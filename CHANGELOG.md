@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- `codegraph install` now honors `CLAUDE_CONFIG_DIR` for Claude Code global profiles, including MCP config, settings, instructions, detection, and uninstall; project-local installs remain unchanged. Thanks @borfast. (#1029)
 - `codegraph install` now honors `CODEX_HOME` for Codex global profiles, so the MCP entry and instructions land where Codex actually reads them; project-local installs remain anchored to the project. Thanks @seanchann. (#1627)
 - Python calls made through `from package import module as alias` now resolve to the real module member instead of disappearing from callers and impact results. Thanks @JoeyNPP. (#1626)
 - Objective-C headers now index in a project that has no `.m` file. A `.h` file is read as C from its name alone and only later recognized as Objective-C; its grammar is now preloaded so the file no longer fails before reaching the index. Thanks @Juddd. (#1628)
