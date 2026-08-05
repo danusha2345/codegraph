@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Java fields initialized with a lambda or an anonymous class — `private final Runnable r = () -> doWork();`, `new LocationListener() { … }`, `Parcelable.Creator` — now contribute call edges, and the anonymous class and its overrides become real symbols instead of being invisible. Previously everything inside a field initializer was dropped, so a method reached only from one looked like it had no callers. Re-index after upgrading.
 - Kotlin properties that hold a lambda, a SAM callback or an anonymous object — `private val frameListener = CameraFrameListener { … }`, the way Android and MSDK callbacks are almost always declared — now contribute call edges. Previously everything inside such an initializer was dropped, so a function reached only through one of these callbacks looked like it had no callers at all and its blast radius came back far too small. Delegated properties (`by lazy { … }`) and plain initializers (`val x = compute()`) were affected the same way and are fixed too. Re-index after upgrading.
 - Incremental sync now applies WAL backpressure during changed-file storage and batched reference resolution, keeping long-lived readers from allowing the WAL to grow past its configured cap on large projects. (#1539)
 - Resolution no longer reads oversized dependency archives such as HarmonyOS `.har` packages as source text, preventing a single package target from exhausting the JavaScript heap during indexing or sync.
