@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- A Kotlin property whose accessor is written on the same line — `val url: String get() = build(host)` — now contributes its accessor's calls too, instead of dropping them. Re-index after upgrading.
 - TypeScript and JavaScript module-level declarations now name themselves as the caller of whatever their initializer runs. `const cfg = loadConfig()` recorded the file as `loadConfig`'s caller; it now records `cfg`, and calls inside non-exported object literals also reach the graph. Re-index after upgrading.
 - `codegraph_explore` again lists a dynamic-dispatch link when the same two symbols are also joined by an ordinary call, instead of dropping it from the summary.
 - Java fields initialized with a lambda or an anonymous class — `private final Runnable r = () -> doWork();`, `new LocationListener() { … }`, `Parcelable.Creator` — now contribute call edges, and the anonymous class and its overrides become real symbols instead of being invisible. Previously everything inside a field initializer was dropped, so a method reached only from one looked like it had no callers. Re-index after upgrading.
