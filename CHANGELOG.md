@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Rust `const` and `static` initializers now contribute their calls: `static REGISTRY: Lazy<Cfg> = Lazy::new(|| build())`, `const LEN: usize = compute_len()`. Previously anything a lazily-built singleton or computed constant called was missing from the graph. Re-index after upgrading.
 - Scala `val`/`var` definitions now contribute the calls their initializer makes — `val handler = () => process(msg)`, `val client = buildClient()`, `lazy val engine = start()`. Previously everything on the right-hand side was dropped. Re-index after upgrading.
 - Kotlin `init { }` blocks and destructuring declarations no longer swallow their code: `init { val cfg = load() }` and `val (a, b) = makePair()` now attribute calls to the enclosing class or file. Re-index after upgrading.
 - A Kotlin property's accessor body now belongs to the property whichever line it is written on, instead of being dropped on the same line or handed to the enclosing class on its own line. Re-index after upgrading.
