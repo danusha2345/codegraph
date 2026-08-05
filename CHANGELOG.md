@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Python module-level assignments now contribute the calls their right-hand side makes — `app = FastAPI()`, `ENGINE = create_engine(url)`, `handler = lambda: run()`, and registry collections. Previously objects wired at import time looked unreferenced. Re-index after upgrading.
 - Rust `const` and `static` initializers now contribute their calls: `static REGISTRY: Lazy<Cfg> = Lazy::new(|| build())`, `const LEN: usize = compute_len()`. Previously anything a lazily-built singleton or computed constant called was missing from the graph. Re-index after upgrading.
 - Scala `val`/`var` definitions now contribute the calls their initializer makes — `val handler = () => process(msg)`, `val client = buildClient()`, `lazy val engine = start()`. Previously everything on the right-hand side was dropped. Re-index after upgrading.
 - Kotlin `init { }` blocks and destructuring declarations no longer swallow their code: `init { val cfg = load() }` and `val (a, b) = makePair()` now attribute calls to the enclosing class or file. Re-index after upgrading.
