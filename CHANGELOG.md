@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Scala `val`/`var` definitions now contribute the calls their initializer makes — `val handler = () => process(msg)`, `val client = buildClient()`, `lazy val engine = start()`. Previously everything on the right-hand side was dropped. Re-index after upgrading.
 - A Kotlin property whose accessor is written on the same line — `val url: String get() = build(host)` — now contributes its accessor's calls too, instead of dropping them. Re-index after upgrading.
 - TypeScript and JavaScript module-level declarations now name themselves as the caller of whatever their initializer runs. `const cfg = loadConfig()` recorded the file as `loadConfig`'s caller; it now records `cfg`, and calls inside non-exported object literals also reach the graph. Re-index after upgrading.
 - `codegraph_explore` again lists a dynamic-dispatch link when the same two symbols are also joined by an ordinary call, instead of dropping it from the summary.
