@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Dynamic-dispatch analysis no longer repeatedly copies every source prefix while scanning match-dense files, avoiding quadratic work and excessive peak memory during the final resolution pass.
 
 ## [1.6.0] - 2026-08-26
 
@@ -48,7 +51,6 @@ After upgrading, run `codegraph index` once in each project so your existing gra
 ### Fixes
 
 #### Better answers from `codegraph_explore`
-
 - Naming a file by its path in a `codegraph_explore` query now works reliably: the path is resolved against the index and that file is guaranteed a place at the top of the answer. Previously the path was broken into fragments — bracketed route segments like SvelteKit's `[id]` made this worst — and pieces like `page` or `runs` matched every sibling file, so the file you actually named could be crowded out of the answer entirely. A path that doesn't match any indexed file is now called out instead of silently ignored.
 
 - Naming a kebab-case file **without its extension** in a `codegraph_explore` query — `background-image-table` rather than `background-image-table.tsx`, the way import paths and prose spell it — now returns that exact file too. Previously the name was split at the hyphens, and in a kebab-cased frontend those pieces (`background`, `image`, `table`) are among the most common words in the codebase, so look-alike sibling files filled the answer while the named file never appeared. Hyphenated words that don't name an indexed file, like "cross-call" or "non-blocking", are left alone.
