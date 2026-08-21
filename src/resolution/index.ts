@@ -16,8 +16,8 @@ import {
   FrameworkResolver,
   ImportMapping,
 } from './types';
-import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
+import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos, nameMatcherMemoStats } from './name-matcher';
+import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos, importResolverMemoStats } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -271,6 +271,7 @@ export class ReferenceResolver {
   private knownNames: Set<string> | null = null; // all known symbol names for fast pre-filtering
   private knownFiles: Set<string> | null = null;
   private cachesWarmed = false;
+  private memoryProbeRefs = 0;
   // tsconfig/jsconfig path-alias map. `undefined` = not yet computed,
   // `null` = computed and absent. Treated as immutable for the
   // resolver's lifetime; callers re-create the resolver if config changes.
@@ -1352,6 +1353,7 @@ export class ReferenceResolver {
       } else {
         unresolved.push(ref);
       }
+      this.reportResolveMemory(ref);
       // Fast-path the per-ref yield check: awaiting the async no-op costs a
       // microtask hop per ref, which dominates at ~10⁵ refs (see MaybeYield).
       const y = maybeYield();
@@ -1368,6 +1370,39 @@ export class ReferenceResolver {
         byMethod,
       },
     };
+  }
+
+  private reportResolveMemory(ref: UnresolvedRef): void {
+    const raw = process.env.CODEGRAPH_RESOLVE_MEMORY;
+    if (!raw) return;
+    const every = Math.max(1, Number.parseInt(raw, 10) || 250);
+    const seenRefs = ++this.memoryProbeRefs;
+    if (seenRefs % every !== 0) return;
+
+    let ownerBuckets = 0;
+    let ownerItems = 0;
+    for (const index of this.methodOwnerIndexCache.values()) {
+      ownerBuckets += index.size;
+      for (const nodes of index.values()) ownerItems += nodes.length;
+    }
+    let kindItems = 0;
+    for (const nodes of this.nodesByKindCache.values()) kindItems += nodes.length;
+    const nameStats = nameMatcherMemoStats(this.context);
+    const importStats = importResolverMemoStats(this.context);
+    const m = process.memoryUsage();
+    const mib = (n: number): number => Math.round(n / 1048576);
+    console.error(
+      `[resolve-memory] refs=${seenRefs} lang=${ref.language} kind=${ref.referenceKind} ` +
+      `ext=${path.extname(ref.filePath)} nameLen=${ref.referenceName.length} ` +
+      `rss=${mib(m.rss)}MiB heap=${mib(m.heapUsed)}/${mib(m.heapTotal)}MiB extMem=${mib(m.external)}MiB ` +
+      `lru=node:${this.nodeCache.size},file:${this.fileCache.size},imports:${this.importMappingCache.size},` +
+      `reexports:${this.reExportCache.size},name:${this.nameCache.size},lower:${this.lowerNameCache.size},` +
+      `qname:${this.qualifiedNameCache.size},lines:${this.fileLinesCache.size},methods:${this.methodMatchCache.size} ` +
+      `ownerIndexes=${this.methodOwnerIndexCache.size}/${ownerBuckets}/${ownerItems} ` +
+      `kinds=${this.nodesByKindCache.size}/${kindItems} deferred=${this.deferredChainRefs.length}/${this.deferredThisMemberRefs.length} ` +
+      `patterns=${nameStats.patterns} infer=${nameStats.inferStates} ` +
+      `importMemos=${importStats.importPaths}/${importStats.exportedSymbols}/${importStats.exportFiles}/${importStats.exportNodes}`
+    );
   }
 
   /**

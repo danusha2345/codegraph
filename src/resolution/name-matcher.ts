@@ -1185,6 +1185,14 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   INFER_SCAN_STATES.delete(context);
 }
 
+/** Opt-in resolver telemetry; never called on the normal hot path. */
+export function nameMatcherMemoStats(context: ResolutionContext): { patterns: number; inferStates: number } {
+  return {
+    patterns: PATTERN_MEMO.size,
+    inferStates: INFER_SCAN_STATES.get(context)?.size ?? 0,
+  };
+}
+
 function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {
   const hit = PATTERN_MEMO.get(key);
   if (hit) return hit;

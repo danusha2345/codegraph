@@ -110,6 +110,24 @@ export function clearImportResolverMemos(context: ResolutionContext): void {
   cobolCopybookIndexes.delete(context);
 }
 
+/** Opt-in resolver telemetry; never called on the normal hot path. */
+export function importResolverMemoStats(context: ResolutionContext): {
+  importPaths: number;
+  exportedSymbols: number;
+  exportFiles: number;
+  exportNodes: number;
+} {
+  const files = fileExportIndexes.get(context);
+  let exportNodes = 0;
+  if (files) for (const idx of files.values()) exportNodes += idx.byName.size;
+  return {
+    importPaths: importPathMemos.get(context)?.size ?? 0,
+    exportedSymbols: exportedSymbolMemos.get(context)?.size ?? 0,
+    exportFiles: files?.size ?? 0,
+    exportNodes,
+  };
+}
+
 export function resolveImportPath(
   importPath: string,
   fromFile: string,
