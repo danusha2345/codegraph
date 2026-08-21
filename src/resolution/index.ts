@@ -1405,6 +1405,25 @@ export class ReferenceResolver {
     );
   }
 
+  private reportResolveBoundary(label: string, batch?: UnresolvedReference[]): void {
+    if (!process.env.CODEGRAPH_RESOLVE_MEMORY) return;
+    let candidateItems = 0;
+    let candidateChars = 0;
+    if (batch) {
+      for (const ref of batch) {
+        candidateItems += ref.candidates?.length ?? 0;
+        for (const candidate of ref.candidates ?? []) candidateChars += candidate.length;
+      }
+    }
+    const m = process.memoryUsage();
+    const mib = (n: number): number => Math.round(n / 1048576);
+    console.error(
+      `[resolve-memory-boundary] ${label} batch=${batch?.length ?? 0} ` +
+      `candidateItems=${candidateItems} candidateChars=${candidateChars} ` +
+      `rss=${mib(m.rss)}MiB heap=${mib(m.heapUsed)}/${mib(m.heapTotal)}MiB extMem=${mib(m.external)}MiB`
+    );
+  }
+
   /**
    * Resolve a list of refs and return everything the ADMISSION side needs to
    * persist the outcome: resolutions, failures, the deferred post-pass refs
@@ -1588,7 +1607,9 @@ export class ReferenceResolver {
     const lp = (k: string, t0: number): void => { if (loopProf) loopProf[k] = (loopProf[k] ?? 0) + (Date.now() - t0); };
     let tLp = 0;
 
+    this.reportResolveBoundary('before-warm');
     await this.warmCachesYielding(maybeYield);
+    this.reportResolveBoundary('after-warm');
 
     const total = this.queries.getUnresolvedReferencesCount();
     let processed = 0;
@@ -1743,6 +1764,7 @@ export class ReferenceResolver {
     try {
     tLp = Date.now();
     let batch = this.queries.getUnresolvedReferencesBatchAfter(0, batchSize);
+    this.reportResolveBoundary('initial-batch-read', batch);
     lp('read', tLp);
     let inFlight: InFlight | null = batch.length > 0 ? beginBatch(batch) : null;
     while (batch.length > 0 && inFlight) {
