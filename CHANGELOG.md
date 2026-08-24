@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Incremental sync now applies WAL backpressure during changed-file storage and batched reference resolution, keeping long-lived readers from allowing the WAL to grow past its configured cap on large projects. (#1539)
 - Resolution no longer reads oversized dependency archives such as HarmonyOS `.har` packages as source text, preventing a single package target from exhausting the JavaScript heap during indexing or sync.
 - Dynamic-dispatch analysis no longer repeatedly copies every source prefix while scanning match-dense files, avoiding quadratic work and excessive peak memory during the final resolution pass.
 
