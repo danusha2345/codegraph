@@ -25,7 +25,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
-- Erlang functions that share a name but differ in arity are now separate symbols with the language's own `module:fun/arity` identity, so the everyday `f/1` delegating to `f/2` shows as a real call edge instead of a self-loop, each arity keeps its own `-spec` and source span, `-export([f/1])` marks exactly that arity as public, and asking `codegraph_explore` for a symbol the way Erlang spells it — `cowboy_req:header/3` — returns that definition. Re-index Erlang projects after upgrading. Thanks @Dshuishui. (#1610) (Erlang)
+- Erlang functions that share a name but differ in arity are now separate symbols with the language's own `module:fun/arity` identity, so the everyday `f/1` delegating to `f/2` shows as a real call edge instead of a self-loop, each arity keeps its own `-spec` and source span, `-export([f/1])` marks exactly that arity as public, and asking `codegraph_explore` for a symbol the way Erlang spells it — `cowboy_req:header/3` — returns that definition. Selective `-import` calls now resolve only to the named module, while built-in and otherwise out-of-scope calls stay unresolved instead of linking to an unrelated project function with the same name. Re-index Erlang projects after upgrading. Thanks @Dshuishui. (#1610) (Erlang)
 
 - Erlang behaviour dispatch no longer miscounts a call site's arity when an argument is a binary literal like `<<1,2,3>>` — the commas inside were counted as argument separators, which silently dropped (or could mislink) the dispatch edge to the behaviour callback. (#1358) (Erlang)
 
