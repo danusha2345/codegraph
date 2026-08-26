@@ -120,6 +120,43 @@ go(Args) ->
     expect(edges.some((e) => e.sq === 'spawner::go/1' && e.tq.startsWith('multi::job'))).toBe(false);
   });
 
+  it('counts arity past comments written inside a parameter or argument list', async () => {
+    fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'src', 'noted.erl'),
+      `-module(noted).
+-export([run/0, leading/2, separating/2, spaced/2, mfa/2]).
+
+leading(X, Y) -> X + Y.
+separating(X, Y) -> X - Y.
+mfa(X, Y) -> {X, Y}.
+
+spaced(X, % why this one is special
+       Y) ->
+    X * Y.
+
+run() ->
+    A = leading( % leading note
+        1, 2),
+    B = separating(1, % separating note
+                   2),
+    C = spaced(1, 2),
+    D = erlang:spawn(noted, mfa, [1, % note inside the MFA list
+                                  2]),
+    {A, B, C, D}.
+`
+    );
+    const edges = await callEdges(dir);
+    // Each syntax shape has its own target so edge deduplication cannot let
+    // one working path mask another path that still miscounts comments.
+    expect(edges).toContainEqual({ sq: 'noted::run/0', tq: 'noted::leading/2' });
+    expect(edges).toContainEqual({ sq: 'noted::run/0', tq: 'noted::separating/2' });
+    expect(edges).toContainEqual({ sq: 'noted::run/0', tq: 'noted::spaced/2' });
+    expect(edges).toContainEqual({ sq: 'noted::run/0', tq: 'noted::mfa/2' });
+    // Nothing resolved to a phantom arity the comments would have produced.
+    expect(edges.some((e) => /::(leading|separating|spaced|mfa)\/[^2]$/.test(e.tq))).toBe(false);
+  });
+
   it('lands `fun mod:f/1` references on the written arity', async () => {
     fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
     fs.writeFileSync(
