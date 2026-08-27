@@ -14,6 +14,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- `codegraph status` now sees edits when the project sits in a subdirectory of its git repository, and ignores changes in sibling packages. Previously it could report `Index is up to date` while `codegraph sync` immediately found and reindexed the same files.
+- A project living in a directory its parent repository gitignores now falls back to filesystem change detection instead of treating Git's silence as a permanently clean index.
 - `codegraph_explore` no longer tells a fresh subagent, or an agent after context compaction, to reuse source that only an earlier context received. Cross-call source suppression now requires explicit `CODEGRAPH_EXPLORE_DEDUP=1`; without a reliable host-provided context lifecycle, the default safely re-serves source on every call. (#1620)
 - Lua and Luau function expressions assigned to locals, table members, or keyed table fields are now indexed as callable nodes. Calls from `local f = function() ... end`, `M.f = function() ... end`, and callback tables such as `M.handlers = { onClick = function() ... end }` are attributed to the named function or method instead of collapsing onto the file node, so callers and impact no longer omit these handlers. Re-index after upgrading. (#1616)
 - Erlang selective imports now resolve a bare call to the exact exported module, function, and arity, while unqualified calls stay within their own module instead of binding to an unrelated same-named project function. Re-index Erlang projects after upgrading. (#1610) (Erlang)
