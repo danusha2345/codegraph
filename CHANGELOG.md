@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Objective-C headers now index in a project that has no `.m` file. A `.h` file is read as C from its name alone and only later recognized as Objective-C; its grammar is now preloaded so the file no longer fails before reaching the index. Thanks @Juddd. (#1628)
 - `codegraph status` now sees edits when the project sits in a subdirectory of its git repository, and ignores changes in sibling packages. Previously it could report `Index is up to date` while `codegraph sync` immediately found and reindexed the same files.
 - A project living in a directory its parent repository gitignores now falls back to filesystem change detection instead of treating Git's silence as a permanently clean index.
 - `codegraph_explore` no longer tells a fresh subagent, or an agent after context compaction, to reuse source that only an earlier context received. Cross-call source suppression now requires explicit `CODEGRAPH_EXPLORE_DEDUP=1`; without a reliable host-provided context lifecycle, the default safely re-serves source on every call. (#1620)
