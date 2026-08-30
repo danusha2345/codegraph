@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Java packages named `build` under standard main and test source roots are now indexed without pulling Gradle or Maven build output into the graph. (#1642)
 - Indexing no longer probes whether paths outside the project exist when resolving a relative import that escapes above the project root; in-project symlinks to external code remain supported. Thanks @ErQrYfkrju. (#1631)
 - `codegraph install` now honors `CLAUDE_CONFIG_DIR` for Claude Code global profiles, including MCP config, settings, instructions, detection, and uninstall; project-local installs remain unchanged. Thanks @borfast. (#1029)
 - `codegraph install` now honors `CODEX_HOME` for Codex global profiles, so the MCP entry and instructions land where Codex actually reads them; project-local installs remain anchored to the project. Thanks @seanchann. (#1627)
