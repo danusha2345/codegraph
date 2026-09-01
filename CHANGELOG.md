@@ -206,6 +206,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Saved-trail authors are now resolved per project.** An embedded host serving several projects in one process no longer reuses the first repository's Git user name for every later trail.
 - Java packages named `build` under standard main and test source roots are now indexed without pulling Gradle or Maven build output into the graph. (#1642)
 - `codegraph callers`, `callees`, and `query` now clearly report when their result limit hides additional matches, including exact totals in callers/callees JSON output. (#1639)
+- `codegraph_explore` no longer tells a fresh subagent, or an agent after context compaction, to reuse source that only an earlier context received. Cross-call source suppression now requires explicit `CODEGRAPH_EXPLORE_DEDUP=1`; without a reliable host-provided context lifecycle, the default safely re-serves source on every call. (#1620)
 
 - **Files under an `e2e/` directory count as tests.** Their calls no longer appear as production callers in Steps, dead-code and test badges.
 
