@@ -209,6 +209,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph_explore` no longer tells a fresh subagent, or an agent after context compaction, to reuse source that only an earlier context received. Cross-call source suppression now requires explicit `CODEGRAPH_EXPLORE_DEDUP=1`; without a reliable host-provided context lifecycle, the default safely re-serves source on every call. (#1620)
 - Lua and Luau function expressions assigned to locals, table members, or keyed table fields are now indexed as callable nodes. Calls from `local f = function() ... end`, `M.f = function() ... end`, and callback tables such as `M.handlers = { onClick = function() ... end }` are attributed to the named function or method instead of collapsing onto the file node, so callers and impact no longer omit these handlers. Re-index after upgrading. (#1616)
 - Erlang selective imports now resolve a bare call to the exact exported module, function, and arity, while unqualified calls stay within their own module instead of binding to an unrelated same-named project function. Re-index Erlang projects after upgrading. (#1610) (Erlang)
+- Incremental sync now applies WAL backpressure during changed-file storage and batched reference resolution, keeping long-lived readers from allowing the WAL to grow past its configured cap on large projects. (#1539)
+
+- Resolution no longer reads oversized dependency archives such as HarmonyOS `.har` packages as source text, preventing a single package target from exhausting the JavaScript heap during indexing or sync.
+
+- Dynamic-dispatch analysis no longer repeatedly copies every source prefix while scanning match-dense files, avoiding quadratic work and excessive peak memory during the final resolution pass.
 
 - **Files under an `e2e/` directory count as tests.** Their calls no longer appear as production callers in Steps, dead-code and test badges.
 
