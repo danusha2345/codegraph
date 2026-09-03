@@ -223,6 +223,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Kotlin `init { }` blocks and destructuring declarations no longer swallow their code: `init { val cfg = load() }` and `val (a, b) = makePair()` contributed no call edge at all, and now attribute to the enclosing class or file.
 - A Kotlin property's accessor body now belongs to the property whichever line it is written on, instead of being dropped (same line) or handed to the enclosing class (own line).
 - Kotlin properties that hold a lambda, a SAM callback or an anonymous object — `private val frameListener = CameraFrameListener { … }`, the way Android and MSDK callbacks are almost always declared — now contribute call edges. Previously everything inside such an initializer was dropped, so a function reached only through one of these callbacks looked like it had no callers at all and its blast radius came back far too small. Delegated properties (`by lazy { … }`) and plain initializers (`val x = compute()`) were affected the same way and are fixed too. Re-index with `codegraph index -f` after upgrading to pick up the new edges.
+- `codegraph callers`, `callees`, and `query` now clearly report when their result limit hides additional matches, including exact totals in callers/callees JSON output; the `codegraph_callers` and `codegraph_callees` MCP answers carry the same "showing N of M" note. (#1639, #1674)
 
 - **Files under an `e2e/` directory count as tests.** Their calls no longer appear as production callers in Steps, dead-code and test badges.
 
