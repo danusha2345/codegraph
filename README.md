@@ -47,6 +47,16 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 
 </div>
 
+<!-- FORK-ONLY: donations — this block lives on danusha2345/codegraph `main` only; never include it in an upstream PR. -->
+> ### ❤️ Support this fork's maintainer / Поддержать разработчика форка
+>
+> This fork ([danusha2345/codegraph](https://github.com/danusha2345/codegraph)) carries the fixes we send upstream — initializer walks for Kotlin/Java/TS/Scala/Rust/Python, CommonJS and nested handlers, Lua/Erlang resolution, memory bounds, CLI/MCP truncation and more. If they helped you, a donation keeps the work going:
+>
+> - **Boosty:** [boosty.to/danusha/donate](https://boosty.to/danusha/donate)
+> - **USDT (TRON / TRC-20):** `THyBqiMTWQ7kUH6vVBEdboL7yGLj5mCSrX`
+> - **GRAM / TON:** `UQDOgjGljFVJiHo_c9JLuX4hF2UQ2SXqSXhj3-1RefFMA4tB`
+<!-- /FORK-ONLY -->
+
 ## Contents
 
 - [Get Started](#get-started)
