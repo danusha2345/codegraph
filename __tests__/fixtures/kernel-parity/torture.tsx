@@ -222,3 +222,11 @@ export function NestedHandlers({ items, onPick }: { items: string[]; onPick: (a:
   const [a, b] = [() => 1, () => 2];
   return items.map((i) => <button onClick={handleClear} onDoubleClick={() => describe(i)}>{later(i)}{count}{a()}{b()}</button>);
 }
+
+// --- call through a field of the enclosing class (#1496) ---------------------
+export class FieldDelegator {
+  constructor(private readonly mailer: { send(m: string): string }, private items: string[]) {}
+  send(msg: string): string { return this.mailer.send(msg); }
+  push(msg: string): void { this.items.push(msg); this.mailer.send(msg).trim(); }
+  direct(): void { this.send('x'); super.toString(); }
+}

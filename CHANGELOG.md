@@ -237,6 +237,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph affected` now recognises every ecosystem's test files — Go `foo_test.go`, Python `test_foo.py`, JVM `FooTest.kt` and the rest — instead of only `.test.`/`.spec.` names, so it stops reporting "no tests affected" for projects that have them. (#1507)
 - `codegraph index <path>` now rebuilds exactly the project you name. A path without an index of its own used to be silently resolved to the nearest initialized parent — a monorepo container, an ancestor with a stale index — and rebuilt under a normal "Done"; it is now an error that names that parent and how to index the path on its own. (#1524)
 - Python parameters annotated with a quoted forward reference — `def f(o: "Alpha")`, or anything under `from __future__ import annotations` — now resolve the methods called on them, the same as the unquoted annotation. Re-index Python projects after upgrading. (#1684)
+- TypeScript/JavaScript: a call through a field of the enclosing class — `this.mailer.send()` — now resolves on the field's declared type, so a delegating wrapper that shares the method's name no longer records itself as its own callee and `callers`, `impact` and trace stop lying on that shape. A field whose type is external or a builtin stays unresolved rather than guessed. Re-index after upgrading. (#1496)
 
 - **Files under an `e2e/` directory count as tests.** Their calls no longer appear as production callers in Steps, dead-code and test badges.
 
