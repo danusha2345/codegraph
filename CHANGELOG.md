@@ -245,6 +245,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **The Map covers a multi-root project.** A React Native app's `ios/` beside its `src/` — or any second root holding a fifth of the code — is now on the picture, one level deeper, instead of the map silently drawing only the larger root.
 
 - Fixed a long-running `codegraph ui` session serving a symbol that a sync had already deleted. The viewer keeps one connection to your index open, and its in-memory lookup didn't notice when another process — your agent's sync, or `codegraph sync` — rewrote the file underneath it, so a symbol screen could keep showing a body with no callers while search correctly reported it had moved. Because a symbol's identity includes the line it starts on, this happened after almost any edit above it.
+### Fixes
+
+- `codegraph status` now sees your edits when the project sits in a **subdirectory** of its git repository (a monorepo package, an app folder next to a server folder). Previously it reported `Index is up to date` no matter how many files had changed, while `codegraph sync` run a second later found them all and reindexed — the two commands flatly contradicted each other, and anything that trusts the status count (the staleness reminder, a scripted check) read the index as clean forever. Change detection also stops at your project's boundary now, so an edit to a sibling package in the same repository is no longer counted as yours. A project that IS its repository root is unaffected.
+
+- A project living in a directory its parent repository **gitignores** no longer reports a permanently clean index either. Git can say nothing at all about such a directory, so change detection now falls back to the same filesystem scan that indexes the project in the first place, instead of taking git's silence for "nothing changed".
+
 
 ## [1.6.0] - 2026-08-26
 
