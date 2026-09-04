@@ -257,6 +257,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Calls no longer resolve to a same-named symbol in an unrelated language on the strength of the name alone. Nothing in Python can call a function in Elixir, but a language's own builtins and test macros — `test`, `describe`, `apply`, `max`, `field` — have no definition of their own to bind to, so a lone same-named symbol in another language was winning by default. On a mixed-language repository that produced thousands of impossible call edges, and the symbols they landed on reported callers and impact that were mostly or entirely fictional. Genuine cross-language calls — FFI bindings, native bridges — are unaffected, because those resolve through an import or a qualified name rather than a bare one. Set `CODEGRAPH_CROSS_FAMILY_CALL_FLOOR=0` to restore the old behaviour.
 - A `.tsx` file calling a `.ts` helper is no longer treated as crossing a language boundary. The two are the same runtime, but they were compared by file type rather than by language family, so ordinary calls throughout a React codebase were scored as low-confidence guesses.
 
+### Fixes
+
+- Calls from your code no longer resolve into your tests. Tests depend on the code they exercise, never the other way round, but a name with no real definition to bind to — a value destructured from a hook, a helper that lives in a package — would land on any same-named helper inside a test file. On one project every `t(...)` call across 137 page components pointed at a translation stub defined in a single test, making it the second most-called symbol in the codebase and its callers and impact almost entirely fictional. Test files are recognised by the names their test runner enforces (`test_*.py`, `*.test.ts`, `*_test.go`, `*Test.java`), never by which folder they sit in, so a `spec/` directory holding an API document or a `testing/` utility library is left alone. Set `CODEGRAPH_TEST_TREE_GATE=0` to restore the old behaviour.
+
 
 ## [1.6.0] - 2026-08-26
 
