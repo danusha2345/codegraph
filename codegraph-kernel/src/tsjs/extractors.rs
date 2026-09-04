@@ -1148,9 +1148,14 @@ impl<'t> Walker<'t> {
                         // resolver can read its declared type (#1496). Mirrors
                         // TreeSitterExtractor.extractCall.
                         callee_name = format!("this.{field}.{method_name}");
+                    } else if let Some(r) = receiver.filter(|r| r.kind() == "call_expression") {
+                        // Call receiver — `make().run()` (#1683): keep the inner
+                        // callee as `<inner>().<method>`, or emit nothing when it
+                        // is not a plain name / member chain. Mirrors
+                        // TreeSitterExtractor.extractCall.
+                        let Some(inner) = self.plain_inner_callee(r) else { return };
+                        callee_name = format!("{inner}().{method_name}");
                     } else {
-                        // (the call-receiver re-encode branches are other
-                        // languages'; TS/JS keeps the bare method name)
                         callee_name = method_name.to_string();
                     }
                 }
@@ -1184,6 +1189,22 @@ impl<'t> Walker<'t> {
             return None;
         }
         Some(self.text(property).to_string())
+    }
+
+    /// The callee of a call-expression receiver when it is a plain identifier
+    /// or member chain (`make`, `d.setdefault`), whitespace stripped (#1683).
+    fn plain_inner_callee(&self, call: Node<'t>) -> Option<String> {
+        let inner = call.child_by_field_name("function")?;
+        let text: String = self.text(inner).chars().filter(|c| !c.is_whitespace()).collect();
+        if text.is_empty() {
+            return None;
+        }
+        let ok = text.split('.').all(|seg| {
+            let mut chars = seg.chars();
+            matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        });
+        if ok { Some(text) } else { None }
     }
 
     pub(super) fn extract_instantiation(&mut self, node: Node<'t>) {
