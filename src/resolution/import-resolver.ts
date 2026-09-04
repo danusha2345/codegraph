@@ -392,15 +392,8 @@ function isExternalImport(
     if (importPath.startsWith('.')) {
       return false;
     }
-    // Multi-module monorepo: an import that belongs to ANY local module is
-    // in-project. Without this, side-by-side modules in one tree all look
-    // like third-party packages to each other (issue #388 multi-module case).
-    const idx = context?.getGoModules?.();
-    if (idx?.resolve(importPath)) {
-      return false;
-    }
-    // Single-module fast path / backward compat: in-module imports look like
-    // `<module-path>/sub/pkg`. Without the module-path check we'd flag every
+    // In-module imports look like `<module-path>/sub/pkg` — local to
+    // this project. Without the module-path check we'd flag every
     // cross-package call in a Go monorepo as external (issue #388).
     const mod = context?.getGoModule?.();
     if (mod && (importPath === mod.modulePath || importPath.startsWith(mod.modulePath + '/'))) {
@@ -2325,9 +2318,8 @@ function resolveGoCrossPackageReference(
   imports: ImportMapping[],
   context: ResolutionContext
 ): ResolvedRef | null {
-  const idx = context.getGoModules?.();
   const mod = context.getGoModule?.();
-  if (!idx && !mod) return null;
+  if (!mod) return null;
 
   // Qualified call: receiver before `.`, member after. A bare reference
   // (no dot) is a same-file/in-package call — handled elsewhere.
@@ -2339,22 +2331,13 @@ function resolveGoCrossPackageReference(
 
   for (const imp of imports) {
     if (imp.localName !== receiver) continue;
-
-    // Project-relative package directory. The multi-module index handles a
-    // monorepo of side-by-side modules; when it's absent (single-module repo
-    // or pre-modules code) fall back to the original single-module algorithm
-    // verbatim, so behavior there is byte-identical to before.
-    let pkgDir: string | null = idx ? idx.packageDir(imp.source) : null;
-    if (pkgDir === null && mod) {
-      // Only in-module imports map to a known directory.
-      if (imp.source !== mod.modulePath && !imp.source.startsWith(mod.modulePath + '/')) {
-        continue;
-      }
-      pkgDir = imp.source === mod.modulePath
-        ? ''
-        : imp.source.substring(mod.modulePath.length + 1);
+    // Only in-module imports map to a known directory.
+    if (imp.source !== mod.modulePath && !imp.source.startsWith(mod.modulePath + '/')) {
+      continue;
     }
-    if (pkgDir === null) continue;
+    const pkgDir = imp.source === mod.modulePath
+      ? ''
+      : imp.source.substring(mod.modulePath.length + 1);
 
     // Look up the member by name and pick the candidate whose file lives
     // directly in the package directory. Match the immediate parent dir

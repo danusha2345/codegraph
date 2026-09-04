@@ -405,12 +405,6 @@ After upgrading, run `codegraph index` once in each project so your existing gra
 - Python classes used as values — `return SomeSerializer` from a factory method, `handler = SomeClass` aliases, registry dicts and lists, and classes passed as arguments — now produce reference edges in the graph. Previously these idioms were invisible, so on Django and Django REST Framework projects, asking for a serializer's callers or the impact of editing it missed the views that actually use it. Re-index after upgrading to pick up the new edges. (#1478)
 
 - SAP HANA `.xsjs` / `.xsjslib` imports now resolve across files: an extensionless `import { x } from './helpers'` in a `.xsjs` file finds `helpers.xsjslib`, so the cross-file call edge is created and `codegraph_callers` / `codegraph_impact` see it. Previously the import path resolved to nothing and the call fell back to same-name matching, which could bind the edge to an unrelated file that happened to export the same symbol. Complements the `.xsjs` / `.xsjslib` extraction support. Thanks @maxmilian. (#556)
-### Fixes
-
-- In a Go project with several modules placed side by side under one directory (a common monorepo layout), a call from one module into another now resolves to the correct definition instead of being dropped or wired to the wrong symbol (#388).
-- Exported Go methods are now correctly marked as exported, so cross-package method calls resolve.
-- In a Go project, variables declared in a grouped `var (...)` block are now indexed, and exported package-level constants and variables are now correctly marked as exported.
-
 
 ## [1.5.0] - 2026-07-21
 

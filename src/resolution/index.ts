@@ -25,7 +25,7 @@ import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
-import { loadGoModule, type GoModule, loadGoModules, type GoModuleIndex } from './go-module';
+import { loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
 import { lexicalPathWithinRoot } from '../utils';
@@ -281,10 +281,6 @@ export class ReferenceResolver {
   private projectAliases: AliasMap | null | undefined = undefined;
   // go.mod module path. Same lazy/immutable convention as projectAliases.
   private goModule: GoModule | null | undefined = undefined;
-  // Index over every go.mod in the project (multi-module monorepo). Same
-  // lazy/immutable convention. `getGoModules` is the preferred path for Go
-  // resolution; `goModule` stays as a single-module fast path / fallback.
-  private goModules: GoModuleIndex | null | undefined = undefined;
   // Monorepo workspace member packages. Same lazy/immutable convention.
   private workspacePackages: WorkspacePackages | null | undefined = undefined;
 
@@ -693,13 +689,6 @@ export class ReferenceResolver {
           this.goModule = loadGoModule(this.projectRoot);
         }
         return this.goModule;
-      },
-
-      getGoModules: () => {
-        if (this.goModules === undefined) {
-          this.goModules = loadGoModules(this.projectRoot);
-        }
-        return this.goModules;
       },
 
       getWorkspacePackages: () => {
