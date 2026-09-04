@@ -234,6 +234,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - CommonJS controllers written as `exports.getItems = async (req, res) => {…}` or `module.exports.x = function () {…}` are now indexed as exported functions, so `node`, `callers` and impact find every Express handler in that style and the calls inside them belong to the handler instead of the file. Re-index JavaScript projects after upgrading. (#1675)
 - **Functions bound with `const` inside another function are symbols now.** `const handleClear = () => {…}` inside a React component — every handler that skips `useCallback` — was invisible to `callers`, `callees` and impact, answering "Symbol not found" exactly the way a function with no callers would. It is indexed like its module-level twin, contained by the enclosing function, with its own calls. Re-index after upgrading. (#1669)
 - Kotlin functions and methods now carry their signature — `(params): ReturnType` — in `codegraph_explore`, `node` and the viewer, instead of no signature at all. Re-index Kotlin projects after upgrading. (#1495)
+- `codegraph affected` now recognises every ecosystem's test files — Go `foo_test.go`, Python `test_foo.py`, JVM `FooTest.kt` and the rest — instead of only `.test.`/`.spec.` names, so it stops reporting "no tests affected" for projects that have them. (#1507)
 
 - **Files under an `e2e/` directory count as tests.** Their calls no longer appear as production callers in Steps, dead-code and test badges.
 
