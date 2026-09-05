@@ -271,6 +271,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Calls from your code no longer resolve into your tests. Tests depend on the code they exercise, never the other way round, but a name with no real definition to bind to — a value destructured from a hook, a helper that lives in a package — would land on any same-named helper inside a test file. On one project every `t(...)` call across 137 page components pointed at a translation stub defined in a single test, making it the second most-called symbol in the codebase and its callers and impact almost entirely fictional. Test files are recognised by the names their test runner enforces (`test_*.py`, `*.test.ts`, `*_test.go`, `*Test.java`), never by which folder they sit in, so a `spec/` directory holding an API document or a `testing/` utility library is left alone. Set `CODEGRAPH_TEST_TREE_GATE=0` to restore the old behaviour.
 
 
+#### Language and framework accuracy
+
+- **Python calls into one of your own modules are no longer mistaken for built-ins.** A call like `ledger.append(row)`, where `ledger` is a module in your project that exports a function named `append`, was silently dropped as if it were a plain list method — so that function showed no callers and the flow through it stopped. Calls made through an attribute or a chained expression (`self.data.append(x)`) also no longer latch onto an unrelated function that merely shares the method's name, which had invented callers that don't exist.
+
 ## [1.6.0] - 2026-08-26
 
 ### Highlights
