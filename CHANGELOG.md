@@ -133,6 +133,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Local JavaScript and TypeScript calls stay connected through linked packages and imports configured by a nested `baseUrl` (#1715).
+
 - A JavaScript or TypeScript name imported from a Node builtin or an npm package no longer links to an unrelated project function of the same name, and filtering nested functions no longer creates new fuzzy guesses (#1709). Imports through an alias the resolver cannot see still reach their local target by name, as before.
 
 #### Screens, links and navigation
