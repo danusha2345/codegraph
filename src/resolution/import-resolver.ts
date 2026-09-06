@@ -358,6 +358,7 @@ export function isExternalPackageSpecifier(importPath: string, context: Resoluti
   // `@scope/name/sub` → `@scope/name`; `name/sub` → `name`.
   const segments = importPath.split('/');
   const head = importPath.startsWith('@') ? segments.slice(0, 2).join('/') : segments[0]!;
+  if (workspaces?.localLinkNames?.has(head)) return false;
   let memo = externalSpecifierMemos.get(context);
   if (!memo) {
     memo = new Map();
