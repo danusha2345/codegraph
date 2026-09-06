@@ -133,7 +133,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
-- Unresolved JavaScript and TypeScript imports no longer point to unrelated project functions, and filtering nested functions no longer creates new fuzzy guesses (#1709).
+- A JavaScript or TypeScript name imported from a Node builtin or an npm package no longer links to an unrelated project function of the same name, and filtering nested functions no longer creates new fuzzy guesses (#1709). Imports through an alias the resolver cannot see still reach their local target by name, as before.
 
 #### Screens, links and navigation
 

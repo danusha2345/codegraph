@@ -6,6 +6,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { builtinModules } from 'module';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
 import { applyAliases } from './path-aliases';
@@ -134,6 +135,7 @@ function getFileExportIndex(filePath: string, context: ResolutionContext): FileE
 export function clearImportResolverMemos(context: ResolutionContext): void {
   importPathMemos.delete(context);
   exportedSymbolMemos.delete(context);
+  externalSpecifierMemos.delete(context);
   fileExportIndexes.delete(context);
   luaFileBasenameIndexes.delete(context);
   cobolCopybookIndexes.delete(context);
@@ -315,6 +317,47 @@ const C_CPP_STDLIB_HEADERS = new Set([
   'unordered_set', 'utility', 'valarray', 'variant', 'vector',
   'version',
 ]);
+
+const NODE_BUILTINS = new Set(builtinModules);
+const externalSpecifierMemos = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * True only for a JS/TS specifier that certainly names something OUTSIDE the
+ * project: a Node builtin (`node:path`, `fs`) or a bare npm package name.
+ * Anything that MIGHT be local stays false — relative and absolute paths,
+ * alias-looking prefixes (`~`, `#`, `$`, `@/`), workspace members, tsconfig
+ * alias prefixes, and a first segment that is a directory at the project root
+ * (baseUrl-style `src/x`, `lib/x`). Deliberately narrower than
+ * {@link isExternalImport}: the caller DROPS a name-based resolution on true
+ * (#1709), so a false positive here is a real edge lost, while a false
+ * negative only keeps the pre-existing behaviour.
+ */
+export function isExternalPackageSpecifier(importPath: string, context: ResolutionContext): boolean {
+  if (importPath.startsWith('node:') || NODE_BUILTINS.has(importPath)) return true;
+  if (/^[./~#$]/.test(importPath) || importPath.startsWith('@/') || /^[A-Za-z]:[\\/]/.test(importPath)) return false;
+  const workspaces = context.getWorkspacePackages?.();
+  if (workspaces && resolveWorkspaceImport(importPath, workspaces)) return false;
+  const aliases = context.getProjectAliases?.();
+  if (aliases && aliases.patterns.some((pat) => importPath.startsWith(pat.prefix))) return false;
+  // `@scope/name/sub` → `@scope/name`; `name/sub` → `name`.
+  const segments = importPath.split('/');
+  const head = importPath.startsWith('@') ? segments.slice(0, 2).join('/') : segments[0]!;
+  let memo = externalSpecifierMemos.get(context);
+  if (!memo) {
+    memo = new Map();
+    externalSpecifierMemos.set(context, memo);
+  }
+  const hit = memo.get(head);
+  if (hit !== undefined) return hit;
+  let isDirectory = false;
+  try {
+    isDirectory = fs.statSync(path.join(context.getProjectRoot(), head)).isDirectory();
+  } catch {
+    // Not there: a bare npm specifier.
+  }
+  memo.set(head, !isDirectory);
+  return !isDirectory;
+}
 
 /**
  * Check if an import is external (npm package, etc.)

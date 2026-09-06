@@ -17,7 +17,7 @@ import {
   ImportMapping,
 } from './types';
 import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
-import { resolveImportPath, resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
+import { isExternalPackageSpecifier, resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -1012,18 +1012,22 @@ export class ReferenceResolver {
     // binding it happened to pick. Same-file matches only.
     if (nameResult) {
       const target = this.queries.getNodeById(nameResult.targetNodeId);
-      // A named/default JS import with no indexed source is not an ambient
-      // cross-file name. Both exact and fuzzy fallback used to bind e.g.
-      // node:path's resolve to an unrelated project's resolve method (#1709).
-      // Same-file matches remain eligible: a local declaration may shadow the
-      // file-level import. Resolved imports already took Strategy 2 above.
+      // A named/default JS import from a Node builtin or an npm package is not
+      // an ambient cross-file name. Both exact and fuzzy fallback used to bind
+      // e.g. node:path's resolve to an unrelated project's resolve method
+      // (#1709). Only a specifier that is CERTAINLY external disqualifies the
+      // match: an alias the resolver cannot see (`~utils` from a nested
+      // tsconfig, a `#subpath` import) still has to reach its local target by
+      // name, as it always did. Same-file matches remain eligible: a local
+      // declaration may shadow the file-level import. Resolved imports already
+      // took Strategy 2 above.
       if (
         target && target.filePath !== ref.filePath &&
         ['typescript', 'tsx', 'javascript', 'jsx'].includes(ref.language) &&
         (ref.referenceKind === 'calls' || ref.referenceKind === 'imports') &&
         this.context.getImportMappings(ref.filePath, ref.language).some(
           mapping => !mapping.isNamespace && mapping.localName === ref.referenceName &&
-            resolveImportPath(mapping.source, ref.filePath, ref.language, this.context) === null
+            isExternalPackageSpecifier(mapping.source, this.context)
         )
       ) {
         nameResult = null;
