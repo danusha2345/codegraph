@@ -73,8 +73,10 @@ describe('fuzzy matching respects lexical reachability of nested functions', () 
 
   it.each([
     ["import { resolve } from 'node:path';", 'resolve'],
+    ["import { resolve } from 'path';", 'resolve'],
     ["import { resolve as joinPath } from 'node:path';", 'joinPath'],
     ["import resolve from 'external-resolver';", 'resolve'],
+    ["import { resolve } from '@scope/external-resolver/deep';", 'resolve'],
   ])('does not promote the sole survivor for %s', async (declaration, name) => {
     fs.writeFileSync(path.join(tempDir, 'nested.ts'),
       `export function owner() { function ${name}() {} return ${name}(); }`);
@@ -93,6 +95,28 @@ describe('fuzzy matching respects lexical reachability of nested functions', () 
       .filter(e => e.target === wrong.id && (e.kind === 'calls' || e.kind === 'imports'));
     expect(badEdges).toEqual([]);
   });
+
+  // An alias a nested tsconfig or a package.json `imports` map defines is
+  // invisible to the resolver; the name match is the only way to its target,
+  // so it must not be mistaken for an npm package (vite's `~utils`).
+  it.each(['~utils', '#lib/utils', '@/lib/utils', '$lib/utils', 'lib/utils'])(
+    'keeps a name match bound through %s, an alias the resolver cannot see', async (specifier) => {
+      fs.writeFileSync(path.join(tempDir, 'nested.ts'),
+        'export function owner() { function resolve() {} return resolve(); }');
+      fs.mkdirSync(path.join(tempDir, 'lib'));
+      fs.writeFileSync(path.join(tempDir, 'lib', 'utils.ts'),
+        'export function resolve(value: string) { return value; }');
+      fs.writeFileSync(path.join(tempDir, 'config.ts'),
+        `import { resolve } from '${specifier}';\nexport function configure() { return resolve('src'); }`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      const target = cg.getNodesByKind('function').find(n => n.name === 'resolve' && n.filePath === 'lib/utils.ts')!;
+      const caller = cg.getNodesByKind('function').find(n => n.name === 'configure')!;
+      expect(target).toBeDefined();
+      expect(cg.getOutgoingEdges(caller.id).filter(e => e.kind === 'calls').map(e => e.target))
+        .toContain(target.id);
+    }
+  );
 
   it('keeps a real imported target despite unreachable same-named closures', async () => {
     fs.writeFileSync(path.join(tempDir, 'nested.ts'),
