@@ -2610,7 +2610,7 @@ export function matchFuzzy(
   // Filter to callable kinds only (function, method, class)
   const callableKinds = new Set(['function', 'method', 'class']);
   const callableCandidates = applyLanguageGate(
-    candidates.filter((n) => callableKinds.has(n.kind) && isCrossFileReachable(n, ref, context)),
+    candidates.filter((n) => callableKinds.has(n.kind)),
     ref
   );
 
@@ -2627,7 +2627,11 @@ export function matchFuzzy(
   // `import { resolve } from 'node:path'` in a dozen playground configs onto
   // the one reachable `resolve` method (#1709). Reachability may reject a
   // unique guess; it must never manufacture one.
-  if (finalCandidates.length === 1 && isLexicallyReachable(finalCandidates[0]!, ref, context)) {
+  if (
+    finalCandidates.length === 1 &&
+    isLexicallyReachable(finalCandidates[0]!, ref, context) &&
+    isCrossFileReachable(finalCandidates[0]!, ref, context)
+  ) {
     const isCrossLanguage = finalCandidates[0]!.language !== ref.language;
     return {
       original: ref,
