@@ -2700,7 +2700,7 @@ export function matchFuzzy(
   const callableKinds = new Set(['function', 'method', 'class']);
   const callableCandidates = applyTestTreeGate(
     applyLanguageGate(
-      candidates.filter((n) => callableKinds.has(n.kind) && isLexicallyReachable(n, ref, context)),
+      candidates.filter((n) => callableKinds.has(n.kind)),
       ref
     ),
     ref
@@ -2710,7 +2710,10 @@ export function matchFuzzy(
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);
   const finalCandidates = sameLanguageCandidates.length > 0 ? sameLanguageCandidates : callableCandidates;
 
-  if (finalCandidates.length === 1) {
+  // Reachability may reject a unique guess, but must not turn an ambiguous
+  // name into a unique guess (or switch to another language's candidate).
+  // The one survivor can still be unrelated to the call site's binding.
+  if (finalCandidates.length === 1 && isLexicallyReachable(finalCandidates[0]!, ref, context)) {
     // Family, not raw language tag: a `.tsx` ref matching a `.ts` definition is
     // the same runtime, and scoring it as though it crossed a boundary
     // understates every call in a React codebase.
