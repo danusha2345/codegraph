@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- **A name imported from a package no longer fuzzy-matches a project symbol.** `import { scan } from 'rolldown/experimental'` names a symbol that is not in the graph at all, but the fuzzy fallback matched it by name anyway — in that case onto the importing file's own `scan`, a self-edge. Fuzzy matching now declines when the call site's binding is a bare specifier (a builtin or an npm package); relative, alias and workspace imports still fall through, and only JS/TS is affected, since elsewhere a project's own modules are imported by absolute name too. On vite this removed 4 wrong edges and added none. Re-index after upgrading.
 
 ## [1.6.1] - 2026-09-29
 
