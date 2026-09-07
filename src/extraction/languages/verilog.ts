@@ -20,14 +20,19 @@ import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
  *    module type). This is the highest-value HDL edge: it powers cross-module
  *    `trace`/`impact` ("what instantiates this module", "what does top use").
  *  - parameter / localparam → `constant` nodes.
+ *  - `define macro → `constant` node (a `.vh` header is mostly macros, and a
+ *    `WIDTH` written as `` `DATA_W `` has to land somewhere).
  *  - typedef → `type_alias` node.
  *  - function/task subroutine calls (`tf_call`) → `calls` references.
  *
- * Package imports go through the generic import path (`importTypes` +
- * `extractImport`), targeting each `package_import_item` so every package in a
- * multi-import (`import a::*, b::*;`) gets its own node. Ports and internal
- * signals are intentionally NOT extracted — they would explode the node count
- * without aiding structural queries.
+ * Package imports and `` `include `` directives go through the generic import
+ * path (`importTypes` + `extractImport`): each `package_import_item` so every
+ * package in a multi-import (`import a::*, b::*;`) gets its own node, and each
+ * `include_compiler_directive` with the quoted path as its module name — the
+ * file-path matcher resolves `"defs.vh"` / `"axi/typedef.svh"` to the indexed
+ * header closest to the including file, the same way a C `#include` lands.
+ * Ports and internal signals are intentionally NOT extracted — they would
+ * explode the node count without aiding structural queries.
  */
 
 // Header wrappers that carry a module/interface/program name.
@@ -175,6 +180,13 @@ function handleParam(node: SyntaxNode, ctx: ExtractorContext): boolean {
   return true;
 }
 
+function handleMacro(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const nameNode = firstChildOfType(node, ['text_macro_name']);
+  const id = nameNode ? firstSimpleIdentifier(nameNode) : null;
+  if (id) ctx.createNode('constant', getNodeText(id, ctx.source), node);
+  return true;
+}
+
 function handleTypedef(node: SyntaxNode, ctx: ExtractorContext): boolean {
   const nameNode =
     getChildByField(node, 'type_name') ??
@@ -219,7 +231,7 @@ export const verilogExtractor: LanguageExtractor = {
   typeAliasTypes: [],
   // Target the per-item node, not the whole declaration, so every package in a
   // multi-import (`import a::*, b::*;`) is indexed — one import node per item.
-  importTypes: ['package_import_item'],
+  importTypes: ['package_import_item', 'include_compiler_directive'],
   callTypes: [],
   variableTypes: [],
   nameField: 'name',
@@ -243,6 +255,8 @@ export const verilogExtractor: LanguageExtractor = {
       case 'parameter_declaration':
       case 'local_parameter_declaration':
         return handleParam(node, ctx);
+      case 'text_macro_definition':
+        return handleMacro(node, ctx);
       case 'type_declaration':
         return handleTypedef(node, ctx);
       case 'tf_call':
@@ -253,6 +267,22 @@ export const verilogExtractor: LanguageExtractor = {
   },
 
   extractImport: (node, source) => {
+    if (node.type === 'include_compiler_directive') {
+      // `include "defs.vh"` → the quoted path; `include <uvm_macros.svh>` → the
+      // bracketed one. The path is the module name, so the generic import ref
+      // resolves it to the header FILE by path suffix (name-matcher's
+      // file-path strategy), never to a symbol.
+      const quoted = firstChildOfType(node, ['quoted_string']);
+      const item = quoted ? firstChildOfType(quoted, ['quoted_string_item']) : null;
+      const system = firstChildOfType(node, ['system_lib_string']);
+      const target = item
+        ? getNodeText(item, source)
+        : system
+          ? getNodeText(system, source).replace(/^<|>$/g, '')
+          : '';
+      if (!target.trim()) return null;
+      return { moduleName: target.trim(), signature: getNodeText(node, source).trim() };
+    }
     // `node` is a package_import_item (`pkg::*` / `pkg::name`); the package name
     // is its first simple_identifier. One item → one import node.
     const id = firstSimpleIdentifier(node);

@@ -12578,4 +12578,41 @@ endmodule
     );
     expect(inst).toBeDefined();
   });
+
+  it('should emit an import for each `include directive, named by the included path', () => {
+    const code = `
+\`include "defs.vh"
+\`include "axi/typedef.svh"
+\`include <uvm_macros.svh>
+module top (input logic clk);
+endmodule
+`;
+    const result = extractFromSource('top.sv', code);
+
+    const includes = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    expect(includes).toEqual(['defs.vh', 'axi/typedef.svh', 'uvm_macros.svh']);
+
+    // the path is what the import ref carries, so the file-path matcher can
+    // land it on the header by suffix
+    const refs = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'imports')
+      .map((r) => r.referenceName);
+    expect(refs).toEqual(['defs.vh', 'axi/typedef.svh', 'uvm_macros.svh']);
+  });
+
+  it('should extract `define macros and top-level parameters from a header', () => {
+    const code = `
+\`ifndef DEFS_VH
+\`define DEFS_VH
+\`define DATA_W 16
+\`define ADDR(x) (x + 1)
+parameter CLK_HZ = 27_000_000;
+localparam BAUD = 115200;
+\`endif
+`;
+    const result = extractFromSource('defs.vh', code);
+
+    const constants = result.nodes.filter((n) => n.kind === 'constant').map((n) => n.name);
+    expect(constants).toEqual(['DEFS_VH', 'DATA_W', 'ADDR', 'CLK_HZ', 'BAUD']);
+  });
 });

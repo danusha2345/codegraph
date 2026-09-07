@@ -2699,6 +2699,19 @@ function splitCamelCase(str: string): string[] {
 }
 
 /**
+ * Whether a Verilog file sits in the simulation side of a design: under a
+ * `sim/`, `tb/`, `test/`, `tests/`, `testbench/` or `dv/` directory, or named
+ * `*_stub`/`*_tb`/`*_sim`. Deliberately narrow — a wrong guess here costs a
+ * real edge, so only the conventional names count.
+ */
+function isVerilogSimPath(filePath: string): boolean {
+  return (
+    /(^|\/)(sim|tb|tests?|testbench|dv)\//i.test(filePath) ||
+    /_(stub|tb|sim)\.s?vh?$/i.test(filePath)
+  );
+}
+
+/**
  * Compute directory proximity from a pre-split list of directory segments
  * (`filePath1` minus its filename) and a second file path.
  * Returns a score based on the number of shared leading directory segments.
@@ -3036,6 +3049,35 @@ export function matchReference(
         return { original: ref, targetNodeId: sameFile.id, confidence: 0.95, resolvedBy: 'exact-match' };
       }
       return null;
+    }
+  }
+
+  // A Verilog module instantiation names its target by bare name: nothing in
+  // the source pins `pll u_pll (...)` to a file — the file list handed to the
+  // synthesizer or the simulator does. A design routinely carries a simulation
+  // stand-in for a vendor primitive beside the real one (`src/pll.v` and
+  // `sim/pll_stub.v`, both `module pll`), and a file outside the simulation
+  // tree never means the stub. So when the instantiating file is not itself
+  // under a simulation path, drop the simulation candidates as long as a
+  // non-simulation module remains, and rank what is left as usual (directory
+  // proximity). A testbench keeps every candidate — it may legitimately mean
+  // either — and a name with no simulation twin is untouched.
+  if (ref.language === 'verilog' && ref.referenceKind === 'instantiates' && !isVerilogSimPath(ref.filePath)) {
+    const modules = context
+      .getNodesByName(ref.referenceName)
+      .filter((n) => n.language === 'verilog' && (n.kind === 'class' || n.kind === 'interface'));
+    const synth = modules.filter((n) => !isVerilogSimPath(n.filePath));
+    if (synth.length > 0 && synth.length < modules.length) {
+      const best = synth.length === 1 ? synth[0]! : findBestMatch(ref, synth, context);
+      if (best) {
+        const proximity = computePathProximity(ref.filePath, best.filePath);
+        return {
+          original: ref,
+          targetNodeId: best.id,
+          confidence: synth.length === 1 || proximity >= 30 ? 0.7 : 0.4,
+          resolvedBy: 'exact-match',
+        };
+      }
     }
   }
 
