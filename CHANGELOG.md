@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- **A C `#if` group whose branches are not whole statements no longer produces phantom functions.** An `else if (…) { … }` arm kept behind `#ifdef`, an `if (…)` header whose body sits after the `#endif` (the ST HAL's per-device latency tables), or a function signature that differs per configuration all read to the C grammar as a function *named* `if` — and every real function after it in the file was then filed underneath it, or dropped. Such a group is now collapsed to its first live branch before parsing, offsets kept, and block macros written in capitals (`ATOMIC_BLOCK(…) { … }`) are recognized like their lowercase cousins. On a betaflight tree 265 phantom nested functions became 5, and whole functions that had been missing (`spiInternalStartDMA`, `processSmartPortTelemetry`, the CMSIS matrix routines) are back with their callers at exact-match confidence. Re-index after upgrading.
+
 
 ## [1.6.1] - 2026-09-29
 
