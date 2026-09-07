@@ -118,6 +118,9 @@ const GATE_GRAMMARS = [
   'tree-sitter-c_sharp.wasm',
   'tree-sitter-ruby.wasm',
   'tree-sitter-php.wasm',
+  // Vendored with no npm fallback (tree-sitter-wasms ships no SystemVerilog),
+  // so a bundle that lost it has no other way to parse a .v/.sv file.
+  'tree-sitter-systemverilog.wasm',
 ];
 
 if (!existsSync(wasmDir)) {
