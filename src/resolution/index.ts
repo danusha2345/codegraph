@@ -16,7 +16,7 @@ import {
   FrameworkResolver,
   ImportMapping,
 } from './types';
-import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
+import { isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
 import { isExternalPackageSpecifier, resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
@@ -1105,6 +1105,13 @@ export class ReferenceResolver {
             isExternalPackageSpecifier(mapping.source, this.context)
         )
       ) {
+        nameResult = null;
+      }
+      // A definition its language makes file-local — a C `static`, a Kotlin
+      // `private fun`, a Go unexported name in another package, a Rust
+      // non-`pub` item outside its module subtree — cannot be what a name in
+      // another file means, whichever strategy chose it (#1730).
+      if (target && !isVisibleAcrossFiles(target, ref, this.context)) {
         nameResult = null;
       }
       if (ref.language === 'nix') {
