@@ -516,6 +516,9 @@ function applyTestTreeGate(candidates: Node[], ref: UnresolvedRef): Node[] {
   // Keeping it as a fallback would leave the whole defect in place, since the
   // fabricated edges are precisely the ones with no production alternative.
   return candidates.filter((c) => !isRunnerNamedTestFile(c.filePath));
+}
+
+/**
  * Languages in which `visibility: 'private'` on a definition means no other
  * FILE can name it: a Kotlin `private fun` is file- or class-local, and the
  * same holds for Java, C#, Swift, Scala, Dart and PHP members.
