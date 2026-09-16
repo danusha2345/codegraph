@@ -279,6 +279,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Java packages named `build` under standard main and test source roots are now indexed without pulling Gradle or Maven build output into the graph. (#1642)
 - Erlang selective imports now resolve a bare call to the exact exported module, function, and arity, while unqualified calls stay within their own module instead of binding to an unrelated same-named project function. Re-index Erlang projects after upgrading. (#1610) (Erlang)
+- Incremental sync now applies WAL backpressure during changed-file storage and batched reference resolution, keeping long-lived readers from allowing the WAL to grow past its configured cap on large projects. (#1539)
+
+- Resolution no longer reads oversized dependency archives such as HarmonyOS `.har` packages as source text, preventing a single package target from exhausting the JavaScript heap during indexing or sync.
+
+- Dynamic-dispatch analysis no longer repeatedly copies every source prefix while scanning match-dense files, avoiding quadratic work and excessive peak memory during the final resolution pass.
 - Kotlin functions and methods now carry their signature — `(params): ReturnType` — in `codegraph_explore`, `node` and the viewer, instead of no signature at all. Re-index Kotlin projects after upgrading. (#1495)
 - TypeScript/JavaScript value aliases — `export const alias = fn`, `export { fn as alias }`, object-literal `api = { run: fn }`, and same-file `const local = fn` — now forward calls edges to the aliased function, so callers and impact on the implementation include consumers that call through the alias instead of stopping at the binding. Genuine wrappers (`() => fn()`) are unchanged. Re-index after upgrading. Thanks @valkyriweb. (#1482, #1485)
 - `codegraph affected` now finds Go, Python and JVM test files that previously went unreported, while preserving custom `--filter` behavior (thanks @danusha2345; #1507, #1688).
