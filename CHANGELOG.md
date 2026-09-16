@@ -158,6 +158,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The Claude Code prompt hook no longer runs on the task-notification messages Claude Code injects when a background agent finishes, removing a multi-second stall on every such turn. (#1832)
 - Projects queried through `projectPath` (a repository other than the server's default, such as an indexed child of an un-indexed workspace) now stay in sync like the default project does: the first call catches up edits made while no server was running, and a file watcher keeps the index current for as long as the project stays open in that session. Up to 8 such projects are kept open per server, the least recently used one is closed when a ninth is opened, and all are closed when the server stops. A project another live server already syncs is left to that server. (#1835)
 
+- `codegraph sync` no longer reports success when another process (an MCP server or another CLI mid-index) holds the index lock: it now exits with status 1 and prints one line on stderr naming the lock holder and asking you to retry — also with `--quiet`, so a git hook that fails on the exit code shows why.
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)
