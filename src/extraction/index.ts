@@ -3459,7 +3459,7 @@ export class ExtractionOrchestrator {
         const fullPath = path.join(this.rootDir, filePath);
         if (profileFiles?.has(filePath)) {
           try {
-            if (fs.statSync(fullPath).size > MAX_FILE_SIZE) {
+            if (fs.statSync(fullPath).size > MAX_SOURCE_FILE_SIZE_BYTES) {
               (tracked ? modified : added).push(filePath);
               continue;
             }
@@ -3512,7 +3512,7 @@ export class ExtractionOrchestrator {
       const fullPath = path.join(this.rootDir, filePath);
       if (profileFiles?.has(filePath)) {
         try {
-          if (fs.statSync(fullPath).size > MAX_FILE_SIZE) {
+          if (fs.statSync(fullPath).size > MAX_SOURCE_FILE_SIZE_BYTES) {
             (trackedMap.has(filePath) ? modified : added).push(filePath);
             continue;
           }
