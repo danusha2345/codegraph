@@ -7,6 +7,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { createDatabase, type SqliteDatabase } from './db/sqlite-adapter';
 
 /** The default per-project data directory name. */
 const DEFAULT_CODEGRAPH_DIR = '.codegraph';
@@ -88,16 +89,36 @@ export function getCodeGraphDir(projectRoot: string): string {
 
 /**
  * Check if a project has been initialized with CodeGraph
- * Requires both .codegraph/ directory AND codegraph.db to exist
+ * Probe the core schema read-only: an empty/foreign DB must not capture root
+ * discovery. Do not migrate or heal databases while walking ancestor paths.
  */
-export function isInitialized(projectRoot: string): boolean {
-  const codegraphDir = getCodeGraphDir(projectRoot);
-  if (!fs.existsSync(codegraphDir) || !fs.statSync(codegraphDir).isDirectory()) {
-    return false;
+export class IndexUnavailableError extends Error {
+  constructor(projectRoot: string) {
+    super(`The index at ${projectRoot} is temporarily unavailable; retry after the current writer finishes. No parent index was selected.`);
+    this.name = 'IndexUnavailableError';
   }
-  // Must have codegraph.db, not just .codegraph folder
-  const dbPath = path.join(codegraphDir, 'codegraph.db');
-  return fs.existsSync(dbPath);
+}
+
+export function isInitialized(projectRoot: string): boolean {
+  let db: SqliteDatabase | undefined;
+  try {
+    const dbPath = path.join(getCodeGraphDir(projectRoot), 'codegraph.db');
+    if (!fs.statSync(dbPath).isFile()) return false;
+    db = createDatabase(dbPath, { readOnly: true }).db;
+    const row = db.prepare(
+      "SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name IN ('nodes', 'edges', 'files')"
+    ).get() as { n: number };
+    return row.n === 3;
+  } catch (error) {
+    const err = error as { errcode?: number; code?: string; message?: string };
+    if (err.errcode === 5 || err.errcode === 6 || err.code === 'EACCES' || err.code === 'EPERM' ||
+        /database (?:is )?(?:locked|busy)/i.test(err.message ?? '')) {
+      throw new IndexUnavailableError(projectRoot);
+    }
+    return false;
+  } finally {
+    db?.close();
+  }
 }
 
 /**

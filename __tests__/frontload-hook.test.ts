@@ -12,16 +12,17 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { DatabaseConnection } from '../src/db';
 import { planFrontload, isTaskNotification, findIndexedSubprojectRoots, unsafeIndexRootReason, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens, PROMPT_HOOK_INJECTION_MAX, CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT, capPromptHookInjection } from '../src/directory';
 
 // Make the built-in exports configurable so HOME can point at a real temp
 // fixture without changing the process environment or the user's home files.
 vi.mock('os', async (importOriginal) => ({ ...await importOriginal<typeof import('os')>() }));
 
-/** Make `dir` look indexed (isInitialized needs `.codegraph/codegraph.db`). */
+/** Use a real core schema, as root discovery refuses empty placeholders. */
 function mkIndexed(dir: string): string {
   fs.mkdirSync(path.join(dir, '.codegraph'), { recursive: true });
-  fs.writeFileSync(path.join(dir, '.codegraph', 'codegraph.db'), '');
+  DatabaseConnection.initialize(path.join(dir, '.codegraph', 'codegraph.db')).close();
   return dir;
 }
 /** A workspace-root manifest so the down-scan gate (looksLikeProjectRoot) passes. */
