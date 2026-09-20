@@ -1517,6 +1517,7 @@ export class ToolHandler {
   private projectOpenPromises: Map<string, Promise<CodeGraph>> = new Map();
   // Invalidates an in-flight open when closeAll() begins during shutdown.
   private projectCacheGeneration = 0;
+  private projectCacheClosed = false;
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
@@ -1769,6 +1770,9 @@ export class ToolHandler {
    * similar to how git finds .git/ directories.
    */
   private async getCodeGraph(projectPath?: string): Promise<CodeGraph> {
+    if (this.projectCacheClosed) {
+      throw new NotIndexedError('This CodeGraph session has closed. Reconnect before querying a project.');
+    }
     if (!projectPath) {
       if (!this.cg) {
         const searched = this.defaultProjectHint ?? process.cwd();
@@ -1875,7 +1879,11 @@ export class ToolHandler {
         let gate: Promise<void>;
         try { gate = this.projectLifecycle.activate(cg); }
         catch (err) { gate = Promise.reject(err); }
-        this.projectGates.set(cg, gate.catch(() => { /* logged by engine */ }));
+        const safeGate = gate.catch(() => { /* logged by engine */ });
+        this.projectGates.set(cg, safeGate);
+        void safeGate.then(() => {
+          if (this.projectGates.get(cg) === safeGate) this.projectGates.delete(cg);
+        });
       }
       return cg;
     } finally {
@@ -1901,7 +1909,6 @@ export class ToolHandler {
     }
     const gate = this.projectGates.get(cg);
     if (!gate) return;
-    this.projectGates.delete(cg);
     await this.awaitCatchUpGate(gate);
   }
 
@@ -1941,6 +1948,7 @@ export class ToolHandler {
    * Close all cached project connections
    */
   closeAll(): void {
+    this.projectCacheClosed = true;
     this.projectCacheGeneration++;
     for (const cg of this.projectCache.values()) {
       this.closeProject(cg);

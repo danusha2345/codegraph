@@ -222,6 +222,25 @@ describe('Shared MCP daemon (issue #411)', () => {
     const live = CodeGraph.openSync(realRoot);
     try { expect(live.searchNodes('afterRebuild')).toHaveLength(1); }
     finally { live.close(); }
+    sendMessage(server.child, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: {
+      name: 'codegraph_search', arguments: { query: 'afterRebuild' },
+    } });
+    const response = await waitFor(() => findResponse(server.stdout, 3), 10000);
+    expect(response.result.isError).not.toBe(true);
+    expect(JSON.stringify(response.result)).toContain('afterRebuild');
+    if (process.platform === 'linux') {
+      const pid = readLockPid(realRoot);
+      expect(pid).toBeTruthy();
+      await waitFor(() => {
+        const directory = `/proc/${pid}/fd`;
+        return !fs.readdirSync(directory).some(fd => {
+          try {
+            const target = fs.readlinkSync(path.join(directory, fd));
+            return target.includes(path.join(realRoot, '.codegraph/codegraph.db')) && target.endsWith(' (deleted)');
+          } catch { return false; }
+        });
+      }, 5000, 25, 'release deleted database descriptors');
+    }
   }, 40000);
 
   it('two invocations share ONE detached daemon; both attach as proxies', async () => {

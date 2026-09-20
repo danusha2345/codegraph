@@ -126,6 +126,7 @@ describe('CodeGraph.reopenIfReplaced (issue #925)', () => {
 
     try {
       const reopening = server.reopenIfReplacedAsync();
+      await vi.waitFor(() => expect(openSpy).toHaveBeenCalledOnce());
       server.close();
       finishOpen(fresh);
 
