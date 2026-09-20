@@ -65,6 +65,75 @@ pub struct Walker<'t> {
     value_scopes: Vec<ValueScope<'t>>,
 }
 
+fn body_docstring(node: Node<'_>, source: &str) -> Option<String> {
+    fn literal(node: Node<'_>, source: &str) -> Option<String> {
+        match node.kind() {
+            "parenthesized_expression" => {
+                let first = (0..node.named_child_count()).filter_map(|i| node.named_child(i))
+                    .find(|child| child.kind() != "comment")?;
+                literal(first, source)
+            }
+            "concatenated_string" => {
+                let mut value = String::new();
+                for i in 0..node.named_child_count() {
+                    let child = node.named_child(i)?;
+                    if child.kind() != "comment" { value.push_str(&literal(child, source)?); }
+                }
+                Some(value)
+            }
+            "string" => {
+                let text = node.utf8_text(source.as_bytes()).ok()?;
+                let prefix = text.bytes().take_while(|b| matches!(b, b'r' | b'R' | b'u' | b'U')).count();
+                let rest = &text[prefix..];
+                let quote = ["\"\"\"", "'''", "\"", "'"].into_iter().find(|q| rest.starts_with(q))?;
+                if !rest.ends_with(quote) || rest.len() < 2 * quote.len() { return None; }
+                Some(rest[quote.len()..rest.len() - quote.len()].to_string())
+            }
+            _ => None,
+        }
+    }
+    let body = if node.kind() == "module" { node } else { node.child_by_field_name("body")? };
+    let first = (0..body.named_child_count()).filter_map(|i| body.named_child(i))
+        .find(|c| c.kind() != "comment")?;
+    if first.kind() != "expression_statement" { return None; }
+    let value = literal(first.named_child(0)?, source)?;
+    let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<String> = normalized.split('\n').map(|line| {
+        let mut out = String::new();
+        let mut column = 0;
+        for ch in line.chars() {
+            if ch == '\t' {
+                let spaces = 8 - column % 8;
+                out.push_str(&" ".repeat(spaces));
+                column += spaces;
+            } else {
+                out.push(ch);
+                column += 1;
+            }
+        }
+        out
+    }).collect();
+    let whitespace = |ch: char| ch.is_whitespace() || matches!(ch, '\u{001c}'..='\u{001f}');
+    let margin = lines.iter().skip(1).filter(|line| !line.trim_matches(whitespace).is_empty())
+        .map(|line| line.chars().take_while(|ch| whitespace(*ch)).count()).min().unwrap_or(0);
+    let mut cleaned = vec![lines[0].trim_start_matches(whitespace).to_string()];
+    cleaned.extend(lines.iter().skip(1).map(|line| line.chars().skip(margin).collect::<String>()));
+    let first = cleaned.iter().position(|line| !line.trim_matches(whitespace).is_empty());
+    let last = cleaned.iter().rposition(|line| !line.trim_matches(whitespace).is_empty());
+    let text = match (first, last) {
+        (Some(first), Some(last)) => cleaned[first..=last].join("\n"),
+        _ => String::new(),
+    };
+    if text.is_empty() { None } else { Some(text) }
+}
+
+fn definition_docstring(node: Node<'_>, source: &str) -> Option<String> {
+    match (preceding_docstring(node, source), body_docstring(node, source)) {
+        (Some(comment), Some(body)) => Some(format!("{comment}\n\n{body}")),
+        (comment, body) => comment.or(body),
+    }
+}
+
 pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
     let grammar = crate::langs::grammar_for("python").ok_or("no python grammar")?;
     let t0 = std::time::Instant::now();
@@ -102,6 +171,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
     let file_id = w.arena.put(&ids::file_node_id(file_path));
     let name_ref = w.arena.put(base_name);
     let qn_ref = w.arena.put(file_path);
+    let module_doc = opt_str(&mut w.arena, body_docstring(tree.root_node(), source).as_deref());
     w.tables.push_node(&NodeRow {
         kind: node_kind_index("file").unwrap(),
         visibility: 0,
@@ -113,7 +183,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         name: name_ref,
         qualified_name: qn_ref,
         id: file_id,
-        docstring: NONE_STR,
+        docstring: module_doc,
         signature: NONE_STR,
         decorators: NONE_STR,
         type_parameters: NONE_STR,
@@ -402,7 +472,7 @@ impl<'t> Walker<'t> {
             return;
         }
         let extra = Extra {
-            docstring: preceding_docstring(node, self.src),
+            docstring: definition_docstring(node, self.src),
             signature: self.signature_of(node),
             is_async: Some(self.is_async(node)),
             is_static: Some(self.is_static(node)),
@@ -421,7 +491,7 @@ impl<'t> Walker<'t> {
         stack_guard!();
         let name = self.extract_name(node);
         let extra = Extra {
-            docstring: preceding_docstring(node, self.src),
+            docstring: definition_docstring(node, self.src),
             signature: self.signature_of(node),
             is_async: Some(self.is_async(node)),
             is_static: Some(self.is_static(node)),
@@ -439,7 +509,7 @@ impl<'t> Walker<'t> {
         stack_guard!();
         let name = self.extract_name(node);
         let extra = Extra {
-            docstring: preceding_docstring(node, self.src),
+            docstring: definition_docstring(node, self.src),
             ..Extra::default()
         };
         let Some(row) = self.create_node("class", &name, node, extra) else { return };

@@ -164,6 +164,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Пустая или посторонняя база в родительском каталоге больше не скрывает индексированные подпроекты. (#1895)
 - Restarting after an interrupted index no longer gets trapped in repeated watchdog restarts while repairing the database. (#1887)
 - После полной переиндексации автообновление и MCP-запросы подхватывают новую базу и сверяют изменения, пропущенные во время её замены. (#1902)
+- Python docstrings модулей, классов и функций теперь доступны в поиске; для существующих проектов требуется переиндексация. (#1905)
 
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 

@@ -561,6 +561,7 @@ export class TreeSitterExtractor {
         startColumn: 0,
         endColumn: 0,
         isExported: false,
+        docstring: this.extractor?.getBodyDocstring?.(this.tree.rootNode, this.source),
         updatedAt: Date.now(),
       };
       this.nodes.push(fileNode);
@@ -1608,6 +1609,12 @@ export class TreeSitterExtractor {
   /**
    * Extract a function
    */
+  private definitionDocstring(node: SyntaxNode): string | undefined {
+    const comment = getPrecedingDocstring(node, this.source);
+    const body = this.extractor?.getBodyDocstring?.(node, this.source);
+    return [comment, body].filter(Boolean).join('\n\n') || undefined;
+  }
+
   private extractFunction(node: SyntaxNode, nameOverride?: string): void {
     if (!this.extractor) return;
 
@@ -1679,7 +1686,7 @@ export class TreeSitterExtractor {
       return;
     }
 
-    const docstring = getPrecedingDocstring(node, this.source);
+    const docstring = this.definitionDocstring(node);
     const signature = this.extractor.getSignature?.(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = commonJsExport || this.extractor.isExported?.(node, this.source);
@@ -1797,7 +1804,7 @@ export class TreeSitterExtractor {
     if (this.extractor.skipBodilessClass && !resolvedBody) return;
 
     const name = extractName(node, this.source, this.extractor);
-    const docstring = getPrecedingDocstring(node, this.source);
+    const docstring = this.definitionDocstring(node);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
 
@@ -1881,7 +1888,7 @@ export class TreeSitterExtractor {
       return;
     }
 
-    const docstring = getPrecedingDocstring(node, this.source);
+    const docstring = this.definitionDocstring(node);
     const signature = this.extractor.getSignature?.(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
     const isAsync = this.extractor.isAsync?.(node);
