@@ -33,7 +33,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
+import { ChildProcessWithoutNullStreams, spawn, execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -198,6 +198,31 @@ describe('Shared MCP daemon (issue #411)', () => {
     servers.length = 0;
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
+
+  it.runIf(process.platform !== 'win32')('auto-sync reaches the live database after a CLI rebuild (#1902)', async () => {
+    const file = path.join(realRoot, 'a.ts');
+    fs.writeFileSync(file, 'export function beforeRebuild() { return 1; }');
+    const cg = CodeGraph.openSync(realRoot);
+    await cg.indexAll();
+    cg.close();
+    const server = spawnServer(tempDir, { CODEGRAPH_WATCH_DEBOUNCE_MS: '100' });
+    servers.push(server);
+    sendInitialize(server.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(server.stdout, 1), 10000);
+    await waitFor(() => readDaemonLog(realRoot).includes('File watcher active'), 10000);
+    sendMessage(server.child, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: {
+      name: 'codegraph_search', arguments: { query: 'beforeRebuild' },
+    } });
+    await waitFor(() => findResponse(server.stdout, 2), 10000);
+    execFileSync(process.execPath, [BIN, 'index', realRoot], {
+      env: process.env, timeout: 20000, stdio: 'pipe',
+    });
+    fs.writeFileSync(file, 'export function afterRebuild() { return 22; }');
+    await waitFor(() => readDaemonLog(realRoot).includes('Auto-synced'), 10000);
+    const live = CodeGraph.openSync(realRoot);
+    try { expect(live.searchNodes('afterRebuild')).toHaveLength(1); }
+    finally { live.close(); }
+  }, 40000);
 
   it('two invocations share ONE detached daemon; both attach as proxies', async () => {
     const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '15000' };
