@@ -6,7 +6,7 @@
 
 import type CodeGraph from '../index';
 import type { QueryPool } from './query-pool';
-import { findNearestCodeGraphRoot } from '../directory';
+import { findNearestCodeGraphRoot, IndexUnavailableError } from '../directory';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
 // schemas), but it must NOT drag in sqlite/query layers before the daemon binds;
@@ -2186,7 +2186,7 @@ export class ToolHandler {
       // Expected condition, not a malfunction: answer as a SUCCESS so the
       // agent keeps trusting the toolset for projects that ARE indexed.
       // (An isError here teaches session-long abandonment — see NotIndexedError.)
-      if (err instanceof NotIndexedError) {
+      if (err instanceof NotIndexedError || err instanceof IndexUnavailableError) {
         return this.textResult(err.message);
       }
       // Security refusal: a clean error, no retry encouragement.
@@ -2269,7 +2269,7 @@ export class ToolHandler {
     try {
       return await this.dispatchTool(toolName, args);
     } catch (err) {
-      if (err instanceof NotIndexedError) {
+      if (err instanceof NotIndexedError || err instanceof IndexUnavailableError) {
         return this.textResult(err.message);
       }
       if (err instanceof PathRefusalError) {
