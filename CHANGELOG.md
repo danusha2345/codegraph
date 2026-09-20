@@ -162,6 +162,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `codegraph sync` no longer reports success when another process (an MCP server or another CLI mid-index) holds the index lock: it now exits with status 1 and prints one line on stderr naming the lock holder and asking you to retry — also with `--quiet`, so a git hook that fails on the exit code shows why.
 - Пустая или посторонняя база в родительском каталоге больше не скрывает индексированные подпроекты. (#1895)
+- Restarting after an interrupted index no longer gets trapped in repeated watchdog restarts while repairing the database. (#1887)
 
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
