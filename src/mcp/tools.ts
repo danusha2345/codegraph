@@ -1924,7 +1924,7 @@ export class ToolHandler {
    */
   private async freshen(cg: CodeGraph): Promise<CodeGraph> {
     try {
-      if (await cg.reopenIfReplacedAsync()) {
+      if (!cg.isIndexing() && await cg.reopenIfReplacedAsync()) {
         process.stderr.write(
           '[CodeGraph MCP] The index was replaced on disk (e.g. a git worktree ' +
           'recreated at the same path); reopened the live database in place.\n'
@@ -2282,6 +2282,10 @@ export class ToolHandler {
       // thread against the watched default instance, so it is NEVER off-loaded to
       // a worker (whose read connection has no watcher). It also skips the
       // auto-banner wrapper to avoid duplicating its own pending-files section.
+      if (!await (await this.getCodeGraph(args.projectPath as string | undefined)).syncIfReplaced(toolName !== 'codegraph_status')) {
+        return this.textResult('The index was replaced and its catch-up is not complete (another writer may be active). Retry shortly; no results from an unverified index were returned.');
+      }
+
       if (toolName === 'codegraph_status') {
         return await this.handleStatus(args);
       }

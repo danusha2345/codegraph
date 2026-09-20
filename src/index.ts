@@ -161,6 +161,11 @@ export class CodeGraph {
   // Mutex for preventing concurrent indexing operations (in-process)
   private indexMutex = new Mutex();
 
+  // Events acknowledged against a replaced database may be absent in the new
+  // index. Keep this until a full reconcile succeeds, including lock retries.
+  private replacedIndexNeedsSync = false;
+  private replacementSync: Promise<boolean> | null = null;
+
   // File lock for preventing concurrent writes across processes (CLI, MCP, git hooks)
   private fileLock: FileLock;
 
@@ -270,6 +275,7 @@ export class CodeGraph {
     // Releasing the dead handle also frees the leaked db/-wal/-shm fds that were
     // pinning the unlinked inode (#925).
     try { stale.close(); } catch { /* the old inode is gone; closing just frees fds */ }
+    this.replacedIndexNeedsSync = true;
     return true;
   }
 
@@ -277,7 +283,8 @@ export class CodeGraph {
   async reopenIfReplacedAsync(): Promise<boolean> {
     if (this.closed) return false;
     if (this.reopenPromise) return this.reopenPromise;
-    const reopening = this.doReopenIfReplacedAsync();
+    if (!this.db.isReplacedOnDisk()) return false;
+    const reopening = this.indexMutex.withLock(() => this.doReopenIfReplacedAsync());
     this.reopenPromise = reopening;
     try {
       return await reopening;
@@ -288,6 +295,7 @@ export class CodeGraph {
 
   /** Serialized implementation for {@link reopenIfReplacedAsync}. */
   private async doReopenIfReplacedAsync(): Promise<boolean> {
+    if (this.closed) return false;
     if (!this.db.isReplacedOnDisk()) return false;
     const dbPath = this.db.getPath();
     // As above, complete the new open before disturbing the still-usable stale
@@ -302,7 +310,23 @@ export class CodeGraph {
     this.queries = new QueryBuilder(fresh.getDb());
     this.wireLayers();
     try { stale.close(); } catch { /* the old inode is gone; closing just frees fds */ }
+    this.replacedIndexNeedsSync = true;
     return true;
+  }
+
+  /** Catch up a replaced index before MCP dispatch, including pool reads. */
+  async syncIfReplaced(wait = true): Promise<boolean> {
+    if (this.closed) return false;
+    if (this.replacementSync) return wait ? this.replacementSync : false;
+    if (!this.replacedIndexNeedsSync && !this.db.isReplacedOnDisk()) return true;
+    if (!wait) return false;
+    const recovering = this.sync().then(result =>
+      !(result.filesChecked === 0 && result.durationMs === 0) &&
+      !this.replacedIndexNeedsSync && !this.db.isReplacedOnDisk()
+    );
+    this.replacementSync = recovering;
+    try { return await recovering; }
+    finally { if (this.replacementSync === recovering) this.replacementSync = null; }
   }
 
   // ===========================================================================
@@ -839,6 +863,14 @@ export class CodeGraph {
           filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0,
         };
       }
+      try {
+        await this.doReopenIfReplacedAsync();
+        if (this.closed) throw new Error('Project closed during index recovery');
+        if (this.replacedIndexNeedsSync) options = { ...options, paths: undefined };
+      } catch (err) {
+        this.fileLock.release();
+        throw err;
+      }
       // Defer WAL auto-checkpointing for the whole incremental run, exactly
       // as indexAll does for the bulk path (#1231): sync's store loop and its
       // resolution passes churn the same FTS + secondary-index hot pages, and
@@ -1098,6 +1130,8 @@ export class CodeGraph {
 
         this.orchestrator.commitHdlProfile();
         this.orchestrator.finishGitIndexState(gitState, fullReconcile, result.failedFilePaths);
+
+        if (fullReconcile && !result.failedFilePaths?.length) this.replacedIndexNeedsSync = false;
 
         return result;
       } finally {
