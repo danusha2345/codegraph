@@ -165,6 +165,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- A file over the size limit is no longer read before it is skipped: committed video and blob fixtures used to be decoded in full — a 400 MB fixture cost 3.4 GB of memory — only to be discarded, and the same file was read again by every resolution pass. Its size stamp now stands in for its content, during indexing and when checking for changes. (#1910)
 - An MPEG transport stream video that happens to be named `.ts` (golden fixtures under `testdata/`, e2e clips) is now recognised from its first bytes and skipped instead of being fed to the TypeScript parser, which spent a long time on each clip for no symbols. Real TypeScript files are still indexed. (#1910)
 - File watching no longer drops the full re-scan a removed directory asks for when that sync fails, so the deleted files leave the index instead of lingering. (#1964)
 - Daemon startup and cleanup now preserve live legacy PID-only locks while still reclaiming dead or identity-disproved records, preventing two writers from serving the same project.
