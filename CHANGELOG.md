@@ -36,6 +36,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **HDL build profiles.** An optional `hdl` section in `codegraph.json` selects source files or filelists, include directories and defines; conditional-compilation branches are indexed under the active profile, `codegraph status` reports the configured versus the indexed profile, and the file watcher follows filelists and included headers.
 
 - **Computed parameters and port widths.** `codegraph hdl-semantic` runs an installed slang (or pyslang through `--python`) on the active profile and returns evaluated parameters, port widths and macro origins as a separate answer, without touching the indexed graph.
+- `codegraph serve --mcp --no-telemetry` turns telemetry off for one MCP server entry, so a shared MCP config can opt out without an environment variable. (#1908)
 
 - **Codex and Astra read project guidance from `AGENTS.md`.** The canonical agent guide now lives in `AGENTS.md` (with a nested `docs/AGENTS.md` for long validation notes); `CLAUDE.md` is a thin `@AGENTS.md` wrapper for Claude Code. Codex/Astra no longer miss the old CLAUDE-only instructions.
 
