@@ -168,6 +168,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - An empty or table-less `codegraph.db` left behind in a parent directory (by an interrupted `codegraph init`, or a never-populated `~/.codegraph/`) no longer counts as an initialized project, so it can no longer hide the real index of every project beneath it. Only a database that actually carries the codegraph schema is treated as initialized, and `codegraph init` in the directory with the broken file now repairs it instead of refusing with "Already initialized". (#1895)
 - Scala classes that extend a parent with several argument lists keep every `with` parent, and Scala 3 capture types and `given … with` bodies parse, because the bundled Scala grammar moved to its v0.26.2 release. Re-index Scala projects to pick this up. (#1823)
 
+- Kotlin calls through a class property, including a primary-constructor property, now resolve on the property's declared type instead of a same-named method on the interface or on an unrelated class. Re-index Kotlin projects to pick this up.
+
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
 - A C or C++ macro invocation such as `TRACE_POINT(1)` no longer shows up as a call to a same-named function in another file when the macro is defined in that file or one of its included headers; function-like macros are indexed as constants, never as callees. (#1838)
