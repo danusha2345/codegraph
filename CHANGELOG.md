@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- **Play projects no longer send `Class.method` calls to another class's method in the same file.** In a Play app, a route handler or a call like `MediaType.parse(...)` went to the first method with that name anywhere in the class's file — often a nested or sibling class's — and now goes only to a method of the class it names.
+
 
 ## [1.6.1] - 2026-09-29
 
