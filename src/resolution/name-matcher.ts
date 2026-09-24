@@ -14,7 +14,7 @@ import { JS_BUILT_INS, JS_BUILTIN_METHOD_NAMES, TS_PRIMITIVE_TYPES } from './js-
 import { isVerilogMemberRef, matchVerilogMember } from './verilog-members';
 import { isVerilogPortRef, matchVerilogPort } from './verilog-ports';
 import { isVerilogWildcardRef, matchVerilogWildcard } from './verilog-wildcard';
-import { LIBRARY_METHOD_NAMES } from './library-methods';
+import { LIBRARY_METHOD_NAMES, JAVA_STD_CLASSES } from './library-methods';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -307,14 +307,23 @@ function receiverTailName(receiver: string): string {
  * resolve before any name-only strategy and never reach this check.
  */
 function isUnevidencedLibraryCall(candidates: Node[], receiver: string, methodName: string, ref: UnresolvedRef): boolean {
-  if (ref.referenceKind !== 'calls' || !LIBRARY_METHOD_NAMES[ref.language]?.has(methodName)) return false;
+  if (ref.referenceKind !== 'calls') return false;
+  const java = ref.language === 'java';
+  // Java: any static call on a java.lang / java.util class (`Objects.hash(…)`).
+  const stdClass = java && JAVA_STD_CLASSES.has(/^(?:java\.[\w.]*\.)?([A-Z]\w*)$/.exec(receiver)?.[1] ?? '');
+  if (!stdClass && !LIBRARY_METHOD_NAMES[ref.language]?.has(methodName)) return false;
   // The enclosing type's own method (`base.Dispose()` in C#) is not a guess.
   if (OWN_TYPE_RECEIVER.test(receiver)) return false;
+  const tail = receiverTailName(receiver);
+  // Java: a constant (`Keys.ACTION_CLEAR.equals(s)`, `Integer.TYPE.equals(c)`)
+  // is named for its value, not its type, and its class is not its type
+  // either — no evidence, except a singleton's `INSTANCE`.
+  if (java && /^[A-Z][A-Z0-9_]+$/.test(tail) && tail !== 'INSTANCE') return true;
   // The receiver's own name, plus a capitalized chain root — a type or
   // companion whose members return it (`GpsMode.ON.next()`,
   // `Lock.tryBegin(1)!!.close()`).
   const root = /^[A-Z]\w*/.exec(receiver)?.[0] ?? '';
-  const receiverWords = nameWords(`${receiverTailName(receiver)} ${root}`);
+  const receiverWords = nameWords(`${tail} ${root}`);
   if (receiverWords.length === 0) return true;
   return !candidates.some((c) => {
     const owner = c.qualifiedName.split('::').slice(0, -1).filter((seg) => !seg.includes('.'));
