@@ -195,6 +195,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A method calling another method of its own class — `render()` in Java, Kotlin, C#, Scala, Swift, C++, Dart or Ruby, or `this.render()` / `self.render()` / `$this->render()` — now links to that class's method (or the one it inherits or is nested in) instead of a same-named method of another class declared nearer in the file.
 
 - Java calls on a value of unknown type, such as `map.put(...)`, `s.toString()`, `KEY.equals(...)` on a constant, or `Objects.hash(...)` and `Collections.emptyMap()` under a wildcard `java.util.*` import, no longer link to a project method that merely shares the name.
+- Go method calls now resolve through the receiver's declared type — an unexported or package-qualified parameter, a constructor's result, or a variable named like a standard-library package (`ring`, `token`) — and a receiver typed outside the project (`net.Conn`, `*bytes.Buffer`, `error`) no longer links to an unrelated project method of the same name; re-index to pick this up.
 
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)
 
