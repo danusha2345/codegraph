@@ -192,6 +192,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - In TypeScript and JavaScript, a method called on a freshly constructed object, such as `new RegExp(p).exec(s)` or `new URL(u).toString()`, now links only to that class's own (or inherited) method and no longer to an unrelated project method of the same name.
 - Standard-library calls on a value of unknown type, such as `name.len()` in Rust, `list.isEmpty()` in Kotlin, `options.setdefault(...)` in Python, `conn.Close()` in Go, `opt.map(...)` in Scala or `Task.Run(...)` in C#, no longer link to a project method that merely shares the name.
+- A method calling another method of its own class — `render()` in Java, Kotlin, C#, Scala, Swift, C++, Dart or Ruby, or `this.render()` / `self.render()` / `$this->render()` — now links to that class's method (or the one it inherits or is nested in) instead of a same-named method of another class declared nearer in the file.
 
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)
 
