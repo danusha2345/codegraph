@@ -175,6 +175,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - In TypeScript and JavaScript, calling a function through an object that lists it by name (`const api = { getUser }` or `{ getUser: getUser }`) now counts as a caller in the object's own file too, so the function no longer looks unused. (#1932)
 
+- When a project keeps copies of the same code in several modules, a call now links to the copy in the caller's own module, even in deeply nested trees where it could previously land on another module's copy.
+
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
 - A C or C++ macro invocation such as `TRACE_POINT(1)` no longer shows up as a call to a same-named function in another file when the macro is defined in that file or one of its included headers; function-like macros are indexed as constants, never as callees. (#1838)
