@@ -6047,6 +6047,7 @@ export function matchMethodCall(
           !sharesReceiverWord(objectOrClass!, targetMethods[0]!) &&
           !(ref.language === 'objc' && objcReceiverReaches(objectOrClass!, targetMethods[0]!, context)) &&
           !(ref.language === 'php' && phpReceiverReaches(objectOrClass!, targetMethods[0]!, context)))) {
+      if (isForeignReceiverSelfLoop(targetMethods[0]!, objectOrClass!, ref, context)) return null;
       return {
         original: ref,
         targetNodeId: targetMethods[0]!.id,
@@ -6094,6 +6095,7 @@ export function matchMethodCall(
       }
 
       if (bestMatch && bestScore >= 2) {
+        if (isForeignReceiverSelfLoop(bestMatch, objectOrClass!, ref, context)) return null;
         return {
           original: ref,
           targetNodeId: bestMatch.id,
@@ -6143,6 +6145,38 @@ function isImportBinding(receiver: string, ref: UnresolvedRef, context: Resoluti
 function isOutOfRepoBinding(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const binding = context.getImportMappings?.(ref.filePath, ref.language)?.find((m) => m.localName === name);
   return !!binding && context.isOutOfRepoImport?.(binding.source, ref.filePath, ref.language) === true;
+}
+
+/** Receivers that name the current object (or its own class/base) — a call
+ * through one of these may genuinely recurse into the enclosing method. */
+const SELF_RECEIVERS = new Set(['this', 'self', 'Self', 'super', 'cls']);
+
+/**
+ * Strategy 3 matches by method NAME (plus receiver/class word overlap), so a
+ * delegating wrapper — `underlying.getHeaders()` inside `getHeaders()`,
+ * `cache.get(k)` inside `get(k)` — name-matches the method it is written in
+ * and the resolver emitted a self-loop. A receiver that is an explicit, other
+ * object is by construction not the enclosing method's own instance, so that
+ * candidate is the one guess we know is wrong: no edge beats a wrong edge.
+ * Real recursion (`this.foo()`, `self.foo()`, bare `foo()`, Go's named method
+ * receiver `r.foo()`) is kept.
+ */
+function isForeignReceiverSelfLoop(
+  candidate: Node,
+  receiver: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): boolean {
+  if (candidate.id !== ref.fromNodeId) return false;
+  if (SELF_RECEIVERS.has(receiver)) return false;
+  if (ref.language === 'go') {
+    // `func (r *T) M()` — the receiver is an ordinary identifier in Go.
+    const lines = context.getFileLines?.(candidate.filePath) ?? context.readFile(candidate.filePath)?.split('\n') ?? [];
+    const decl = lines[candidate.startLine - 1] ?? '';
+    const goRecv = decl.match(/^\s*func\s*\(\s*(\w+)/);
+    if (goRecv && goRecv[1] === receiver) return false;
+  }
+  return true;
 }
 
 /** Go builtin/primitive field types that can never carry a project method. */
