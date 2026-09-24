@@ -171,6 +171,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Kotlin calls through a class property, a primary-constructor property, or a variable set from a function call now resolve on the declared type, and a call on a library type (such as `Regex` or a JDK class) no longer links to an unrelated project method with the same name. Re-index Kotlin projects to pick this up.
 - Kotlin `fun interface` declarations are indexed, and no longer hide the declaration that follows them.
 
+- Java and Kotlin inheritance now resolves nested types more precisely, and anonymous implementations retain their members after re-indexing.
+
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
 - A C or C++ macro invocation such as `TRACE_POINT(1)` no longer shows up as a call to a same-named function in another file when the macro is defined in that file or one of its included headers; function-like macros are indexed as constants, never as callees. (#1838)
