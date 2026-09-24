@@ -186,6 +186,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - C++ local object initialization — `Widget w;`, `Widget w(1);`, `Widget w{1};` — now calls the constructor defined for the type in the nearest namespace, picking the overload whose parameter count fits when exactly one does, instead of pointing at the class itself; plain aggregates, pointers, references and `extern` declarations produce no call. (#1839)
 - A call to a function defined in the same file is no longer marked as an uncertain match when the file sits near the top of the project, and it now wins over a weaker same-named guess in another file.
+- A method called on the result of an expression, such as `(await list()).map(...)` in TypeScript or `v.iter().map(...)` in Rust, no longer links to an unrelated same-named method, and calls no longer link into another language they cannot reach, such as Rust onto a TypeScript class or Kotlin onto a JavaScript function.
 
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)
 
