@@ -5,6 +5,7 @@
  */
 
 import * as fs from 'fs';
+import { readBoundedSourceSync } from '../file-limits';
 import * as path from 'path';
 import { Language, Node, UnresolvedReference, Edge } from '../types';
 import { QueryBuilder } from '../db/queries';
@@ -32,7 +33,6 @@ import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
-import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
@@ -446,12 +446,7 @@ export class ReferenceResolver {
       // Import resolvers may follow package metadata to an archive (`file:*.har`,
       // for example). Reject anything extraction would not accept before UTF-8
       // decoding can multiply a large binary blob into gigabytes of V8 heap.
-      const stats = fs.statSync(fullPath);
-      if (!stats.isFile() || stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
-        this.fileCache.set(filePath, null);
-        return null;
-      }
-      const content = fs.readFileSync(fullPath, 'utf-8');
+      const content = readBoundedSourceSync(fullPath).bytes?.toString('utf8') ?? null;
       this.fileCache.set(filePath, content);
       return content;
     } catch (error) {
