@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- A method calling another method of its own class — `render()` in Java, Kotlin, C#, Scala, Swift, C++, Dart or Ruby, or `this.render()` / `self.render()` / `$this->render()` — now links to that class's method (or the one it inherits or is nested in) instead of a same-named method of another class declared nearer in the file.
 
 ## [1.6.1] - 2026-09-29
 
