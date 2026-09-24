@@ -14,6 +14,7 @@ import { resolveWorkspaceImport } from './workspace-packages';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
+  objectLiteralMemberBinding,
   localReceiverTypePatterns,
   normalizeInferredTypeName,
 } from './name-matcher';
@@ -887,9 +888,73 @@ export function extractImportMappings(
     mappings.push(...extractPHPImports(content));
   } else if (language === 'c' || language === 'cpp') {
     mappings.push(...extractCppImports(content));
+  } else if (language === 'erlang') {
+    mappings.push(...extractErlangImports(content));
   }
 
   return mappings;
+}
+
+/**
+ * Extract Erlang's selective imports: `-import(module, [f/1, g/2]).`
+ *
+ * The arity stays in the local/exported name because it is part of an Erlang
+ * function's identity. The module name is an atom, not a filesystem path; the
+ * Erlang branch in resolveViaImport uses it to form the qualified name.
+ */
+function extractErlangImports(content: string): ImportMapping[] {
+  const mappings: ImportMapping[] = [];
+  const atom = String.raw`(?:'(?:\\.|[^'])*'|[a-z][A-Za-z0-9_@]*)`;
+  const importRe = new RegExp(
+    String.raw`^\s*-import\s*\(\s*(${atom})\s*,\s*\[([\s\S]*?)\]\s*\)\s*\.`,
+    'gm',
+  );
+  const bindingRe = new RegExp(String.raw`(${atom})\s*\/\s*(\d{1,3})`, 'g');
+  const unquoteAtom = (value: string): string => value.replace(/^'([\s\S]*)'$/, '$1');
+
+  let importMatch: RegExpExecArray | null;
+  while ((importMatch = importRe.exec(content)) !== null) {
+    const source = unquoteAtom(importMatch[1]!);
+    const bindings = stripErlangLineComments(importMatch[2]!);
+    bindingRe.lastIndex = 0;
+    let bindingMatch: RegExpExecArray | null;
+    while ((bindingMatch = bindingRe.exec(bindings)) !== null) {
+      const name = `${unquoteAtom(bindingMatch[1]!)}/${bindingMatch[2]}`;
+      mappings.push({
+        localName: name,
+        exportedName: name,
+        source,
+        isDefault: false,
+        isNamespace: false,
+      });
+    }
+  }
+
+  return mappings;
+}
+
+/** Strip `%` comments without treating a percent inside a quoted atom/string as a comment. */
+function stripErlangLineComments(value: string): string {
+  let result = '';
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i]!;
+    if (quote) {
+      result += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === quote) quote = null;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+      result += ch;
+    } else if (ch === '%') {
+      while (i + 1 < value.length && value[i + 1] !== '\n') i++;
+    } else {
+      result += ch;
+    }
+  }
+  return result;
 }
 
 /**
@@ -1573,6 +1638,31 @@ export function resolveViaImport(
     return null;
   }
 
+  // Erlang selective imports name a module rather than a filesystem path, and
+  // the imported binding includes its arity (`-import(a, [f/1])`). Resolve the
+  // exact module::function/arity identity before the generic path-based import
+  // logic. Ambiguous duplicate module definitions are left unresolved.
+  if (ref.language === 'erlang' && /^.+\/\d{1,3}$/.test(ref.referenceName)) {
+    const imp = imports.find((candidate) => candidate.localName === ref.referenceName);
+    if (imp) {
+      const candidates = context
+        .getNodesByQualifiedName(`${imp.source}::${imp.exportedName}`)
+        .filter(
+          (node) =>
+            node.language === 'erlang' && node.kind === 'function' && node.isExported,
+        );
+      if (candidates.length === 1) {
+        return {
+          original: ref,
+          targetNodeId: candidates[0]!.id,
+          confidence: 0.95,
+          resolvedBy: 'import',
+        };
+      }
+    }
+    return null;
+  }
+
   // Go cross-package calls: `pkga.FuncX(...)` extracts to referenceName
   // `pkga.FuncX` and the import `github.com/example/myproject/pkga`
   // maps to a *package directory* containing one or more .go files.
@@ -1891,17 +1981,7 @@ function resolveObjectLiteralAlias(
 ): ResolvedRef | null {
   if (container.kind !== 'constant' && container.kind !== 'variable') return null;
   if (!JS_FAMILY_FILE.test(container.filePath)) return null;
-  if (!/^[A-Za-z_$][\w$]*$/.test(member)) return null;
-  const lines = context.getFileLines?.(container.filePath) ?? context.readFile(container.filePath)?.split('\n');
-  if (!lines) return null;
-  const extent = lines.slice(container.startLine - 1, container.endLine).join('\n');
-  const brace = extent.indexOf('{');
-  if (brace < 0) return null;
-  const body = extent.slice(brace);
-  const keyed = new RegExp(`[{,\\s]${member}\\s*:\\s*([A-Za-z_$][\\w$]*)\\s*[,}]`);
-  const shorthand = new RegExp(`[{,\\s]${member}\\s*[,}]`);
-  const k = body.match(keyed);
-  const binding = k ? k[1]! : shorthand.test(body) ? member : null;
+  const binding = objectLiteralMemberBinding(container, member, context);
   if (binding === null) return null;
 
   const callable = (n: Node) => n.kind === 'function' || n.kind === 'method' || n.kind === 'class';

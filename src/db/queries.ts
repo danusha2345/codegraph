@@ -163,6 +163,22 @@ interface UnresolvedRefRow {
  * refs against newly-added node names.
  */
 function referenceNameTail(referenceName: string): string {
+  // Named HDL connections carry structured module/port/instance identity.
+  // Retry on the formal port name when a previously removed port reappears.
+  for (const prefix of ['hdl:port-position:', 'hdl:wildcard:']) {
+    if (referenceName.startsWith(prefix)) {
+      try {
+        const parts: unknown = JSON.parse(referenceName.slice(prefix.length));
+        if (Array.isArray(parts) && typeof parts[0] === 'string') return parts[0];
+      } catch { /* Fall back for malformed internal references. */ }
+    }
+  }
+  if (referenceName.startsWith('hdl:port:')) {
+    try {
+      const parts: unknown = JSON.parse(referenceName.slice('hdl:port:'.length));
+      if (Array.isArray(parts) && parts.length === 3 && typeof parts[1] === 'string') return parts[1];
+    } catch { /* Malformed refs retain the generic tail behavior below. */ }
+  }
   // Erlang refs carry a written arity (`f/1`, `mod::fn/2` — #1610); the tail a
   // new symbol's plain name could match is the arity-less function name.
   const base = referenceName.replace(/\/\d{1,3}$/, '') || referenceName;
@@ -251,6 +267,13 @@ export class QueryBuilder {
   private nodeCache: Map<string, Node> = new Map();
   private readonly maxCacheSize = 1000;
 
+  // getDominantFile()'s answer, tagged with the database change stamp it was
+  // computed under (see getChangeStamp). Query-independent, so one value
+  // serves every explore until the database changes (#1864).
+  private dominantFileMemo:
+    | { stamp: string; value: { filePath: string; edgeCount: number; nextEdgeCount: number } | null }
+    | undefined;
+
   // Prepared statements (lazily initialized)
   private stmts: {
     insertNode?: SqliteStatement;
@@ -289,6 +312,7 @@ export class QueryBuilder {
     getAllFilePaths?: SqliteStatement;
     getAllNodeNames?: SqliteStatement;
     getDominantFile?: SqliteStatement;
+    getChangeStamp?: SqliteStatement;
     getTopRouteFile?: SqliteStatement;
     getRoutingManifest?: SqliteStatement;
     insertNameSegment?: SqliteStatement;
@@ -976,8 +1000,49 @@ export class QueryBuilder {
    * Excludes test/spec files from candidacy via path-pattern. The agent's
    * typical question is "how does X work", not "how is X tested", so
    * boosting a test file's directory would be a misfire.
+   *
+   * The answer depends only on the graph, never on the query, and the
+   * aggregation behind it scans every edge — seconds on a large index, paid
+   * by every generic explore (#1864). So it is memoized per database change
+   * stamp: recomputed only after something wrote to the database.
    */
   getDominantFile(): { filePath: string; edgeCount: number; nextEdgeCount: number } | null {
+    // total_changes() counts writes that are later rolled back, so a result
+    // read inside a transaction could outlive a ROLLBACK under an unchanged
+    // stamp. Never keep one; `undefined` (a runtime without the getter) is
+    // treated the same way.
+    if (this.db.inTransaction !== false) {
+      this.dominantFileMemo = undefined;
+      return this.computeDominantFile();
+    }
+    const stamp = this.getChangeStamp();
+    if (this.dominantFileMemo?.stamp === stamp) return this.dominantFileMemo.value;
+    const value = this.computeDominantFile();
+    this.dominantFileMemo = { stamp, value };
+    return value;
+  }
+
+  /**
+   * A value that differs whenever the database content may have changed
+   * since the last call, whoever changed it: `total_changes()` counts the
+   * rows this connection inserted, updated or deleted, and
+   * `PRAGMA data_version` moves when any OTHER connection — another process's
+   * sync, a CLI `codegraph index` beside a running MCP server — commits. Both
+   * are O(1), so no write path has to remember to invalidate anything.
+   * Coarse on purpose: any write, not just one to nodes/edges, forces a
+   * recompute, which only costs time, never a stale answer.
+   */
+  private getChangeStamp(): string {
+    if (!this.stmts.getChangeStamp) {
+      this.stmts.getChangeStamp = this.db.prepare(
+        'SELECT total_changes() AS changes, (SELECT data_version FROM pragma_data_version) AS version'
+      );
+    }
+    const row = this.stmts.getChangeStamp.get() as { changes: number; version: number };
+    return `${row.changes}:${row.version}`;
+  }
+
+  private computeDominantFile(): { filePath: string; edgeCount: number; nextEdgeCount: number } | null {
     if (!this.stmts.getDominantFile) {
       // Pull top 20 candidates; we then filter out test/generated files
       // in code (regex-grade matching that SQL LIKE can't express). The
@@ -1868,8 +1933,8 @@ export class QueryBuilder {
   /**
    * Get outgoing edges from a node
    */
-  getOutgoingEdges(sourceId: string, kinds?: EdgeKind[], provenance?: string): Edge[] {
-    if ((kinds && kinds.length > 0) || provenance) {
+  getOutgoingEdges(sourceId: string, kinds?: EdgeKind[], provenance?: string, limit?: number): Edge[] {
+    if ((kinds && kinds.length > 0) || provenance || limit !== undefined) {
       let sql = 'SELECT * FROM edges WHERE source = ?';
       const params: (string | number)[] = [sourceId];
 
@@ -1881,6 +1946,11 @@ export class QueryBuilder {
       if (provenance) {
         sql += ' AND provenance = ?';
         params.push(provenance);
+      }
+
+      if (limit !== undefined) {
+        sql += ' LIMIT ?';
+        params.push(Math.max(0, Math.floor(limit)));
       }
 
       const rows = this.db.prepare(sql).all(...params) as EdgeRow[];
@@ -1897,10 +1967,19 @@ export class QueryBuilder {
   /**
    * Get incoming edges to a node
    */
-  getIncomingEdges(targetId: string, kinds?: EdgeKind[]): Edge[] {
-    if (kinds && kinds.length > 0) {
-      const sql = `SELECT * FROM edges WHERE target = ? AND kind IN (${kinds.map(() => '?').join(',')})`;
-      const rows = this.db.prepare(sql).all(targetId, ...kinds) as EdgeRow[];
+  getIncomingEdges(targetId: string, kinds?: EdgeKind[], limit?: number): Edge[] {
+    if ((kinds && kinds.length > 0) || limit !== undefined) {
+      let sql = 'SELECT * FROM edges WHERE target = ?';
+      const params: (string | number)[] = [targetId];
+      if (kinds && kinds.length > 0) {
+        sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
+        params.push(...kinds);
+      }
+      if (limit !== undefined) {
+        sql += ' LIMIT ?';
+        params.push(Math.max(0, Math.floor(limit)));
+      }
+      const rows = this.db.prepare(sql).all(...params) as EdgeRow[];
       return rows.map(rowToEdge);
     }
 
@@ -3535,10 +3614,44 @@ export class QueryBuilder {
     refs: UnresolvedReference[]
   ): number {
     return this.db.transaction(() => {
-      const changed = this.deleteEdgesByIds(edgeIds);
-      this.insertUnresolvedRefsBatch(refs);
+      let changed = this.deleteEdgesByIds(edgeIds);
+      const seenHdl = new Set<string>();
+      const pending = refs.filter(ref => {
+        if (!ref.referenceName.startsWith('hdl:wildcard:') && !ref.referenceName.startsWith('hdl:port-position:')) return true;
+        const key = JSON.stringify([ref.fromNodeId, ref.referenceName, ref.line, ref.column]);
+        if (seenHdl.has(key)) return false;
+        seenHdl.add(key);
+        return true;
+      });
+      // A wildcard/positional binding depends on the entire module header.
+      // Invalidate its complete fan-out, including actual signals in untouched
+      // files, before rebuilding it from one original reference.
+      for (const ref of pending) {
+        if (ref.referenceName.startsWith('hdl:wildcard:') || ref.referenceName.startsWith('hdl:port-position:')) {
+          changed += this.db.prepare("DELETE FROM edges WHERE source = ? AND json_extract(metadata, '$.refName') = ?")
+            .run(ref.fromNodeId, ref.referenceName).changes;
+        }
+      }
+      this.insertUnresolvedRefsBatch(pending);
       return changed;
     })();
+  }
+
+  hasLanguage(language: Language): boolean {
+    return !!this.db.prepare('SELECT 1 FROM nodes WHERE language = ? LIMIT 1').get(language);
+  }
+
+  /** HDL call arguments may change access when a remote formal changes direction.
+   * Seek HDL sources first, then their indexed outgoing edges; ordinary projects
+   * have no rows here. Include unclassified arguments so newly indexed callees
+   * can provide direction evidence on the next sync. */
+  getHdlCallArgumentEdges(): Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }> {
+    const rows = this.db.prepare(`SELECT e.*, src.file_path AS source_file_path, src.language AS source_language
+      FROM nodes src JOIN edges e ON e.source = src.id
+      WHERE src.language = 'verilog' AND e.kind = 'references' AND e.metadata LIKE '%hdl:call-arg:%'`)
+      .all() as Array<EdgeRow & { source_file_path: string; source_language: Language }>;
+    return rows.map(row => ({ ...rowToEdge(row), edgeId: row.id,
+      sourceFilePath: row.source_file_path, sourceLanguage: row.source_language }));
   }
 
   /**

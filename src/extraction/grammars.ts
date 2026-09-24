@@ -23,6 +23,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   javascript: 'tree-sitter-javascript.wasm',
   jsx: 'tree-sitter-javascript.wasm',
   python: 'tree-sitter-python.wasm',
+  verilog: 'tree-sitter-systemverilog.wasm',
   go: 'tree-sitter-go.wasm',
   rust: 'tree-sitter-rust.wasm',
   java: 'tree-sitter-java.wasm',
@@ -120,6 +121,11 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.scala': 'scala',
   '.sc': 'scala',
   '.lua': 'lua',
+  // Verilog / SystemVerilog (one grammar covers both)
+  '.v': 'verilog',
+  '.vh': 'verilog',
+  '.sv': 'verilog',
+  '.svh': 'verilog',
   '.luau': 'luau',
   '.m': 'objc',
   '.mm': 'objc',
@@ -171,6 +177,53 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.tfvars': 'terraform',
   '.tofu': 'terraform',
 };
+
+/** MPEG transport stream: fixed 188-byte packets, each opening with 0x47. */
+const MPEG_TS_PACKET_SIZE = 188;
+const MPEG_TS_SYNC_BYTE = 0x47;
+/** Consecutive packets whose sync byte must line up before a file counts as video. */
+const MPEG_TS_MIN_PACKETS = 4;
+/**
+ * How many bytes of a file's head `isMpegTransportStream` needs — enough to
+ * see `MPEG_TS_MIN_PACKETS` sync bytes plus the packets between them.
+ */
+export const MPEG_TS_SNIFF_BYTES = MPEG_TS_PACKET_SIZE * MPEG_TS_MIN_PACKETS;
+
+/**
+ * Whether these leading bytes are an MPEG transport stream — the OTHER thing a
+ * `.ts` file can be. Golden video fixtures (`testdata/*.ts`, e2e clips) share
+ * TypeScript's extension, and tree-sitter takes ~28 s to chew through a 900 KB
+ * clip for zero symbols (#1910), so the decision has to be made from the head
+ * of the file, before any parse.
+ *
+ * Two conditions, both required:
+ *   1. the sync byte 0x47 sits at offsets 0, 188, 376 and 564 — every packet
+ *      of a transport stream opens with it, and nothing else pads to 188;
+ *   2. a NUL byte appears somewhere in the head — every stream carries one
+ *      within its first packets (the PSI pointer field, table reserved bits,
+ *      the `00 00 01` PES start codes), and UTF-8 source text never does.
+ * 0x47 is the letter `G`, so (1) alone could in principle match a source file
+ * whose lines happen to put a `G` at four 188-byte strides; (2) closes that
+ * door, because a text file with a NUL in it is not TypeScript either.
+ *
+ * `head` is the first `MPEG_TS_SNIFF_BYTES` (or fewer) bytes of the file.
+ */
+export function isMpegTransportStream(head: Uint8Array): boolean {
+  const lastSync = MPEG_TS_PACKET_SIZE * (MPEG_TS_MIN_PACKETS - 1);
+  if (head.length <= lastSync) return false;
+  for (let off = 0; off <= lastSync; off += MPEG_TS_PACKET_SIZE) {
+    if (head[off] !== MPEG_TS_SYNC_BYTE) return false;
+  }
+  for (let i = 0; i < head.length; i++) {
+    if (head[i] === 0) return true;
+  }
+  return false;
+}
+
+/** Whether `filePath` carries the one extension MPEG-TS shares with a language. */
+export function hasMpegTsExtension(filePath: string): boolean {
+  return filePath.length > 3 && filePath.slice(-3).toLowerCase() === '.ts';
+}
 
 /**
  * Whether a file is one CodeGraph can parse, based purely on its extension.
@@ -289,7 +342,7 @@ export async function initGrammars(): Promise<void> {
  * the vendored wasm together.
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
-  'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
+  'pascal', 'scala', 'lua', 'luau', 'verilog', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
   'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
   // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
@@ -692,6 +745,7 @@ export function getLanguageDisplayName(language: Language): string {
     scala: 'Scala',
     lua: 'Lua',
     luau: 'Luau',
+    verilog: 'Verilog / SystemVerilog',
     objc: 'Objective-C',
     solidity: 'Solidity',
     nix: 'Nix',

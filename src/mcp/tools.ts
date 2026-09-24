@@ -4,7 +4,9 @@
  * Defines the tools exposed by the CodeGraph MCP server.
  */
 
+import { formatHdlProfileStatus } from '../hdl/status';
 import type CodeGraph from '../index';
+import { formatHdlAccess, HDL_ACCESS_FILTERS, type HdlAccessFilter } from './hdl-access';
 import type { QueryPool } from './query-pool';
 import { findNearestCodeGraphRoot } from '../directory';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
@@ -37,6 +39,7 @@ import { extractQueryPaths, queryMightContainPaths } from '../search/query-paths
 import {
   existsSync,
   readFileSync,
+  realpathSync,
   statSync,
 } from 'fs';
 import { createHash } from 'crypto';
@@ -1342,6 +1345,11 @@ export const tools: ToolDefinition[] = [
           description: 'Maximum number of files to include source code from (default: 12)',
           default: 12,
         },
+        hdlAccess: {
+          type: 'string',
+          description: 'HDL signal access filter. With this option query must be one exact signal name or qualified name; read includes control/event uses, write includes readwrite. Returns access sites and source, not elaborated drivers.',
+          enum: [...HDL_ACCESS_FILTERS],
+        },
         projectPath: projectPathProperty,
       },
       required: ['query'],
@@ -1462,9 +1470,48 @@ const DEFAULT_MCP_TOOLS = new Set(['explore']);
  * Supports cross-project queries via the projectPath parameter.
  * Other projects are opened on-demand and cached for performance.
  */
+/** realpath when the path exists, the path itself otherwise — never throws. */
+function canonicalPath(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
+/**
+ * How many explicit-`projectPath` projects a handler keeps open at once
+ * (#1835). Each cached project may hold a file watcher, a writer lock and a
+ * SQLite connection, so the cache is bounded LRU: opening one more than this
+ * closes the least recently used. Small on purpose — a session that queries
+ * many repositories still leaks nothing; it only pays a reopen + catch-up.
+ */
+export const MAX_CACHED_PROJECTS = 8;
+
+/**
+ * Engine-side lifecycle for a project the ToolHandler opened for an explicit
+ * `projectPath` (#1835). `activate` gives it the same treatment the default
+ * project gets — a file watcher while it stays open and a catch-up sync — and
+ * returns the catch-up promise, which the handler awaits (time-boxed) before
+ * the first call against that project. `release` runs when the handler closes
+ * the project (LRU eviction or shutdown) so the engine can drop its writer lock.
+ */
+export interface ProjectLifecycle {
+  activate(cg: CodeGraph): Promise<void>;
+  release(cg: CodeGraph): void;
+}
+
 export class ToolHandler {
-  // Cache of opened CodeGraph instances for cross-project queries
+  // Cache of opened CodeGraph instances for cross-project queries, keyed by the
+  // CANONICAL (realpath) index root. Map insertion order doubles as LRU order:
+  // a hit re-inserts, and `MAX_CACHED_PROJECTS` bounds the size (#1835).
   private projectCache: Map<string, CodeGraph> = new Map();
+  // Engine hook that watches + catches up an explicit project (null for the
+  // CLI and worker-thread handlers, which never own a watcher).
+  private projectLifecycle: ProjectLifecycle | null = null;
+  // Per explicit project: its catch-up sync, awaited once by the first call
+  // that targets it (same time-box as the default project's gate).
+  private projectGates: Map<CodeGraph, Promise<void>> = new Map();
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
@@ -1491,6 +1538,9 @@ export class ToolHandler {
   // huge repo can't hang the first call (#905); cleared on first await so
   // subsequent calls don't pay any cost.
   private catchUpGate: Promise<void> | null = null;
+  // Engine hook fired when `freshen` reopened a replaced database (#1902), so
+  // the engine can reconcile the new file with a catch-up sync.
+  private onDatabaseReopened: ((cg: CodeGraph) => void) | null = null;
   // Optional worker-thread pool for off-loop read-tool dispatch (daemon mode).
   // When set + healthy, the heavy read tools run on a worker so the daemon's
   // main loop stays free for the MCP transport under concurrent load. Null in
@@ -1510,6 +1560,14 @@ export class ToolHandler {
   }
 
   /**
+   * Engine-only: own the lifecycle (watcher, catch-up, writer lock) of every
+   * project this handler opens for an explicit `projectPath` (#1835).
+   */
+  setProjectLifecycle(lifecycle: ProjectLifecycle | null): void {
+    this.projectLifecycle = lifecycle;
+  }
+
+  /**
    * Update the default CodeGraph instance (e.g. after lazy initialization)
    */
   setDefaultCodeGraph(cg: CodeGraph): void {
@@ -1525,6 +1583,15 @@ export class ToolHandler {
    */
   setCatchUpGate(p: Promise<void> | null): void {
     this.catchUpGate = p;
+  }
+
+  /**
+   * Engine-only: called after a tool call's {@link freshen} reopened a database
+   * that was replaced on disk (#1902). The engine decides whether a catch-up
+   * sync is its to run (only for the instance it watches and writes).
+   */
+  setOnDatabaseReopened(fn: ((cg: CodeGraph) => void) | null): void {
+    this.onDatabaseReopened = fn;
   }
 
   /**
@@ -1754,8 +1821,13 @@ export class ToolHandler {
     // (#926). The DB connection itself is still cached (by resolved root,
     // below), so re-resolving costs only the stat walk, never a reopen.
     const resolvedRoot = findNearestCodeGraphRoot(projectPath);
+    // Canonicalize for the identity checks below only: two spellings of one
+    // root (a symlinked checkout, `/tmp` vs `/private/tmp`) must share one
+    // connection and one watcher (#1835). The instance itself is still opened
+    // at the root as found, so nothing user-visible changes spelling.
+    const canonicalRoot = resolvedRoot ? canonicalPath(resolvedRoot) : null;
 
-    if (!resolvedRoot) {
+    if (!resolvedRoot || !canonicalRoot) {
       throw new NotIndexedError(
         `The project at ${projectPath} isn't indexed with codegraph (no .codegraph/ directory found ` +
         'walking up from it), so codegraph cannot query it. Use your built-in tools (Read/Grep/Glob) ' +
@@ -1771,19 +1843,69 @@ export class ToolHandler {
     // support) that surfaces as intermittent
     // "database is locked" on concurrent tool calls. See issue #238. The
     // default instance is owned/closed by the server, so it's never cached.
-    if (this.cg && this.cg.getProjectRoot() === resolvedRoot) {
+    if (this.cg && canonicalPath(this.cg.getProjectRoot()) === canonicalRoot) {
       return this.freshen(this.cg);
     }
 
-    // Cache the open DB connection by RESOLVED ROOT only — never by the input
+    // Cache the open DB connection by CANONICAL ROOT only — never by the input
     // path. One key per instance means closeAll() closes each exactly once, and
     // a changed resolution maps to a different entry instead of a stale hit.
-    const cached = this.projectCache.get(resolvedRoot);
-    if (cached) return this.freshen(cached);
+    const cached = this.projectCache.get(canonicalRoot);
+    if (cached) {
+      // Refresh LRU position.
+      this.projectCache.delete(canonicalRoot);
+      this.projectCache.set(canonicalRoot, cached);
+      return this.freshen(cached);
+    }
 
     const cg = loadCodeGraph().openSync(resolvedRoot);
-    this.projectCache.set(resolvedRoot, cg);
+    this.projectCache.set(canonicalRoot, cg);
+    // Bounded: evict the least recently used explicit project (#1835).
+    while (this.projectCache.size > MAX_CACHED_PROJECTS) {
+      const [oldestKey, oldest] = this.projectCache.entries().next().value as [string, CodeGraph];
+      this.projectCache.delete(oldestKey);
+      this.closeProject(oldest);
+    }
+    // Same lifecycle as the default project: watcher + catch-up sync, owned
+    // by the engine (#1835). The catch-up promise is the project's gate.
+    if (this.projectLifecycle) {
+      let gate: Promise<void>;
+      try {
+        gate = this.projectLifecycle.activate(cg);
+      } catch (err) {
+        gate = Promise.reject(err);
+      }
+      gate = gate.catch(() => { /* logged by the engine; serve best-effort */ });
+      this.projectGates.set(cg, gate);
+    }
     return cg;
+  }
+
+  /**
+   * Before dispatching a call that names an explicit `projectPath`, wait
+   * (time-boxed, once) for that project's catch-up sync — the same guarantee the
+   * default project's gate gives the first call of a session (#1835). Resolution
+   * errors are left to the dispatch path, which already answers them with the
+   * success-shaped guidance.
+   */
+  private async awaitProjectGate(projectPath: string): Promise<void> {
+    let cg: CodeGraph;
+    try {
+      cg = this.getCodeGraph(projectPath);
+    } catch {
+      return;
+    }
+    const gate = this.projectGates.get(cg);
+    if (!gate) return;
+    this.projectGates.delete(cg);
+    await this.awaitCatchUpGate(gate);
+  }
+
+  /** Close one explicit project: watcher, writer lock (via the engine), DB. */
+  private closeProject(cg: CodeGraph): void {
+    this.projectGates.delete(cg);
+    try { this.projectLifecycle?.release(cg); } catch { /* best-effort */ }
+    try { cg.close(); } catch { /* best-effort */ }
   }
 
   /**
@@ -1803,6 +1925,7 @@ export class ToolHandler {
           '[CodeGraph MCP] The index was replaced on disk (e.g. a git worktree ' +
           'recreated at the same path); reopened the live database in place.\n'
         );
+        this.onDatabaseReopened?.(cg);
       }
     } catch {
       // Best-effort self-heal — a failed reopen must never break the tool call;
@@ -1816,9 +1939,10 @@ export class ToolHandler {
    */
   closeAll(): void {
     for (const cg of this.projectCache.values()) {
-      cg.close();
+      this.closeProject(cg);
     }
     this.projectCache.clear();
+    this.projectGates.clear();
     this.worktreeMismatchCache.clear();
   }
 
@@ -2010,13 +2134,11 @@ export class ToolHandler {
       return result; // no default project — leave as is
     }
 
-    // Cross-project `projectPath` calls open a cached CodeGraph WITHOUT a
-    // watcher (watchers are only attached to the default session project).
+    // A cross-project `projectPath` call's cached CodeGraph only has a watcher
+    // when the engine owns its lifecycle (#1835) — the CLI's handler has none.
     // When the cross-project path happens to be the same project as the
-    // default cg, the cached instance is the wrong one — its pendingFiles is
-    // permanently empty. Detect the equal-path case and prefer the default
-    // cg so the staleness signal still fires when an agent passes the
-    // explicit projectPath form of its own project.
+    // default cg, prefer the default cg so the staleness signal still fires
+    // when an agent passes the explicit projectPath form of its own project.
     if (this.cg && cg !== this.cg) {
       try {
         const sameProject =
@@ -2031,9 +2153,9 @@ export class ToolHandler {
     // stopped, getPendingFiles() is empty so the per-file banner below can't
     // fire — but the index is now FROZEN and silently drifting stale. Surface
     // one global notice instead, so the agent Reads for current content rather
-    // than trusting a response off a no-longer-updating index. (Cross-project
-    // calls open a watcher-less CodeGraph, so this is false there — correct: we
-    // only know degraded state for the default session project.)
+    // than trusting a response off a no-longer-updating index. (A cross-project
+    // instance without an engine-owned watcher reports false here — correct: we
+    // only know degraded state for a project we watch.)
     let degraded = false;
     try {
       degraded = cg.isWatcherDegraded?.() ?? false;
@@ -2131,6 +2253,13 @@ export class ToolHandler {
       const pathCheck = this.validateOptionalPath(args.projectPath, 'projectPath');
       if (typeof pathCheck === 'object' && pathCheck !== undefined) {
         return pathCheck;
+      }
+      // An explicit project gets the same first-call guarantee as the default
+      // (#1835): its post-open catch-up sync finishes (time-boxed) before we
+      // serve it. Resolved on the main thread so the watcher lives here even
+      // when dispatch is off-loaded to a worker.
+      if (typeof pathCheck === 'string') {
+        await this.awaitProjectGate(pathCheck);
       }
       // The `path` and `pattern` properties used by codegraph_files are
       // also path-shaped — apply the same cap.
@@ -2295,7 +2424,17 @@ export class ToolHandler {
       case 'codegraph_callers': return await this.handleCallers(args);
       case 'codegraph_callees': return await this.handleCallees(args);
       case 'codegraph_impact': return await this.handleImpact(args);
-      case 'codegraph_explore': return await this.handleExplore(args);
+      case 'codegraph_explore': {
+        const result = await this.handleExplore(args);
+        if (result.isError) return result;
+        const profile = this.getCodeGraph(args.projectPath as string | undefined).getHdlProfileStatus?.() ?? null;
+        const note = formatHdlProfileStatus(profile);
+        const first = result.content[0];
+        if (!note || first?.type !== 'text') return result;
+        const emission = result[EXPLORE_EMISSION_KEY];
+        return { ...result, content: [{type:'text', text:`${note}\n\n${first.text}`}, ...result.content.slice(1)],
+          ...(emission ? {[EXPLORE_EMISSION_KEY]: {...emission,responseBytes:emission.responseBytes + note.length + 2}} : {}) };
+      }
       case 'codegraph_node': return await this.handleNode(args);
       case 'codegraph_files': return await this.handleFiles(args);
       default: return this.errorResult(`Unknown tool: ${toolName}`);
@@ -2543,23 +2682,39 @@ export class ToolHandler {
       : '';
 
     const impactOf = (defNodes: Node[]) => {
+      const maxNodes = 1_000;
+      const maxEdges = 5_000;
       const mergedNodes = new Map<string, Node>();
       const mergedEdges: Edge[] = [];
       const seenEdges = new Set<string>();
+      let truncated = false;
       for (const node of defNodes) {
-        const impact = cg.getImpactRadius(node.id, depth);
+        const impact = cg.getImpactRadius(node.id, depth, { maxNodes, maxEdges });
+        truncated ||= impact.truncated === true;
         for (const [id, n] of impact.nodes) {
+          if (!mergedNodes.has(id) && mergedNodes.size >= maxNodes) {
+            truncated = true;
+            continue;
+          }
           mergedNodes.set(id, n);
         }
         for (const e of impact.edges) {
+          if (!mergedNodes.has(e.source) || !mergedNodes.has(e.target)) {
+            truncated = true;
+            continue;
+          }
           const key = `${e.source}->${e.target}:${e.kind}`;
           if (!seenEdges.has(key)) {
+            if (mergedEdges.length >= maxEdges) {
+              truncated = true;
+              continue;
+            }
             seenEdges.add(key);
             mergedEdges.push(e);
           }
         }
       }
-      return { nodes: mergedNodes, edges: mergedEdges, roots: defNodes.map((n) => n.id) };
+      return { nodes: mergedNodes, edges: mergedEdges, roots: defNodes.map((n) => n.id), truncated };
     };
 
     // Single definition (or same-file overloads): the familiar merged report.
@@ -2980,7 +3135,7 @@ export class ToolHandler {
       '',
       ...notes,
       '',
-      '> These sites choose their call target at runtime (registry / bus / reflection) — the site shown IS where the flow continues. To follow it, run codegraph_explore or codegraph_node on a candidate; source for the sites above is included below.',
+      '> These sites choose their call target at runtime (registry / bus / reflection) — the site shown IS where the flow continues. To follow it, run codegraph_explore on a candidate; source for the sites above is included below.',
       '',
     ].join('\n');
   }
@@ -3288,6 +3443,13 @@ export class ToolHandler {
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const projectRoot = cg.getProjectRoot();
+    if (args.hdlAccess !== undefined) {
+      if (typeof args.hdlAccess !== 'string' || !HDL_ACCESS_FILTERS.includes(args.hdlAccess as HdlAccessFilter)) {
+        return this.errorResult(`hdlAccess must be one of: ${HDL_ACCESS_FILTERS.join(', ')}`);
+      }
+      return this.textResult(this.truncateOutput(formatHdlAccess(cg, rawQuery, args.hdlAccess as HdlAccessFilter,
+        clamp((args.maxFiles as number) || 12, 1, 20))));
+    }
 
     // Resolve adaptive output budget from project size. Falls back to the
     // largest-tier defaults if stats aren't available, which preserves
@@ -4408,6 +4570,11 @@ export class ToolHandler {
     // (#1046) — it must reflect what we show, not the raw candidate gather.
     const renderedFilePaths: string[] = [];
     let anyFileTrimmed = false;
+    // Files whose rendered source is a SLICE (clusters / focused / skeleton),
+    // not the whole file. The completeness footer must not call them complete:
+    // a "Complete source … do NOT re-read" line under a body full of gap markers
+    // is a contradiction, and the agent resolves it by Reading the file (#1918).
+    let slicedFiles = 0;
     // Files that changed on disk after their last index sync (#1474). Their
     // indexed line ranges are untrustworthy, so sliced renders (adaptive /
     // skeleton / clusters) are OFF for them: a small drifted file still ships
@@ -4436,6 +4603,8 @@ export class ToolHandler {
       overhead: number;
       ranges: ExploreLineRange[];
       fingerprint: string;
+      /** The section is a slice of the file, not the whole file. */
+      sliced: boolean;
     };
     let suppressedFallback: SuppressedFallback | null = null;
     // Reservation carry-forward (CG-21). A reservation is a promise the render
@@ -4739,6 +4908,7 @@ export class ToolHandler {
           noteEmitted(filePath, [...ranges, ...opts.covered], body.length, fingerprint);
           renderedFilePaths.push(filePath);
           filesIncluded++;
+          if (opts.mode !== 'whole') slicedFiles++;
           return;
         }
         // Fully held. The section is the pointer; the slot and the bytes go to a
@@ -4762,6 +4932,7 @@ export class ToolHandler {
             overhead: opts.overhead,
             ranges: opts.fullRanges,
             fingerprint,
+            sliced: opts.mode !== 'whole',
           };
         }
       };
@@ -5844,6 +6015,7 @@ export class ToolHandler {
         sourceSpent += restore.sourceChars;
         newSourceChars += restore.sourceChars;
         filesIncluded++;
+        if (restore.sliced) slicedFiles++;
         const idx = backReferencedFiles.indexOf(restore.filePath);
         if (idx >= 0) backReferencedFiles.splice(idx, 1);
         emittedByFile.set(restore.filePath, {
@@ -5935,13 +6107,21 @@ export class ToolHandler {
     }
 
     // Completeness signal so agents know they don't need to re-read these files.
-    // On small projects the budget gates this off — but if we actually had to
-    // trim or drop clusters, surface a brief note so the agent knows it can
-    // still Read for more detail.
+    // It is only ever claimed for files shipped WHOLE: a sliced file is named
+    // as sliced, with the way to reach what the slice left out (#1918). On
+    // small projects the budget gates the signal off, but a trim still gets
+    // the brief note. Only codegraph_explore is named — the other tools are
+    // not listed to agents by default.
+    const trimNote = `Elided symbols are named inside gap markers as \`name (file:line)\` and preferred in the file header — run another \`codegraph_explore\` with those exact names for their source.`;
+    const wholeFiles = filesIncluded - slicedFiles;
     const completenessBlock: string[] = budget.includeCompletenessSignal
-      ? ['', '---', `> **Complete source for ${filesIncluded} files is included above — do NOT re-read them.** If your question also needs files/symbols listed under "Not shown above" (or any area this call didn't cover), make ANOTHER codegraph_explore targeting those names — it returns the same source with line numbers and is cheaper and more complete than reading. Reserve Read for a single specific line range explore can't surface.`]
-      : anyFileTrimmed
-        ? ['', `> Some file sections were trimmed for size. Elided symbols are named inside gap markers as \`name (file:line)\` and preferred in the file header — run another \`codegraph_explore\` (or \`codegraph_node\`) with those exact names for their source.`]
+      ? ['', '---', `> ${[
+          wholeFiles > 0 ? `**Complete source for ${wholeFiles} ${wholeFiles === 1 ? 'file is' : 'files are'} included above — do NOT re-read ${wholeFiles === 1 ? 'it' : 'them'}.**` : '',
+          slicedFiles > 0 ? `**${slicedFiles} ${slicedFiles === 1 ? 'file is' : 'files are'} shown as slices** (the lines shown are verbatim and current). ${trimNote}` : '',
+          `If your question also needs files/symbols listed under "Not shown above" (or any area this call didn't cover), make ANOTHER codegraph_explore targeting those names — it returns the same source with line numbers and is cheaper and more complete than reading. Reserve Read for a single specific line range explore can't surface.`,
+        ].filter(Boolean).join(' ')}`]
+      : anyFileTrimmed || slicedFiles > 0
+        ? ['', `> Some file sections were trimmed for size. ${trimNote}`]
         : [];
 
     // Advisory exploration-guidance note based on project size. Deliberately
@@ -6988,9 +7168,12 @@ export class ToolHandler {
 
     // Compact format: just list affected symbols grouped by file
     const lines: string[] = [
-      `**Impact: "${symbol}" affects ${nodeCount} symbols**`,
+      `**Impact: "${symbol}" affects ${nodeCount} symbols${impact.truncated ? ' (truncated at safety limit)' : ''}**`,
       '',
     ];
+    if (impact.truncated) {
+      lines.push('> Result truncated to protect the MCP process on a high-fanout graph. Narrow with `file` or reduce `depth`.', '');
+    }
 
     // Group by file
     const byFile = new Map<string, Node[]>();

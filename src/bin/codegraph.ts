@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { formatHdlProfileStatus } from '../hdl/status';
 /**
  * CodeGraph CLI
  *
@@ -41,7 +42,7 @@ try {
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection } from '../directory';
+import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
@@ -61,6 +62,7 @@ import { BROWSER_ENV, DEFAULT_UI_PORT } from '../ui-server/constants';
 import type { UiServerHandle } from '../ui-server';
 import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
 import type { Node, Edge } from '../types';
+import type { SyncResult } from '../extraction';
 import { isTestPath } from '../search/query-utils';
 
 // Decided once, before `--color`/`--no-color` are stripped from argv below
@@ -697,6 +699,17 @@ async function runInit(
       return;
     }
 
+    if (hasForeignDbFile(projectPath)) {
+      const dbFile = path.join(getCodeGraphDir(projectPath), 'codegraph.db');
+      clack.log.error(`${dbFile} is not a SQLite database, so it cannot be rebuilt in place.`);
+      clack.log.info('Move or delete that file, then run "codegraph init" again.');
+      clack.outro('');
+      process.exitCode = 1;
+      return;
+    }
+    if (hasSchemalessDb(projectPath)) {
+      clack.log.warn(`Found a codegraph.db without the codegraph schema in ${getCodeGraphDir(projectPath)} (left by an interrupted init?) — rebuilding it.`);
+    }
     const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
     const cg = await CodeGraph.init(projectPath, { index: false });
     clack.log.success(`Initialized in ${projectPath}`);
@@ -955,9 +968,24 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
 
+      // sync() returns all-zero counts when another process (an MCP server
+      // or another CLI mid-index) holds the index lock. That is not "up to
+      // date": say why, and exit 1 even under --quiet, which suppresses
+      // progress but never a failure.
+      const lockedMessage = (result: SyncResult): string | null => {
+        if (result.skippedReason !== 'locked') return null;
+        const holder = result.lockHolderPid != null ? ` (PID ${result.lockHolderPid})` : '';
+        return `Nothing synced: another process holds the index lock${holder}. Retry, or run "codegraph sync" when it exits.`;
+      };
+
       if (options.quiet) {
-        await cg.sync();
+        const result = await cg.sync();
         cg.destroy();
+        const locked = lockedMessage(result);
+        if (locked) {
+          process.stderr.write(`codegraph sync: ${locked}\n`);
+          process.exit(1);
+        }
         return;
       }
 
@@ -972,6 +1000,12 @@ program
       });
 
       await progress.stop();
+
+      const locked = lockedMessage(result);
+      if (locked) {
+        cg.destroy();
+        throw new Error(locked);
+      }
 
       const totalChanges = result.filesAdded + result.filesModified + result.filesRemoved;
 
@@ -1038,7 +1072,9 @@ program
       const journalMode = cg.getJournalMode();
 
       const buildInfo = cg.getIndexBuildInfo();
-      const reindexRecommended = cg.isIndexStale();
+      const hdlProfile = cg.getHdlProfileStatus();
+      const engineReindexRecommended = cg.isIndexStale();
+      const reindexRecommended = engineReindexRecommended || !!hdlProfile?.reindexRecommended;
       const indexState = cg.getIndexState();
       // Zero on a healthy index; non-zero at rest means a resolution pass was
       // interrupted, so some files' call edges are missing (#1187).
@@ -1075,6 +1111,7 @@ program
             builtWithExtractionVersion: buildInfo.extractionVersion,
             currentExtractionVersion: EXTRACTION_VERSION,
             reindexRecommended,
+            hdlProfile,
             // 'complete' | 'partial' (files silently dropped) | 'indexing'
             // (a run was killed mid-index — the index is truncated) |
             // 'failed' | null (predates the marker).
@@ -1175,6 +1212,10 @@ program
           console.log(`  Removed:   ${changes.removed.length} files`);
         }
         info('Run "codegraph sync" to update the index');
+      } else if (hdlProfile?.state === 'configuration-error') {
+        warn('Source files are unchanged; HDL profile configuration requires attention');
+      } else if (hdlProfile?.reindexRecommended) {
+        warn('Source files are unchanged; indexed HDL context needs a rebuild');
       } else {
         success('Index is up to date');
       }
@@ -1182,7 +1223,12 @@ program
 
       // Re-index hint: the index was built by an older engine than the one now
       // running, so a rebuild would add data a migration can't backfill.
-      if (reindexRecommended) {
+      const profileNote = formatHdlProfileStatus(hdlProfile);
+      if (profileNote) {
+        console.log(profileNote);
+        console.log();
+      }
+      if (engineReindexRecommended) {
         const builtWith = buildInfo.version ? `v${buildInfo.version.replace(/^v/, '')}` : 'an earlier version';
         warn(`Index was built by ${builtWith}; re-index to pick up this engine's improvements.`);
         info('Run "codegraph index" (full rebuild) or "codegraph sync"');
@@ -1288,11 +1334,57 @@ program
  * can reach the graph through a plain shell command.
  */
 program
+  .command('hdl-semantic [query]')
+  .description('Compute HDL parameters and port widths with optional slang (exact symbol or instance query)')
+  .option('--slang <executable>', 'Path to the installed slang executable')
+  .option('--python <executable>', 'Python with pinned pyslang for compiler macro source mapping (instead of --slang)')
+  .option('-p, --path <path>', 'Project path')
+  .option('--top <name>', 'Single top module (defaults to the active profile top)')
+  .option('--parameter <name=value...>', 'Top-level parameter overrides')
+  .option('--allow-use-before-declare', 'Explicit slang compatibility mode')
+  .option('--limit <number>', 'Maximum facts (1..1000)', '100')
+  .action(async (query: string | undefined, options: { slang?: string; python?: string; path?: string; top?: string;
+    parameter?: string[]; allowUseBeforeDeclare?: boolean; limit: string }) => {
+    const projectPath = resolveProjectPath(options.path);
+    try {
+      if (!isInitialized(projectPath)) throw new Error('HDL semantic queries require an initialized CodeGraph project');
+      const parameters: Record<string, string> = Object.create(null);
+      for (const argument of options.parameter ?? []) {
+        const separator = argument.indexOf('=');
+        if (separator < 1 || !argument.slice(separator + 1)) throw new Error('Parameter must be NAME=VALUE');
+        const name = argument.slice(0, separator);
+        if (Object.prototype.hasOwnProperty.call(parameters, name)) throw new Error('Duplicate HDL parameter override: ' + name);
+        parameters[name] = argument.slice(separator + 1);
+      }
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const controller = new AbortController();
+      const interrupt = () => controller.abort();
+      process.once('SIGINT', interrupt);
+      process.once('SIGTERM', interrupt);
+      try {
+        const result = await cg.getHdlSemantics({ executable: options.slang, pythonExecutable: options.python, top: options.top,
+          parameters, allowUseBeforeDeclare: options.allowUseBeforeDeclare, query, limit: Number(options.limit),
+          signal: controller.signal });
+        console.log(JSON.stringify(result));
+      } finally {
+        process.removeListener('SIGINT', interrupt);
+        process.removeListener('SIGTERM', interrupt);
+        cg.close();
+      }
+    } catch (err) {
+      error(`HDL semantics failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exitCode = 1;
+    }
+  });
+
+program
   .command('explore <query...>')
   .description('Explore an area: relevant symbols\' source + call paths in one shot (same output as the codegraph_explore MCP tool)')
   .option('-p, --path <path>', 'Project path')
   .option('--max-files <number>', 'Maximum number of files to include source from')
-  .action(async (queryParts: string[], options: { path?: string; maxFiles?: string }) => {
+  .option('--hdl-access <kind>', 'HDL signal access: read, write, readwrite, control, event, all (query is one exact signal name)')
+  .action(async (queryParts: string[], options: { path?: string; maxFiles?: string; hdlAccess?: string }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -1308,6 +1400,7 @@ program
 
       const args: Record<string, unknown> = { query: queryParts.join(' ') };
       if (options.maxFiles) args.maxFiles = parseInt(options.maxFiles, 10);
+      if (options.hdlAccess) args.hdlAccess = options.hdlAccess;
       const result = await handler.execute('codegraph_explore', args);
 
       console.log(result.content[0]?.text ?? '');
@@ -1413,6 +1506,9 @@ program
       let input: { prompt?: string; cwd?: string } = {};
       try { input = JSON.parse(raw); } catch { return; }
       const prompt = String(input.prompt || '');
+      // System-injected task notifications are not user prompts: exit before
+      // any project lookup or explore work (#1832).
+      if (isTaskNotification(prompt)) return;
 
       // Gate telemetry: how often each tier fires vs. no-ops — counter names
       // only, NEVER prompt content (see TELEMETRY.md). This is the data that
@@ -2093,13 +2189,19 @@ program
   .option('-p, --path <path>', 'Project path (optional for MCP mode, uses rootUri from client)')
   .option('--mcp', 'Run as MCP server (stdio transport)')
   .option('--no-watch', 'Disable the file watcher (no auto-sync; useful on slow filesystems like WSL2 /mnt drives)')
-  .action(async (options: { path?: string; mcp?: boolean; watch?: boolean }) => {
+  .option('--no-telemetry', 'Send no usage telemetry from this server (same as CODEGRAPH_TELEMETRY=0)')
+  .action(async (options: { path?: string; mcp?: boolean; watch?: boolean; telemetry?: boolean }) => {
     const projectPath = options.path ? resolveProjectPath(options.path) : undefined;
 
     // Commander sets watch=false when --no-watch is passed. Route it through
     // the same env-var chokepoint the watcher and MCP server already honor.
     if (options.watch === false) {
       process.env.CODEGRAPH_NO_WATCH = '1';
+    }
+    // Same for --no-telemetry (#1908): telemetry reads CODEGRAPH_TELEMETRY on
+    // every check, and a daemon this server spawns inherits the env.
+    if (options.telemetry === false) {
+      process.env.CODEGRAPH_TELEMETRY = '0';
     }
 
     try {

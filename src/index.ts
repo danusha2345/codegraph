@@ -5,6 +5,7 @@
  * knowledge graph from any codebase.
  */
 
+import * as fs from 'fs';
 import * as path from 'path';
 import {
   Node,
@@ -23,11 +24,17 @@ import {
   TaskContext,
   BuildContextOptions,
   FindRelevantContextOptions,
+  ImpactOptions,
   UnresolvedReference,
 } from './types';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
 import { QueryBuilder } from './db/queries';
+import { loadHdlProfile } from './hdl/profile';
+import { hdlDependenciesChanged } from './hdl/index-context';
+import { buildHdlProfileStatus, type HdlProfileStatus } from './hdl/status';
+import { analyzeHdlSemantics, type HdlSemanticOptions, type HdlSemanticResult } from './hdl/semantics';
+export type { HdlSemanticOptions, HdlSemanticResult } from './hdl/semantics';
 import {
   isInitialized,
   createDirectory,
@@ -234,6 +241,25 @@ export class CodeGraph {
   }
 
   /**
+   * Set when this instance followed a database replaced on disk (#1902): the
+   * next sync that can run reconciles the whole tree, because whatever the old
+   * handle absorbed since the rebuild never reached the new file.
+   */
+  private pendingFullReconcile = false;
+
+  /** How long a recreated, not-yet-indexed database is treated as a rebuild in progress. */
+  private static readonly RECREATE_GRACE_MS = 120_000;
+
+  /** The database file at the path was written within the recreate grace window. */
+  private isFreshlyRecreated(): boolean {
+    try {
+      return Date.now() - fs.statSync(getDatabasePath(this.projectRoot)).mtimeMs < CodeGraph.RECREATE_GRACE_MS;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Heal a stale database handle in place. If `.codegraph/` was removed and
    * recreated at the SAME path while this instance held the DB open — a git
    * worktree removed and re-added, or `rm -rf .codegraph` + `codegraph init` —
@@ -246,8 +272,19 @@ export class CodeGraph {
    *
    * POSIX-only in practice: `isReplacedOnDisk` never fires on Windows (an open
    * file can't be unlinked there, and st_ino is unreliable).
+   *
+   * Refuses (returns false) while an index/sync holds the index mutex: closing
+   * the handle that run is writing through would break it mid-flight. `sync()`
+   * performs the same check itself once it holds the mutex (#1902), so the
+   * replaced file is still picked up — by that sync, or by the caller's retry.
    */
   reopenIfReplaced(): boolean {
+    if (this.indexMutex.isLocked()) return false;
+    return this.reopenReplacedDatabase();
+  }
+
+  /** The body of {@link reopenIfReplaced}, without the in-flight-sync guard. */
+  private reopenReplacedDatabase(): boolean {
     if (!this.db.isReplacedOnDisk()) return false;
     const dbPath = this.db.getPath();
     // Open the live file FIRST — if that throws (e.g. mid-recreate), the old
@@ -258,6 +295,9 @@ export class CodeGraph {
     this.db = fresh;
     this.queries = new QueryBuilder(fresh.getDb());
     this.wireLayers();
+    // Whoever reopened — a sync, or a tool call's self-heal — the next sync
+    // must reconcile the whole tree (#1902).
+    this.pendingFullReconcile = true;
     // Releasing the dead handle also frees the leaked db/-wal/-shm fds that were
     // pinning the unlinked inode (#925).
     try { stale.close(); } catch { /* the old inode is gone; closing just frees fds */ }
@@ -732,6 +772,7 @@ export class CodeGraph {
           }
         } catch { /* metadata is advisory — never fail an index over it */ }
 
+        if (result.success && result.filesErrored === 0) this.orchestrator.commitHdlProfile();
         return result;
       } finally {
         // Restore the auto-checkpoint interval AFTER the fold-up above so the
@@ -769,7 +810,9 @@ export class CodeGraph {
         return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
       try {
-        return this.orchestrator.indexFiles(filePaths);
+        const result = await this.orchestrator.indexFiles(filePaths);
+        if (result.success && result.filesErrored === 0) this.orchestrator.commitHdlProfile();
+        return result;
       } finally {
         this.fileLock.release();
       }
@@ -786,7 +829,43 @@ export class CodeGraph {
       try {
         this.fileLock.acquire();
       } catch {
+        const lockHolderPid = this.fileLock.readHolderPid();
+        return {
+          skippedReason: 'locked',
+          ...(lockHolderPid != null ? { lockHolderPid } : {}),
+          filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0,
+        };
+      }
+      // A full rebuild in another process (`codegraph index` → recreate)
+      // unlinks the database and creates a new file at the same path. A
+      // long-lived instance — the MCP daemon's watcher — would otherwise keep
+      // "syncing" into the dead inode, and nothing it wrote there is visible
+      // to anyone (#1902). Follow the path before writing (one stat), and
+      // widen a scoped sync to a full one: whatever the old handle absorbed
+      // since the rebuild is gone, so the new file has to be reconciled whole.
+      // If the reopen fails (the rebuild is mid-way), report the lock-busy
+      // shape so the watcher keeps its pending files and retries.
+      try {
+        this.reopenReplacedDatabase();
+      } catch {
+        this.fileLock.release();
         return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
+      }
+      if (this.pendingFullReconcile) {
+        // `codegraph index` recreates the file, THEN takes the write lock in
+        // indexAll. A sync landing in that gap would otherwise run a full
+        // reconcile of the empty file and hold the lock the rebuild is about
+        // to ask for. A fresh file with no index_state yet is that rebuild:
+        // step aside (lock-busy shape, the watcher retries) and reconcile in
+        // full once it is done. Bounded, so a rebuild that died before
+        // indexing does not park the watcher forever.
+        if (this.getIndexState() === null && this.isFreshlyRecreated()) {
+          this.fileLock.release();
+          return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
+        }
+        // Cleared only once this run completes (below): a sync that throws
+        // must leave the full catch-up for the next one.
+        options = { ...options, paths: undefined };
       }
       // Defer WAL auto-checkpointing for the whole incremental run, exactly
       // as indexAll does for the bulk path (#1231): sync's store loop and its
@@ -954,12 +1033,21 @@ export class CodeGraph {
             result.definitionDelta,
             result.changedFilePaths ?? []
           );
+          // A deleted duplicate module can make an HDL binding unique again.
+          // Deletion-only syncs skip the changed-file failed-ref retry above.
+          const hdlRetry = this.queries.getRetryableFailedReferences(result.definitionDelta)
+            .filter(ref => ref.referenceName.startsWith('hdl:wildcard:') || ref.referenceName.startsWith('hdl:port-position:'));
+          if (hdlRetry.length > 0) await this.resolver.resolveAndPersistListYielding(hdlRetry);
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
             console.error(
               `[phase-timing] sync-rebind: ${Date.now() - tRebind}ms (${result.definitionDelta.length} changed names, ${rebound} edges re-opened)`
             );
           }
         }
+
+        // Access direction is signature-dependent even if no node name changed.
+        // Re-open typed and still-unclassified HDL argument sites in untouched files.
+        this.orchestrator.resurrectHdlCallArgumentEdges(result.changedFilePaths ?? [], result.filesRemoved > 0);
 
         // Orphan sweep (#1187). A resolution pass that dies mid-run — the #850
         // daemon liveness watchdog's SIGKILL (#1122), Ctrl-C, a crash — leaves
@@ -1036,8 +1124,10 @@ export class CodeGraph {
           try { this.queries.setMetadata('index_state', 'complete'); } catch { /* advisory */ }
         }
 
+        this.orchestrator.commitHdlProfile();
         this.orchestrator.finishGitIndexState(gitState, fullReconcile, result.failedFilePaths);
 
+        if (fullReconcile && result.filesChecked > 0) this.pendingFullReconcile = false;
         return result;
       } finally {
         // Mirror indexAll's teardown: stop the valve, then restore the
@@ -1091,7 +1181,8 @@ export class CodeGraph {
         const filesChanged = result.filesAdded + result.filesModified + result.filesRemoved;
         return { filesChanged, durationMs: result.durationMs };
       },
-      options
+      options,
+      () => this.getHdlDependencyPaths()
     );
 
     return this.watcher.start();
@@ -1231,6 +1322,36 @@ export class CodeGraph {
    * index built before stamping existed (treated as stale). See
    * `extraction-version.ts` and `isIndexStale()`.
    */
+  getHdlDependencyPaths(): string[] {
+    try {
+      const context = JSON.parse(this.queries.getMetadata('hdl_profile_context') ?? 'null');
+      return Array.isArray(context?.dependencies) ? context.dependencies.flatMap((d: unknown) =>
+        d && typeof d === 'object' && 'path' in d && typeof d.path === 'string' ? [d.path] : []) : [];
+    } catch { return []; }
+  }
+
+  /** Explicit optional compiler query; source graph remains available if compilation fails. */
+  async getHdlSemantics(options: HdlSemanticOptions): Promise<HdlSemanticResult> {
+    return analyzeHdlSemantics(this.projectRoot, options, {
+      profile: () => this.getHdlProfileStatus(), stale: () => this.isIndexStale(),
+      file: file => this.queries.getFileByPath(file), nodes: file => this.queries.getNodesByFile(file),
+    });
+  }
+
+  getHdlProfileStatus(): HdlProfileStatus | null {
+    const configuration = loadHdlProfile(this.projectRoot);
+    const metadata = { name: this.queries.getMetadata('hdl_profile_name') || null,
+      fingerprint: this.queries.getMetadata('hdl_profile_fingerprint'), context: this.queries.getMetadata('hdl_profile_context') };
+    const hasHdl = this.queries.hasLanguage('verilog');
+    if (!hasHdl && !metadata.name && configuration.status === 'invalid-config') return null;
+    const status = buildHdlProfileStatus(configuration, metadata, hasHdl);
+    if (status?.state === 'matches' && status.indexed.mode === 'profile' && hdlDependenciesChanged(this.projectRoot, metadata.context)) {
+      status.state = 'mismatch'; status.mismatch = true; status.reindexRecommended = true;
+      status.diagnostics.push('HDL include dependency changed since indexing.');
+    }
+    return status;
+  }
+
   getIndexBuildInfo(): { version: string | null; extractionVersion: number | null } {
     const version = this.queries.getMetadata('indexed_with_version');
     const ev = this.queries.getMetadata('indexed_with_extraction_version');
@@ -2004,8 +2125,8 @@ export class CodeGraph {
    * @param maxDepth - Maximum depth to traverse (default: 3)
    * @returns Subgraph containing potentially impacted nodes
    */
-  getImpactRadius(nodeId: string, maxDepth: number = 3): Subgraph {
-    return this.traverser.getImpactRadius(nodeId, maxDepth);
+  getImpactRadius(nodeId: string, maxDepth: number = 3, options: ImpactOptions = {}): Subgraph {
+    return this.traverser.getImpactRadius(nodeId, maxDepth, options);
   }
 
   /**

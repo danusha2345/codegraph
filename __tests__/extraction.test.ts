@@ -4,14 +4,14 @@
  * Tests for the tree-sitter extraction system.
  */
 
-import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { execFileSync } from 'child_process';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, scanDirectoryAsync, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore, type ScanSkipStats } from '../src/extraction';
-import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
+import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile, getParser } from '../src/extraction/grammars';
 import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, blankCLeadingAttrMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
 
@@ -1844,6 +1844,46 @@ class T {
     // `run` is the anonymous class's override, itself extracted under the field.
     expect(callersOf('target')).toEqual(['directCall', 'fieldLambda', 'run']);
     expect(callersOf('compute')).toEqual(['eager']);
+  });
+
+  it('keeps the full qualified name on the extends reference of `new Outer.Inner() { ... }` (real AOSP AIDL shape: `new ICarPropertyEventListener.Stub() { ... }`)', () => {
+    // The anon class's OWN name and the enclosing `instantiates` edge are
+    // correctly truncated to the bare last segment ("Stub") — that matches
+    // how a real in-project nested class's own node is named, and how
+    // `instantiates` resolves (by bare class name). But the `extends`
+    // reference is a DIFFERENT resolution path: a real named class's
+    // `extends IFoo.Stub` clause is extracted verbatim (untruncated), and
+    // qualified lookups depend on that full dotted text surviving.
+    // Truncating the anonymous class's extends reference to "Stub" would
+    // lose the relationship to `ICarPropertyEventListener.Stub`.
+    const code = `
+package p;
+interface ICarPropertyEventListener {
+  interface Stub {}
+}
+class CarNightService {
+    private final ICarPropertyEventListener mListener =
+        new ICarPropertyEventListener.Stub() {
+            public void onEvent() {}
+        };
+}
+`;
+    const result = extractFromSource('CarNightService.java', code);
+    const anon = result.nodes.find((n) => n.kind === 'class' && /Stub\$anon@/.test(n.name));
+    expect(anon, 'anonymous Stub subclass should be extracted as a class').toBeDefined();
+
+    const extendsRef = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'extends' && r.fromNodeId === anon!.id
+    );
+    expect(extendsRef, 'anon class should carry an extends reference').toBeDefined();
+    expect(extendsRef!.referenceName).toBe('ICarPropertyEventListener.Stub');
+
+    // The anon class's own cosmetic name and the instantiates edge stay
+    // truncated to the bare last segment — unaffected by this fix.
+    const instantiatesRef = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'instantiates' && r.referenceName === 'Stub'
+    );
+    expect(instantiatesRef, 'enclosing field should still instantiate the bare Stub name').toBeDefined();
   });
 });
 
@@ -8195,6 +8235,39 @@ describe('Nested non-submodule git repos', () => {
     expect(ig.ignores('src/app.ts')).toBe(false);
   });
 
+  it('keeps Java packages named build while excluding build output (#1642)', () => {
+    const sourceFile = 'module/src/main/java/com/acme/build/RealtimePlusService.java';
+    const testFile = 'module/src/test/java/com/acme/build/RealtimePlusServiceTest.java';
+    const outputFile = 'module/build/generated/Generated.java';
+
+    for (const rel of [sourceFile, testFile, outputFile]) {
+      const abs = path.join(tempDir, rel);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, 'class Example {}\n');
+    }
+
+    const scope = buildScopeIgnore(tempDir);
+    expect(scope.ignores(sourceFile)).toBe(false);
+    expect(scope.ignores(testFile)).toBe(false);
+    expect(scope.ignores(outputFile)).toBe(true);
+
+    const files = scanDirectory(tempDir);
+    expect(files).toContain(sourceFile);
+    expect(files).toContain(testFile);
+    expect(files).not.toContain(outputFile);
+  });
+
+  it('lets an explicit .gitignore exclude a Java package named build (#1642)', () => {
+    const sourceFile = 'src/main/java/com/acme/build/Hidden.java';
+    const abs = path.join(tempDir, sourceFile);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, 'class Hidden {}\n');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'src/main/java/**/build/\n');
+
+    expect(buildScopeIgnore(tempDir).ignores(sourceFile)).toBe(true);
+    expect(scanDirectory(tempDir)).not.toContain(sourceFile);
+  });
+
   it('buildDefaultIgnore honors .git/info/exclude (#1728)', async () => {
     const { execFileSync } = await import('child_process');
     const git = (cwd: string, ...args: string[]) =>
@@ -10418,6 +10491,22 @@ import foo.cfm;
 </cfcomponent>
 `;
 
+    it('releases the tag parser tree after extraction', () => {
+      const parser = getParser('cfml');
+      expect(parser).toBeDefined();
+      const sample = parser!.parse('<cfcomponent></cfcomponent>');
+      expect(sample).toBeDefined();
+      const treePrototype = Object.getPrototypeOf(sample!);
+      sample!.delete();
+      const deleteSpy = vi.spyOn(treePrototype, 'delete');
+      try {
+        extractFromSource('TagStyle.cfc', '<cfcomponent></cfcomponent>');
+        expect(deleteSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        deleteSpy.mockRestore();
+      }
+    });
+
     it('should name the component from the file name when the tag has no name attribute', () => {
       const result = extractFromSource('TagStyle.cfc', code);
       const cls = result.nodes.find((n) => n.kind === 'class');
@@ -12481,6 +12570,200 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     }
   });
 
+  it('blankCUnbalancedConditionalBranches collapses a damaged #if group to its first branch, offsets kept', async () => {
+    const { blankCUnbalancedConditionalBranches } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'void f(int id)',
+      '{',
+      '    if (id == 1) {',
+      '        a(id);',
+      '    }',
+      '#if defined(USE_V) || \\',
+      '    defined(USE_W)',
+      '    else if (id == 2) { // "{" in a comment',
+      '        b(id);',
+      '    }',
+      '#else',
+      '    else if (id == 3) {',
+      '        c(id);',
+      '    }',
+      '#endif',
+      '#ifdef USE_X',
+      '    d(id);',
+      '#else',
+      '    e(id);',
+      '#endif',
+      '}',
+      '#if 0',
+      'void dead(void) {',
+      '#else',
+      'void live(void) {',
+      '#endif',
+      '}',
+    ].join('\n');
+    const out = blankCUnbalancedConditionalBranches(src);
+    expect(out.length).toBe(src.length);
+    expect(out.split('\n').length).toBe(src.split('\n').length);
+    const lines = out.split('\n');
+    // The `else`-led group opens on a feature test and has an `#else`: the
+    // `#else` branch (the build without the feature) is verbatim; directive
+    // lines (continuation included) and the feature branch are spaces.
+    expect(lines[5]).toBe(' '.repeat(src.split('\n')[5]!.length));
+    expect(lines[6]).toBe(' '.repeat(src.split('\n')[6]!.length));
+    expect(lines[7]).toBe(' '.repeat(src.split('\n')[7]!.length));
+    expect(out).not.toContain('b(id)');
+    expect(lines[10]).toBe('     ');
+    expect(lines[11]).toBe('    else if (id == 3) {');
+    expect(lines[12]).toBe('        c(id);');
+    expect(lines[14]).toBe('      ');
+    // A balanced group is untouched, directives included.
+    expect(lines[15]).toBe('#ifdef USE_X');
+    expect(lines[16]).toBe('    d(id);');
+    expect(lines[18]).toBe('    e(id);');
+    expect(lines[19]).toBe('#endif');
+    // `#if 0` keeps the live branch instead.
+    expect(out).not.toContain('dead');
+    expect(lines[24]).toBe('void live(void) {');
+    // No conditional group at all: identity.
+    const plain = 'int g(void) {\n#define X 1\n    return X;\n}\n';
+    expect(blankCUnbalancedConditionalBranches(plain)).toBe(plain);
+  });
+
+  it('blankCUnbalancedConditionalBranches: two function heads under #ifdef/#else keep the #else head; expression fragments keep their only branch', async () => {
+    const { blankCUnbalancedConditionalBranches } = await import('../src/extraction/languages/c-cpp');
+    // jq's main.c: `umain` for WIN32, `main` otherwise — `main` must survive.
+    const heads = [
+      '#ifdef WIN32',
+      'int umain(int argc, char* argv[]) {',
+      '#else /*}*/',
+      'int main(int argc, char* argv[]) {',
+      '#endif',
+      '  return run(argc, argv);',
+      '}',
+    ].join('\n');
+    const h = blankCUnbalancedConditionalBranches(heads).split('\n');
+    expect(h[1]).toBe(' '.repeat('int umain(int argc, char* argv[]) {'.length));
+    expect(h[3]).toBe('int main(int argc, char* argv[]) {');
+    expect(h[0]).toBe('            ');
+    // `#ifndef` is the inverse: its first branch is the default build.
+    const inv = heads.replace('#ifdef WIN32', '#ifndef POSIX');
+    expect(blankCUnbalancedConditionalBranches(inv).split('\n')[1]).toBe('int umain(int argc, char* argv[]) {');
+    // A branch that is a fragment of an `if (…)` condition (STM32 HAL), or
+    // that opens with `} else if` (betaflight cli.c): directives blanked, the
+    // only branch kept, so the statement parses as written for that build.
+    const frag = [
+      'int check(op_t *h1, op_t *h4)',
+      '{',
+      '  if ((h1 == NULL)',
+      '#if defined(STM32G474xx)',
+      '      || (h4 == NULL)',
+      '#endif',
+      '     )',
+      '  {',
+      '    return 1;',
+      '  }',
+      '  if (',
+      '#if !defined(USE_FLASH)',
+      '      isEmpty(h1) ||',
+      '#endif',
+      '      strncasecmp(h1, "rom", 3) == 0) {',
+      '    reboot(1);',
+      '#if defined(USE_FLASH)',
+      '  } else if (isEmpty(h1)) {',
+      '    reboot(2);',
+      '#endif',
+      '  } else {',
+      '    reboot(0);',
+      '  }',
+      '  return 0;',
+      '}',
+    ].join('\n');
+    const f = blankCUnbalancedConditionalBranches(frag).split('\n');
+    expect(f[3]).toBe(' '.repeat('#if defined(STM32G474xx)'.length));
+    expect(f[4]).toBe('      || (h4 == NULL)');
+    expect(f[5]).toBe('      ');
+    expect(f[12]).toBe('      isEmpty(h1) ||');
+    expect(f[17]).toBe('  } else if (isEmpty(h1)) {');
+    expect(f[16]).toBe(' '.repeat('#if defined(USE_FLASH)'.length));
+  });
+
+  it('a #if branch beginning with `else` no longer files the rest of the file under the enclosing function', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-c-ifelse-'));
+    try {
+      fs.writeFileSync(
+        path.join(dir, 'current.c'),
+        [
+          'void currentMeterRead(int id, meter_t *meter)',
+          '{',
+          '    if (id == 1) {',
+          '        adcRead(meter);',
+          '    }',
+          '#ifdef USE_VIRTUAL',
+          '    else if (id == 2) {',
+          '        virtualRead(meter);',
+          '    }',
+          '#endif',
+          '    else {',
+          '        resetMeter(meter);',
+          '    }',
+          '}',
+          '',
+          'static bool markBusy(void)',
+          '{',
+          '    ATOMIC_BLOCK(NVIC_PRIO_MAX) {',
+          '        busy = true;',
+          '    }',
+          '    return true;',
+          '}',
+          '',
+          'int after(void)',
+          '{',
+          '    return 1;',
+          '}',
+          '',
+        ].join('\n')
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const fns = cg.getNodesByKind('function').filter((n) => n.filePath === 'current.c');
+        const byName = Object.fromEntries(fns.map((n) => [n.name, n]));
+        expect(Object.keys(byName).sort()).toEqual(['after', 'currentMeterRead', 'markBusy']);
+        expect(byName.currentMeterRead!.endLine).toBe(14);
+        expect(byName.markBusy!.qualifiedName).toBe('markBusy');
+        expect(byName.markBusy!.endLine).toBe(22);
+        expect(byName.after!.qualifiedName).toBe('after');
+        expect(byName.after!.startLine).toBe(24);
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('Go: a method carries the exportedness of its name, like a function', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-go-method-exported-'));
+    try {
+      fs.writeFileSync(
+        path.join(dir, 'log.go'),
+        'package log\n\ntype writer struct{}\n\nfunc (w *writer) Close() error { return nil }\n\nfunc (w *writer) flush() {}\n\nfunc Open() *writer { return &writer{} }\n\nfunc helper() {}\n'
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const flag = (name: string) =>
+          cg.getNodesByKind('method').concat(cg.getNodesByKind('function')).find((n) => n.name === name)!.isExported;
+        expect(flag('Close')).toBe(true);
+        expect(flag('flush')).toBe(false);
+        expect(flag('Open')).toBe(true);
+        expect(flag('helper')).toBe(false);
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('blankCStatementMacroCalls blanks indented iterator macros, keeps the block', async () => {
     const { blankCStatementMacroCalls } = await import('../src/extraction/languages/c-cpp');
     const src = [
@@ -12744,6 +13027,10 @@ describe('Unsupported-language projects report what they skipped (#1502)', () =>
     tempDir = createTempDir();
   });
 
+  afterEach(() => {
+    cleanupTempDir(tempDir);
+  });
+
   it('counts files it could not index, by extension, on the git path', async () => {
     const runGit = (...args: string[]) =>
       execFileSync('git', args, { cwd: tempDir, stdio: 'pipe' });
@@ -12787,5 +13074,190 @@ describe('Unsupported-language projects report what they skipped (#1502)', () =>
 
     expect(files).toEqual(['a.ts']);
     expect(stats.unsupportedByExtension.size).toBe(0);
+  });
+});
+
+describe('Verilog / SystemVerilog Extraction', () => {
+  it('should report Verilog as supported', () => {
+    expect(isLanguageSupported('verilog')).toBe(true);
+    expect(getSupportedLanguages()).toContain('verilog');
+  });
+
+  it('should extract modules as containers with scoped functions and tasks', () => {
+    const code = `
+module top (input logic clk, output logic [7:0] z);
+  function automatic int square(int n);
+    return n * n;
+  endfunction
+  task automatic do_reset();
+    z = '0;
+  endtask
+endmodule
+`;
+    const result = extractFromSource('top.sv', code);
+
+    const mod = result.nodes.find((n) => n.kind === 'class' && n.name === 'top');
+    expect(mod).toBeDefined();
+    expect(mod?.language).toBe('verilog');
+
+    const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'square');
+    expect(fn).toBeDefined();
+    expect(fn?.qualifiedName).toBe('top::square'); // scoped under the module
+
+    const task = result.nodes.find((n) => n.kind === 'function' && n.name === 'do_reset');
+    expect(task).toBeDefined();
+  });
+
+  it('should emit an instantiates reference from a module to its submodule type', () => {
+    const code = `
+module alu #(parameter int WIDTH = 8) (input logic [WIDTH-1:0] a, output logic [WIDTH-1:0] y);
+endmodule
+
+module top (input logic [7:0] x, output logic [7:0] z);
+  alu #(.WIDTH(8)) u_alu (.a(x), .y(z));
+endmodule
+`;
+    const result = extractFromSource('soc.sv', code);
+
+    const top = result.nodes.find((n) => n.kind === 'class' && n.name === 'top');
+    expect(top).toBeDefined();
+
+    const inst = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'instantiates' && r.referenceName === 'alu'
+    );
+    expect(inst).toBeDefined();
+    expect(inst?.fromNodeId).toBe(top?.id); // the parent module is the source
+
+    // parameter is captured as a constant
+    const param = result.nodes.find((n) => n.kind === 'constant' && n.name === 'WIDTH');
+    expect(param).toBeDefined();
+  });
+
+  it('should extract package typedefs, functions, imports and call edges', () => {
+    const code = `
+package math_pkg;
+  typedef enum logic [1:0] { IDLE, RUN, DONE } state_t;
+  function automatic int add(int a, int b);
+    return a + b;
+  endfunction
+endpackage
+
+module worker (input logic clk);
+  import math_pkg::*;
+  function automatic int caller(int y);
+    return add(y);
+  endfunction
+endmodule
+`;
+    const result = extractFromSource('pkg.sv', code);
+
+    const pkg = result.nodes.find((n) => n.kind === 'class' && n.name === 'math_pkg');
+    expect(pkg).toBeDefined();
+
+    const typedef = result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'state_t');
+    expect(typedef).toBeDefined();
+    expect(typedef?.qualifiedName).toBe('math_pkg::state_t');
+
+    const importNode = result.nodes.find((n) => n.kind === 'import' && n.name === 'math_pkg');
+    expect(importNode).toBeDefined();
+
+    const callRef = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'calls' && r.referenceName === 'add'
+    );
+    expect(callRef).toBeDefined();
+  });
+
+  it('should extract every package in a multi-package import statement', () => {
+    const code = `
+package a_pkg;
+  function automatic int fa(); return 1; endfunction
+endpackage
+
+package b_pkg;
+  function automatic int fb(); return 2; endfunction
+endpackage
+
+module worker (input logic clk);
+  import a_pkg::*, b_pkg::*;
+  function automatic int caller();
+    return fa() + fb();
+  endfunction
+endmodule
+`;
+    const result = extractFromSource('multi.sv', code);
+
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    expect(imports).toContain('a_pkg');
+    expect(imports).toContain('b_pkg'); // the second import must not be dropped
+
+    // call edges still resolve when multiple imports share one statement
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+    expect(calls).toContain('fa');
+    expect(calls).toContain('fb');
+  });
+
+  it('should capture function calls inside instantiation port/param expressions', () => {
+    const code = `
+module sub #(parameter int W = 8) (input logic [W-1:0] a);
+endmodule
+
+module top (input logic [7:0] x);
+  function automatic int dbl(int v); return v * 2; endfunction
+  function automatic int wid(); return 8; endfunction
+  sub #(.W(wid())) u_sub (.a(dbl(x)));
+endmodule
+`;
+    const result = extractFromSource('inst_calls.sv', code);
+
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+    expect(calls).toContain('dbl'); // call inside a port connection
+    expect(calls).toContain('wid'); // call inside a parameter override
+
+    // the instantiation edge itself is still emitted
+    const inst = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'instantiates' && r.referenceName === 'sub'
+    );
+    expect(inst).toBeDefined();
+  });
+
+  it('should emit an import for each `include directive, named by the included path', () => {
+    const code = `
+\`include "defs.vh"
+\`include "axi/typedef.svh"
+\`include <uvm_macros.svh>
+module top (input logic clk);
+endmodule
+`;
+    const result = extractFromSource('top.sv', code);
+
+    const includes = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    expect(includes).toEqual(['defs.vh', 'axi/typedef.svh', 'uvm_macros.svh']);
+
+    // the path is what the import ref carries, so the file-path matcher can
+    // land it on the header by suffix
+    const refs = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'imports')
+      .map((r) => r.referenceName);
+    expect(refs).toEqual(['defs.vh', 'axi/typedef.svh', 'uvm_macros.svh']);
+  });
+
+  it('should extract `define macros and top-level parameters from a header', () => {
+    const code = `
+\`ifndef DEFS_VH
+\`define DEFS_VH
+\`define DATA_W 16
+\`define ADDR(x) (x + 1)
+parameter CLK_HZ = 27_000_000;
+localparam BAUD = 115200;
+\`endif
+`;
+    const result = extractFromSource('defs.vh', code);
+
+    const constants = result.nodes.filter((n) => n.kind === 'constant').map((n) => n.name);
+    expect(constants).toEqual(['DEFS_VH', 'DATA_W', 'ADDR', 'CLK_HZ', 'BAUD']);
   });
 });

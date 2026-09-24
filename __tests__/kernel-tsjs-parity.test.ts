@@ -124,6 +124,39 @@ function nested(holder) {
     expect(result.unresolvedReferences.some((r) => r.referenceName === 'values.get')).toBe(true);
   });
 
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('peels transparent receivers and drops untyped expression receivers: %s', (ext, language) => {
+    const typed = language === 'typescript' || language === 'tsx';
+    const result = assertParity(`fixture.${ext}`, `
+function list() { return []; }
+class Runner { go() { return 1; } }
+async function exprReceivers(x, y) {
+  (await list()).map(g);
+  (x).run();
+  ${typed ? 'x!.run(); (y as X).run(); (x satisfies X).stop(); getTarget("a")!.install(); if (x && y!.c.has(1)) {} if (x && this.e!.c.has(1)) {}' : ''}
+  (a ?? b).map(g);
+  arr[0].run();
+  f().list.map(g);
+  (() => 1).call(null);
+  this.a.b.run();
+  super.stop();
+  new Runner().go();
+  (new ns.Widget(1)).draw();
+  new (pick())().go();
+  new Runner().a.run();
+  window.Api.start();
+}
+`, language);
+    const fn = result.nodes.find((n) => n.name === 'exprReceivers');
+    expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'calls' && r.fromNodeId === fn!.id)
+      .map((r) => r.referenceName)).toEqual([
+        'list().map', 'list', 'x.run',
+        ...(typed ? ['x.run', 'y.run', 'x.stop', 'getTarget().install', 'getTarget', 'has'] : []),
+        'f', 'run', 'stop', 'new Runner().go', 'new ns.Widget().draw', 'pick', 'start',
+      ]);
+  });
+
   it('torture fixture (tsx): components, stores, RTK, fn-refs, value-refs, decorators', () => {
     const file = path.join(FIXTURE_DIR, 'torture.tsx');
     assertParity('fixtures/torture.tsx', fs.readFileSync(file, 'utf8'), 'tsx');
@@ -137,6 +170,11 @@ function nested(holder) {
   it('torture fixture (java): Lombok, anonymous classes, method refs, chains', () => {
     const file = path.join(FIXTURE_DIR, 'Torture.java');
     assertParity('fixtures/Torture.java', fs.readFileSync(file, 'utf8'), 'java');
+  });
+
+  it('torture fixture (java records): components, compact ctors, nested/local/generic records', () => {
+    const file = path.join(FIXTURE_DIR, 'TortureRecord.java');
+    assertParity('fixtures/TortureRecord.java', fs.readFileSync(file, 'utf8'), 'java');
   });
 
   it('torture fixture (python): decorators, self fn-refs, imports, shadowing', () => {
@@ -165,6 +203,7 @@ function nested(holder) {
     ['torture.tsx', 'tsx'],
     ['torture.js', 'javascript'],
     ['Torture.java', 'java'],
+    ['TortureRecord.java', 'java'],
     ['torture.py', 'python'],
     ['torture.go', 'go'],
   ] as const)('torture fixture CRLF parity: %s', (name, lang) => {

@@ -5,6 +5,7 @@
  */
 
 import * as fs from 'fs';
+import { readBoundedSourceSync } from '../file-limits';
 import * as path from 'path';
 import { Language, Node, UnresolvedReference, Edge } from '../types';
 import { QueryBuilder } from '../db/queries';
@@ -18,8 +19,14 @@ import {
   SUPERTYPE_TARGET_KINDS,
   isInheritanceRef,
   isImportableKind,
+  CPP_DEFINE_SIGNATURE,
 } from './types';
-import { matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
+import { matchKotlinReceiverChain, matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos, GO_STDLIB_PACKAGES } from './name-matcher';
+import { isVerilogMemberRef, matchVerilogMember } from './verilog-members';
+import { isVerilogPortRef, matchVerilogPort } from './verilog-ports';
+import { isVerilogWildcardRef, matchVerilogWildcard } from './verilog-wildcard';
+import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
+import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
@@ -33,6 +40,7 @@ import { logDebug } from '../errors';
 import { lexicalPathWithinRoot } from '../utils';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
+import { memoryBudgetBytes } from './memory-budget';
 import { JS_BUILT_INS } from './js-builtins';
 
 /** Node kinds that can declare supertypes (extends/implements). */
@@ -104,20 +112,6 @@ const PYTHON_BUILT_IN_METHODS = new Set([
   'startswith', 'endswith', 'find', 'index', 'count', 'encode', 'decode',
   'format', 'isdigit', 'isalpha', 'isalnum',
   'read', 'write', 'readline', 'readlines', 'close', 'flush', 'seek',
-]);
-
-const GO_STDLIB_PACKAGES = new Set([
-  'fmt', 'os', 'io', 'net', 'http', 'log', 'math', 'sort', 'sync',
-  'time', 'path', 'bytes', 'strings', 'strconv', 'errors', 'context',
-  'json', 'xml', 'csv', 'html', 'template', 'regexp', 'reflect',
-  'runtime', 'testing', 'flag', 'bufio', 'crypto', 'encoding',
-  'filepath', 'hash', 'mime', 'rand', 'signal', 'sql', 'syscall',
-  'unicode', 'unsafe', 'atomic', 'binary', 'debug', 'exec', 'heap',
-  'ring', 'scanner', 'tar', 'zip', 'gzip', 'zlib', 'tls', 'url',
-  'user', 'pprof', 'trace', 'ast', 'build', 'parser', 'printer',
-  'token', 'types', 'cgo', 'plugin', 'race', 'ioutil',
-  // Kubernetes-common stdlib aliases
-  'utilruntime', 'utilwait', 'utilnet',
 ]);
 
 const GO_BUILT_INS = new Set([
@@ -293,8 +287,15 @@ export class ReferenceResolver {
     // The content cache is heavier (full file text), so we give it a
     // smaller budget than the metadata caches.
     const contentLimit = Math.max(64, Math.floor(limit / 5));
+    const contentBudget = Math.max(
+      8 * 1024 * 1024,
+      Math.min(64 * 1024 * 1024, Math.floor(memoryBudgetBytes() * 0.02))
+    );
     this.nodeCache = new LRUCache(limit);
-    this.fileCache = new LRUCache(contentLimit);
+    this.fileCache = new LRUCache(contentLimit, {
+      maxWeight: Math.floor(contentBudget / 4),
+      weightOf: (value) => value === null ? 1 : Math.max(64, value.length * 2),
+    });
     this.importMappingCache = new LRUCache(limit);
     this.reExportCache = new LRUCache(limit);
     this.nameCache = new LRUCache(limit);
@@ -302,7 +303,12 @@ export class ReferenceResolver {
     this.qualifiedNameCache = new LRUCache(limit);
     // Split-lines arrays are heavier than content strings; refs arrive
     // file-ordered, so a small cache still hits nearly always.
-    this.fileLinesCache = new LRUCache(contentLimit);
+    this.fileLinesCache = new LRUCache(contentLimit, {
+      maxWeight: Math.floor(contentBudget * 3 / 4),
+      weightOf: (value) => value === null
+        ? 1
+        : Math.max(64, value.length * 8 + value.reduce((sum, line) => sum + line.length * 2, 0)),
+    });
     this.methodMatchCache = new LRUCache(limit);
 
     this.context = this.createContext();
@@ -412,6 +418,7 @@ export class ReferenceResolver {
     if (this.context) {
       clearImportResolverMemos(this.context);
       clearNameMatcherMemos(this.context);
+      clearCppMacroVisibility(this.context);
     }
   }
 
@@ -422,7 +429,10 @@ export class ReferenceResolver {
     }
     const fullPath = path.join(this.projectRoot, filePath);
     try {
-      const content = fs.readFileSync(fullPath, 'utf-8');
+      // Import resolvers may follow package metadata to an archive (`file:*.har`,
+      // for example). Reject anything extraction would not accept before UTF-8
+      // decoding can multiply a large binary blob into gigabytes of V8 heap.
+      const content = readBoundedSourceSync(fullPath).bytes?.toString('utf8') ?? null;
       this.fileCache.set(filePath, content);
       return content;
     } catch (error) {
@@ -732,6 +742,7 @@ export class ReferenceResolver {
       filePath: ref.filePath || this.getFilePathFromNodeId(ref.fromNodeId),
       language: ref.language || this.getLanguageFromNodeId(ref.fromNodeId),
       rowId: ref.rowId,
+      candidates: ref.candidates,
     }));
 
     const total = refs.length;
@@ -877,6 +888,10 @@ export class ReferenceResolver {
    * the alias names (see ./alias-binding), regardless of the strategy.
    */
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
+    // A C/C++ "call" whose name is a function-like macro visible in this
+    // translation unit is a macro expansion, not a call — it must never bind
+    // to a same-named function in another file (#1838).
+    if (isVisibleCppMacro(ref, this.context)) return null;
     const resolved = this.gateTargetKind(this.resolveOneInner(ref), ref);
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
 
@@ -896,6 +911,25 @@ export class ReferenceResolver {
   }
 
   private resolveOneInner(ref: UnresolvedRef): ResolvedRef | null {
+    if (isVerilogWildcardRef(ref)) return matchVerilogWildcard(ref, this.context, matchReference);
+    if (isVerilogPortRef(ref)) return matchVerilogPort(ref, this.context, matchReference);
+    if (isVerilogMemberRef(ref)) return matchVerilogMember(ref, this.context);
+    // A local C++ object construction (`T obj(args)`, ref `ns::T::T/1`)
+    // resolves ONLY to a constructor of the lexically nearest `T` (#1839).
+    if (isCppConstructorRef(ref)) return matchCppConstructor(ref, this.context);
+    // A Kotlin call through a receiver chain (`engine.pump.drain()`) resolves
+    // on the chain's declared type, or gets no edge when that type is a
+    // library one. An untyped chain resolves as the bare method name, the ref
+    // the extractor emitted before it kept the chain.
+    if (ref.language === 'kotlin' && ref.referenceKind === 'calls') {
+      const chain = matchKotlinReceiverChain(ref, this.context);
+      if (chain && 'method' in chain) {
+        const bare = this.resolveOneInner({ ...ref, referenceName: chain.method });
+        return bare ? { ...bare, original: ref } : null;
+      }
+      if (chain !== undefined) return this.gateLanguage(chain, ref);
+    }
+
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {
       return null;
@@ -1036,7 +1070,17 @@ export class ReferenceResolver {
       CHAIN_SHAPE.test(ref.referenceName) &&
       (ref.language === 'typescript' || ref.language === 'javascript' || ref.language === 'tsx' || ref.language === 'jsx' || ref.language === 'python')
     ) {
-      return this.gateLanguage(matchReference(ref, this.context), ref);
+      const chainResult = this.gateLanguage(matchReference(ref, this.context), ref);
+      // `new Sub().inherited()`: the method may live on a supertype of a
+      // project class, resolvable once extends edges exist — defer to the
+      // conformance pass like the other chained calls.
+      if (!chainResult && NEW_RECEIVER_SHAPE.test(ref.referenceName)) {
+        const cls = newReceiverClass(ref, this.context);
+        if (cls && this.context.getNodesByName(cls).some((n) => n.kind === 'class' && sameLanguageFamily(n.language, ref.language))) {
+          this.deferReference(ref, this.deferredChainRefs);
+        }
+      }
+      return chainResult;
     }
 
     const tImp = this.profileStages ? process.hrtime.bigint() : 0n;
@@ -1196,6 +1240,8 @@ export class ReferenceResolver {
           // wrong rebind; edges without refName (pre-#1240, synthesized) are
           // deliberately NOT resurrected for the same reason.
           refName: ref.original.referenceName,
+          ...(ref.original.language === 'verilog' && ref.original.candidates?.length
+            ? { refCandidates: ref.original.candidates } : {}),
           ...(ref.original.referenceKind !== kind ? { refKind: ref.original.referenceKind } : {}),
           // Uniform marker for function-as-value edges (#756), regardless of
           // which strategy resolved them (import vs matchFunctionRef) — lets
@@ -1441,6 +1487,8 @@ export class ReferenceResolver {
       // dotted-receiver languages on `.` (matchDottedCallChain).
       const chainMatch = (ref.language === 'php' && PHP_PROP_SHAPE.test(ref.referenceName))
         ? matchMethodCall(ref, this.context)
+        : NEW_RECEIVER_SHAPE.test(ref.referenceName)
+        ? matchNewReceiverCall(ref, this.context)
         : SCOPED_CHAIN_LANGUAGES.has(ref.language)
         ? matchScopedCallChain(ref, this.context)
         : matchDottedCallChain(ref, this.context);
@@ -1485,6 +1533,7 @@ export class ReferenceResolver {
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
         rowId: raw.rowId,
+        candidates: raw.candidates,
       };
       const result = this.resolveOneTimed(ref);
       if (result) {
@@ -1605,6 +1654,7 @@ export class ReferenceResolver {
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
         rowId: raw.rowId,
+        candidates: raw.candidates,
       };
       const result = this.resolveOneTimed(ref);
       if (result) {
@@ -2257,7 +2307,17 @@ export class ReferenceResolver {
       const dotIdx = name.indexOf('.');
       if (dotIdx > 0) {
         const pkg = name.substring(0, dotIdx);
-        if (GO_STDLIB_PACKAGES.has(pkg)) {
+        // Only when the file imports it: an unimported `ring` / `list` / `url`
+        // is a local variable (`func flush(ring *ringLog) { ring.Write(b) }`),
+        // and skipping it here dropped every method call made through it.
+        // Matched on any path segment, not the import's local name, so a
+        // versioned path (`math/rand/v2`) still counts as importing `rand`.
+        if (
+          GO_STDLIB_PACKAGES.has(pkg) &&
+          this.context
+            .getImportMappings(ref.filePath, 'go')
+            .some((i) => i.localName === pkg || i.source.split('/').includes(pkg))
+        ) {
           return true;
         }
       }
@@ -2645,6 +2705,13 @@ export class ReferenceResolver {
    */
   private gateTargetKind(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result) return result;
+
+    // A `#define` is a value, never a callee (#1838): a macro defined only in
+    // an unrelated file is not what `NAME(x)` here expands to either.
+    if (ref.referenceKind === 'calls') {
+      const target = this.queries.getNodeById(result.targetNodeId);
+      if (target?.kind === 'constant' && CPP_DEFINE_SIGNATURE.test(target.signature ?? '')) return null;
+    }
 
     // An `imports` reference names something importable — never a member that
     // only exists inside a type.
