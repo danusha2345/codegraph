@@ -10,7 +10,7 @@ import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, SUPERTYPE_TARGET_KINDS, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { resolveWorkspaceImport } from './workspace-packages';
-import { JS_BUILT_INS, TS_PRIMITIVE_TYPES } from './js-builtins';
+import { JS_BUILT_INS, JS_BUILTIN_METHOD_NAMES, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { isVerilogMemberRef, matchVerilogMember } from './verilog-members';
 import { isVerilogPortRef, matchVerilogPort } from './verilog-ports';
 import { isVerilogWildcardRef, matchVerilogWildcard } from './verilog-wildcard';
@@ -3456,6 +3456,8 @@ export function matchMethodCall(
     const sameLanguageMethods = methods.filter(m => m.language === ref.language);
     const targetMethods = sameLanguageMethods.length > 0 ? sameLanguageMethods : methods;
 
+    if (isUnevidencedJsBuiltinMethod(targetMethods, objectOrClass!, methodName!, ref)) return null;
+
     // If only one same-language method with this name exists, use it
     if (targetMethods.length === 1 && targetMethods[0]!.language === ref.language) {
       if (isForeignReceiverSelfLoop(targetMethods[0]!, objectOrClass!, ref, context)) return null;
@@ -4135,6 +4137,28 @@ function splitCamelCase(str: string): string[] {
     .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
     .split(/[\s._:\/\\]+/)
     .filter(w => w.length > 1);
+}
+
+/**
+ * JS/TS name-only fallback guard: `lines.map()` / `seen.has(k)` with an
+ * untyped receiver is almost always the built-in prototype method, so a
+ * project class's lone `map`/`has` is not evidence enough. Decline unless the
+ * receiver's words name a candidate's class (`treeCache.get` → `LRUCache`).
+ * Typed receivers, `this.field` calls and `Class.method` matches are resolved
+ * before Strategy 3 and never reach this check.
+ */
+function isUnevidencedJsBuiltinMethod(
+  candidates: Node[],
+  receiver: string,
+  methodName: string,
+  ref: UnresolvedRef
+): boolean {
+  if (!ESM_FAMILY.has(ref.language) || !JS_BUILTIN_METHOD_NAMES.has(methodName)) return false;
+  const receiverWords = splitCamelCase(receiver).map((w) => w.toLowerCase());
+  return !candidates.some((m) => {
+    const owner = m.qualifiedName.split('::').slice(0, -1).join('::');
+    return splitCamelCase(owner).some((w) => receiverWords.includes(w.toLowerCase()));
+  });
 }
 
 /**
