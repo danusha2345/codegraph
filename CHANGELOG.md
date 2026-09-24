@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- **A Scala `Outer.Inner(...)` call now reaches the Scala case class it builds, not a Java constructor.** A companion `apply` such as `RemoteNode.Obfuscated("x")` was linked to an unrelated Java class's constructor that merely shared the words in its name; it now links to the Scala type of that name, and a Java constructor is never guessed that way.
+
 
 ## [1.6.1] - 2026-09-29
 
