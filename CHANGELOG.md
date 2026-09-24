@@ -183,6 +183,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A C or C++ macro invocation such as `TRACE_POINT(1)` no longer shows up as a call to a same-named function in another file when the macro is defined in that file or one of its included headers; function-like macros are indexed as constants, never as callees. (#1838)
 
 - C++ local object initialization — `Widget w;`, `Widget w(1);`, `Widget w{1};` — now calls the constructor defined for the type in the nearest namespace, picking the overload whose parameter count fits when exactly one does, instead of pointing at the class itself; plain aggregates, pointers, references and `extern` declarations produce no call. (#1839)
+- A call to a function defined in the same file is no longer marked as an uncertain match when the file sits near the top of the project, and it now wins over a weaker same-named guess in another file.
 
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)
 
