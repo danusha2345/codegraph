@@ -149,6 +149,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
+- Standard-library calls on a value of unknown type, such as `name.len()` in Rust, `list.isEmpty()` in Kotlin, `options.setdefault(...)` in Python, `conn.Close()` in Go, `opt.map(...)` in Scala or `Task.Run(...)` in C#, no longer link to a project method that merely shares the name.
+
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)
 
 - Calls between JavaScript, JSX and TypeScript files keep their callers and callback flows.
