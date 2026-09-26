@@ -157,6 +157,17 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Trails are plain JSON, one file per trail, under `.codegraph/ui/trails/` — already ignored by git, so they stay yours by default. **Export** hands you the file if you'd rather commit one for the team. This is the only thing the viewer writes: it still never indexes, never changes your graph, and never touches a line of your code. Start it with `codegraph ui --read-only` and it won't write even that — saved trails can still be opened, just not saved or deleted.
 
 ### Fixes
+
+- При остановленном watcher `codegraph_explore` больше не отдаёт исходный код из изменившихся после индексации файлов: он называет их и просит проверить напрямую, продолжая отвечать по неизменённым файлам. (#1959)
+- While auto-sync is off, `codegraph_search`, `codegraph_callers`, `codegraph_callees` and `codegraph_impact` likewise refuse an answer that names a file changed since its last sync, and name that file instead. (#1959)
+
+- MCP status now shows when a file was last indexed and how many files were added, changed, or removed since then, so an out-of-date graph is visible even when file watching has stopped. (#1959)
+
+- The "edited since the last index sync" warning no longer names a file the answer never showed just because its path is part of one that it did, such as `src/app.ts` next to `src/app.tsx`. (#1968)
+
+- Долгая индексация больше не теряет блокировку записи через две минуты: пока владелец жив, второй процесс ждёт освобождения индекса. (#1959)
+- После длительной конкуренции за lock MCP при следующем вызове повторно включает watcher и делает полный проход. До успешной синхронизации ответы явно помечены как потенциально устаревшие; повторные попытки ограничены паузой. (#1959)
+- Зависший при остановке общий MCP-демон теперь закрывает даже соединения без завершённого приветствия; резервный процесс при занятом writer lock продолжает обслуживать чтение без второго писателя. (#1963)
 - A file over the size limit is no longer read before it is skipped: committed video and blob fixtures used to be decoded in full — a 400 MB fixture cost 3.4 GB of memory — only to be discarded, and the same file was read again by every resolution pass. Its size stamp now stands in for its content, during indexing and when checking for changes. (#1910)
 
 - An MPEG transport stream video that happens to be named `.ts` (golden fixtures under `testdata/`, e2e clips) is now recognised from its first bytes and skipped as non-source instead of being fed to the TypeScript parser — a 900 KB clip used to cost about 28 seconds of CPU per file for no symbols, and a folder of them minutes. Real TypeScript is never affected. (#1910)
@@ -181,6 +192,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Java calls on a variable, parameter or field whose declared type is a library class (such as `Parcel`, `Context`, `List` or `Handler`), and static calls on an imported library class such as `Log.d(...)`, no longer link to an unrelated project method with the same name. Calls through `this.field`, `Outer.this.field`, a field read inside an anonymous or inner class, a chain of fields such as `owner.repo.save()`, and a variable declared with type arguments (`Map<String, Foo> byName`) now resolve on the declared type, and a type written with its package or outer class (`Map.Entry`, `play.api.mvc.BodyParser`) or imported as a nested class is no longer mistaken for a same-named type elsewhere in the project. Re-index Java projects to pick this up.
 
 - Java `record` declarations are now indexed as classes, with their methods, constructors, components and implicit accessors, so calls on a record-typed value like `info.remoteAddress()` resolve and records show up in callers, impact and implementations; re-index Java projects after upgrading.
+- Restarting after an interrupted index no longer gets trapped in repeated watchdog restarts while repairing the database. (#1887)
+- После полной переиндексации автообновление и MCP-запросы подхватывают новую базу и сверяют изменения, пропущенные во время её замены. (#1902)
+- Python docstrings модулей, классов и функций теперь доступны в поиске; для существующих проектов требуется переиндексация. (#1905)
 
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 

@@ -152,6 +152,8 @@ export interface LanguageExtractor {
 
   /** Extract signature from node */
   getSignature?: (node: SyntaxNode, source: string) => string | undefined;
+  /** Authored prose inside a definition body (or the module root). */
+  getBodyDocstring?: (node: SyntaxNode, source: string) => string | undefined;
   /** Extract visibility from node */
   getVisibility?: (node: SyntaxNode) => 'public' | 'private' | 'protected' | 'internal' | undefined;
   /** Check if node is exported */

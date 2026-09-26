@@ -9,7 +9,7 @@
  * lifecycle the default project gets — a catch-up sync the first call waits
  * for, a watcher while it stays cached — bounded (LRU) and released on stop().
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -20,8 +20,8 @@ import { __setLoadCodeGraphForTests } from '../src/mcp/tools';
 const opened: CodeGraph[] = [];
 /** CodeGraph that records every instance the ToolHandler opens. */
 class RecordingCodeGraph extends CodeGraph {
-  static openSync(projectRoot: string): CodeGraph {
-    const cg = CodeGraph.openSync(projectRoot);
+  static async open(projectRoot: string): Promise<CodeGraph> {
+    const cg = await CodeGraph.open(projectRoot);
     opened.push(cg);
     return cg;
   }
@@ -78,6 +78,33 @@ describe('MCP explicit projectPath lifecycle (#1835)', () => {
     expect(res.isError).toBeFalsy();
     return res.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
   }
+
+  it('shares one connection and watcher across concurrent first calls', async () => {
+    const results = await Promise.all(Array.from({ length: 20 }, () => search(serviceA, 'alphaOriginal')));
+    expect(results.every(text => text.includes('alphaOriginal'))).toBe(true);
+    expect(opened).toHaveLength(1);
+    expect(opened[0].isWatching()).toBe(true);
+  });
+
+  it('does not reopen or activate a project after stop wins an in-flight open', async () => {
+    const cg = await CodeGraph.open(serviceA);
+    let finish!: (cg: CodeGraph) => void;
+    const gate = new Promise<CodeGraph>(resolve => { finish = resolve; });
+    const spy = vi.spyOn(RecordingCodeGraph, 'open').mockReturnValueOnce(gate);
+    try {
+      const call = engine.getToolHandler().execute('codegraph_search', { projectPath: serviceA, query: 'alphaOriginal' });
+      await vi.waitFor(() => expect(spy).toHaveBeenCalledOnce());
+      engine.stop();
+      finish(cg);
+      await call;
+      expect(spy).toHaveBeenCalledOnce();
+      expect(cg.isWatching()).toBe(false);
+      expect(() => cg.getStats()).toThrow();
+    } finally {
+      spy.mockRestore();
+      cg.close();
+    }
+  });
 
   it('catches up an edit made before the first call and watches later edits', async () => {
     // Edited while no server owned the index — the catch-up path.

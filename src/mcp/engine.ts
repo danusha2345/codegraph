@@ -92,15 +92,6 @@ export class MCPEngine {
       activate: (cg) => this.activateExplicitProject(cg),
       release: (cg) => this.releaseExplicitProject(cg),
     });
-    // A tool call found the default project's database replaced on disk (a
-    // `codegraph index` rebuild) and reopened it (#1902). Reconcile the new
-    // file with the usual catch-up — `sync()` serializes on the index mutex,
-    // so it never overlaps an in-flight watcher sync. Only when this engine is
-    // watching, i.e. it is the project's writer: a read-only engine (writer
-    // lock held elsewhere, watching disabled) must not start writing.
-    this.toolHandler.setOnDatabaseReopened((cg) => {
-      if (cg === this.cg && cg.isWatching()) this.catchUpSync();
-    });
     if (opts.writerLockRoot) {
       const writer = tryAcquireWriterLock(opts.writerLockRoot, 'fallback');
       if (writer.kind === 'taken') {
@@ -189,13 +180,26 @@ export class MCPEngine {
   }
 
   /**
-   * Synchronous last-resort init used by the per-session retry loop when the
-   * background `ensureInitialized` already finished (or failed) and we need
-   * to pick up a project that appeared *after* the engine started.
+   * Last-resort init used by the per-session retry loop when the background
+   * `ensureInitialized` already finished (or failed) and we need to pick up a
+   * project that appeared *after* the engine started.
    */
-  retryInitializeSync(searchFrom: string): void {
+  async retryInitializeSync(searchFrom: string): Promise<void> {
     if (this.closed) return;
     if (this.toolHandler.hasDefaultCodeGraph()) return;
+    if (this.initPromise) {
+      try { await this.initPromise; } catch { /* let caller retry */ }
+      return;
+    }
+
+    this.initPromise = this.doRetryInitialize(searchFrom).finally(() => {
+      this.initPromise = null;
+    });
+    try { await this.initPromise; } catch { /* let the next tool call retry */ }
+  }
+
+  /** Serialized implementation for {@link retryInitializeSync}. */
+  private async doRetryInitialize(searchFrom: string): Promise<void> {
     this.toolHandler.setDefaultProjectHint(searchFrom);
     // Same resolution `doInitialize` used: up-walk, then the bounded workspace
     // down-scan (#1606) — this retry is exactly the path that picks up a
@@ -217,7 +221,12 @@ export class MCPEngine {
         try { this.cg.close(); } catch { /* ignore */ }
         this.cg = null;
       }
-      this.cg = loadCodeGraph().openSync(resolvedRoot);
+      const opened = await loadCodeGraph().open(resolvedRoot);
+      if (this.closed) {
+        try { opened.close(); } catch { /* shutdown already owns cleanup */ }
+        return;
+      }
+      this.cg = opened;
       this.projectPath = resolvedRoot;
       this.toolHandler.setDefaultCodeGraph(this.cg);
       this.startWatching();
@@ -370,7 +379,12 @@ export class MCPEngine {
 
     this.projectPath = resolvedRoot;
     try {
-      this.cg = await loadCodeGraph().open(resolvedRoot);
+      const opened = await loadCodeGraph().open(resolvedRoot);
+      if (this.closed) {
+        try { opened.close(); } catch { /* shutdown already owns cleanup */ }
+        return;
+      }
+      this.cg = opened;
       this.toolHandler.setDefaultCodeGraph(this.cg);
       this.startWatching();
       this.catchUpSync();
@@ -397,7 +411,7 @@ export class MCPEngine {
    * keep working.
    */
   private startWatching(): void {
-    if (!this.cg || this.watcherStarted || !this.opts.watch) return;
+    if (this.closed || !this.cg || this.watcherStarted || !this.opts.watch) return;
 
     // #1740: only one live watcher/writer per project. Daemon and startDirect
     // usually already hold writer.pid (re-entrant for this pid). Proxy

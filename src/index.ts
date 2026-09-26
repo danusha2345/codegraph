@@ -162,11 +162,15 @@ export class CodeGraph {
   // Mutex for preventing concurrent indexing operations (in-process)
   private indexMutex = new Mutex();
 
+  private replacementSync: Promise<boolean> | null = null;
+
   // File lock for preventing concurrent writes across processes (CLI, MCP, git hooks)
   private fileLock: FileLock;
 
   // File watcher for auto-sync on file changes
   private watcher: FileWatcher | null = null;
+  private closed = false;
+  private reopenPromise: Promise<boolean> | null = null;
 
   private constructor(
     db: DatabaseConnection,
@@ -279,12 +283,14 @@ export class CodeGraph {
    * replaced file is still picked up — by that sync, or by the caller's retry.
    */
   reopenIfReplaced(): boolean {
+    if (this.closed) return false;
     if (this.indexMutex.isLocked()) return false;
     return this.reopenReplacedDatabase();
   }
 
   /** The body of {@link reopenIfReplaced}, without the in-flight-sync guard. */
   private reopenReplacedDatabase(): boolean {
+    if (this.closed) return false;
     if (!this.db.isReplacedOnDisk()) return false;
     const dbPath = this.db.getPath();
     // Open the live file FIRST — if that throws (e.g. mid-recreate), the old
@@ -302,6 +308,56 @@ export class CodeGraph {
     // pinning the unlinked inode (#925).
     try { stale.close(); } catch { /* the old inode is gone; closing just frees fds */ }
     return true;
+  }
+
+  /** Async counterpart used by long-lived servers so recovery stays off-loop. */
+  async reopenIfReplacedAsync(): Promise<boolean> {
+    if (this.closed) return false;
+    if (this.reopenPromise) return this.reopenPromise;
+    if (!this.db.isReplacedOnDisk()) return false;
+    const reopening = this.indexMutex.withLock(() => this.doReopenIfReplacedAsync());
+    this.reopenPromise = reopening;
+    try {
+      return await reopening;
+    } finally {
+      if (this.reopenPromise === reopening) this.reopenPromise = null;
+    }
+  }
+
+  /** Serialized implementation for {@link reopenIfReplacedAsync}. */
+  private async doReopenIfReplacedAsync(): Promise<boolean> {
+    if (this.closed) return false;
+    if (!this.db.isReplacedOnDisk()) return false;
+    const dbPath = this.db.getPath();
+    // As above, complete the new open before disturbing the still-usable stale
+    // handle. This path also keeps secondary-index recovery off the event loop.
+    const fresh = await DatabaseConnection.openAsync(dbPath);
+    if (this.closed) {
+      try { fresh.close(); } catch { /* close() won the lifecycle race */ }
+      return false;
+    }
+    const stale = this.db;
+    this.db = fresh;
+    this.queries = new QueryBuilder(fresh.getDb());
+    this.wireLayers();
+    try { stale.close(); } catch { /* the old inode is gone; closing just frees fds */ }
+    this.pendingFullReconcile = true;
+    return true;
+  }
+
+  /** Catch up a replaced index before MCP dispatch, including pool reads. */
+  async syncIfReplaced(wait = true): Promise<boolean> {
+    if (this.closed) return false;
+    if (this.replacementSync) return wait ? this.replacementSync : false;
+    if (!this.pendingFullReconcile && !this.db.isReplacedOnDisk()) return true;
+    if (!wait) return false;
+    const recovering = this.sync().then(result =>
+      !(result.filesChecked === 0 && result.durationMs === 0) &&
+      !this.pendingFullReconcile && !this.db.isReplacedOnDisk()
+    );
+    this.replacementSync = recovering;
+    try { return await recovering; }
+    finally { if (this.replacementSync === recovering) this.replacementSync = null; }
   }
 
   // ===========================================================================
@@ -390,7 +446,7 @@ export class CodeGraph {
 
     // Open database
     const dbPath = getDatabasePath(resolvedRoot);
-    const db = DatabaseConnection.open(dbPath);
+    const db = await DatabaseConnection.openAsync(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
     const instance = new CodeGraph(db, queries, resolvedRoot);
@@ -487,6 +543,8 @@ export class CodeGraph {
    * Close the CodeGraph instance and release resources
    */
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.unwatch();
     // Release file lock if held
     this.fileLock.release();
@@ -846,7 +904,8 @@ export class CodeGraph {
       // If the reopen fails (the rebuild is mid-way), report the lock-busy
       // shape so the watcher keeps its pending files and retries.
       try {
-        this.reopenReplacedDatabase();
+        await this.doReopenIfReplacedAsync();
+        if (this.closed) throw new Error('Project closed during index recovery');
       } catch {
         this.fileLock.release();
         return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
@@ -1127,7 +1186,9 @@ export class CodeGraph {
         this.orchestrator.commitHdlProfile();
         this.orchestrator.finishGitIndexState(gitState, fullReconcile, result.failedFilePaths);
 
-        if (fullReconcile && result.filesChecked > 0) this.pendingFullReconcile = false;
+        if (fullReconcile && result.filesChecked > 0 && !result.failedFilePaths?.length) {
+          this.pendingFullReconcile = false;
+        }
         return result;
       } finally {
         // Mirror indexAll's teardown: stop the valve, then restore the
@@ -1206,12 +1267,11 @@ export class CodeGraph {
   }
 
   /**
-   * True once live watching has permanently degraded (OS watch-resource
-   * exhaustion, or a write lock held past the retry budget) and auto-sync is
-   * disabled until the next {@link watch} call. Distinct from `!isWatching()`:
-   * a stopped/never-started watcher is inactive but NOT degraded. MCP tools use
-   * this to surface a whole-index "results may be stale" notice, since
-   * `getPendingFiles()` goes empty once watching stops (#876).
+   * True once live watching has degraded, or while a re-armed watcher has not
+   * completed its full catch-up. Distinct from `!isWatching()`: a stopped or
+   * never-started watcher is inactive but NOT degraded. MCP tools use this for
+   * a whole-index stale notice, since pending files are lost when watching
+   * stops (#876, #1959).
    */
   isWatcherDegraded(): boolean {
     return this.watcher?.isDegraded() ?? false;
@@ -1220,6 +1280,16 @@ export class CodeGraph {
   /** The reason live watching degraded, or null if it is healthy (#876). */
   getWatcherDegradedReason(): string | null {
     return this.watcher?.getDegradedReason() ?? null;
+  }
+
+  /** Re-arm a lock-degraded watcher; its stale state persists until a full sync. */
+  rearmWatcherAfterLockContention(): boolean {
+    return this.watcher?.rearmAfterLockContention() ?? false;
+  }
+
+  /** True while a re-armed watcher owes a full reconcile of missed changes. */
+  isWatcherRecovering(): boolean {
+    return this.watcher?.isRecoveringFromLock() ?? false;
   }
 
   /**
