@@ -159,6 +159,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixes
 
 - При остановленном watcher `codegraph_explore` больше не отдаёт исходный код из изменившихся после индексации файлов: он называет их и просит проверить напрямую, продолжая отвечать по неизменённым файлам. (#1959)
+- While auto-sync is off, `codegraph_search`, `codegraph_callers`, `codegraph_callees` and `codegraph_impact` likewise refuse an answer that names a file changed since its last sync, and name that file instead. (#1959)
 
 - MCP status now shows when a file was last indexed and how many files were added, changed, or removed since then, so an out-of-date graph is visible even when file watching has stopped. (#1959)
 
