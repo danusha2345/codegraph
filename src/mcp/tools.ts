@@ -8,7 +8,7 @@ import { formatHdlProfileStatus } from '../hdl/status';
 import type CodeGraph from '../index';
 import { formatHdlAccess, HDL_ACCESS_FILTERS, type HdlAccessFilter } from './hdl-access';
 import type { QueryPool } from './query-pool';
-import { findNearestCodeGraphRoot } from '../directory';
+import { findNearestCodeGraphRoot, IndexUnavailableError } from '../directory';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
 // schemas), but it must NOT drag in sqlite/query layers before the daemon binds;
@@ -1512,6 +1512,12 @@ export class ToolHandler {
   // Per explicit project: its catch-up sync, awaited once by the first call
   // that targets it (same time-box as the default project's gate).
   private projectGates: Map<CodeGraph, Promise<void>> = new Map();
+  // Coalesce concurrent first queries for the same project while its async
+  // recovery/open is still in flight, so only one connection is created.
+  private projectOpenPromises: Map<string, Promise<CodeGraph>> = new Map();
+  // Invalidates an in-flight open when closeAll() begins during shutdown.
+  private projectCacheGeneration = 0;
+  private projectCacheClosed = false;
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
@@ -1538,9 +1544,6 @@ export class ToolHandler {
   // huge repo can't hang the first call (#905); cleared on first await so
   // subsequent calls don't pay any cost.
   private catchUpGate: Promise<void> | null = null;
-  // Engine hook fired when `freshen` reopened a replaced database (#1902), so
-  // the engine can reconcile the new file with a catch-up sync.
-  private onDatabaseReopened: ((cg: CodeGraph) => void) | null = null;
   // Optional worker-thread pool for off-loop read-tool dispatch (daemon mode).
   // When set + healthy, the heavy read tools run on a worker so the daemon's
   // main loop stays free for the MCP transport under concurrent load. Null in
@@ -1583,15 +1586,6 @@ export class ToolHandler {
    */
   setCatchUpGate(p: Promise<void> | null): void {
     this.catchUpGate = p;
-  }
-
-  /**
-   * Engine-only: called after a tool call's {@link freshen} reopened a database
-   * that was replaced on disk (#1902). The engine decides whether a catch-up
-   * sync is its to run (only for the instance it watches and writes).
-   */
-  setOnDatabaseReopened(fn: ((cg: CodeGraph) => void) | null): void {
-    this.onDatabaseReopened = fn;
   }
 
   /**
@@ -1775,7 +1769,10 @@ export class ToolHandler {
    * Walks up parent directories to find the nearest .codegraph/ folder,
    * similar to how git finds .git/ directories.
    */
-  private getCodeGraph(projectPath?: string): CodeGraph {
+  private async getCodeGraph(projectPath?: string): Promise<CodeGraph> {
+    if (this.projectCacheClosed) {
+      throw new NotIndexedError('This CodeGraph session has closed. Reconnect before querying a project.');
+    }
     if (!projectPath) {
       if (!this.cg) {
         const searched = this.defaultProjectHint ?? process.cwd();
@@ -1858,27 +1855,42 @@ export class ToolHandler {
       return this.freshen(cached);
     }
 
-    const cg = loadCodeGraph().openSync(resolvedRoot);
-    this.projectCache.set(canonicalRoot, cg);
-    // Bounded: evict the least recently used explicit project (#1835).
-    while (this.projectCache.size > MAX_CACHED_PROJECTS) {
-      const [oldestKey, oldest] = this.projectCache.entries().next().value as [string, CodeGraph];
-      this.projectCache.delete(oldestKey);
-      this.closeProject(oldest);
+    const generation = this.projectCacheGeneration;
+    let opening = this.projectOpenPromises.get(canonicalRoot);
+    if (!opening) {
+      opening = loadCodeGraph().open(resolvedRoot);
+      this.projectOpenPromises.set(canonicalRoot, opening);
     }
-    // Same lifecycle as the default project: watcher + catch-up sync, owned
-    // by the engine (#1835). The catch-up promise is the project's gate.
-    if (this.projectLifecycle) {
-      let gate: Promise<void>;
-      try {
-        gate = this.projectLifecycle.activate(cg);
-      } catch (err) {
-        gate = Promise.reject(err);
+    try {
+      const cg = await opening;
+      if (generation !== this.projectCacheGeneration) {
+        try { cg.close(); } catch { /* another waiter may already have closed it */ }
+        throw new Error('Project cache closed while the database was opening');
       }
-      gate = gate.catch(() => { /* logged by the engine; serve best-effort */ });
-      this.projectGates.set(cg, gate);
+      // A concurrent waiter may already have installed this same instance.
+      if (this.projectCache.get(canonicalRoot) === cg) return cg;
+      this.projectCache.set(canonicalRoot, cg);
+      while (this.projectCache.size > MAX_CACHED_PROJECTS) {
+        const [oldestKey, oldest] = this.projectCache.entries().next().value as [string, CodeGraph];
+        this.projectCache.delete(oldestKey);
+        this.closeProject(oldest);
+      }
+      if (this.projectLifecycle) {
+        let gate: Promise<void>;
+        try { gate = this.projectLifecycle.activate(cg); }
+        catch (err) { gate = Promise.reject(err); }
+        const safeGate = gate.catch(() => { /* logged by engine */ });
+        this.projectGates.set(cg, safeGate);
+        void safeGate.then(() => {
+          if (this.projectGates.get(cg) === safeGate) this.projectGates.delete(cg);
+        });
+      }
+      return cg;
+    } finally {
+      if (this.projectOpenPromises.get(canonicalRoot) === opening) {
+        this.projectOpenPromises.delete(canonicalRoot);
+      }
     }
-    return cg;
   }
 
   /**
@@ -1891,13 +1903,12 @@ export class ToolHandler {
   private async awaitProjectGate(projectPath: string): Promise<void> {
     let cg: CodeGraph;
     try {
-      cg = this.getCodeGraph(projectPath);
+      cg = await this.getCodeGraph(projectPath);
     } catch {
       return;
     }
     const gate = this.projectGates.get(cg);
     if (!gate) return;
-    this.projectGates.delete(cg);
     await this.awaitCatchUpGate(gate);
   }
 
@@ -1918,14 +1929,13 @@ export class ToolHandler {
    * stat() and a no-op unless the inode actually changed; it never throws into a
    * tool call.
    */
-  private freshen(cg: CodeGraph): CodeGraph {
+  private async freshen(cg: CodeGraph): Promise<CodeGraph> {
     try {
-      if (cg.reopenIfReplaced()) {
+      if (!cg.isIndexing() && await cg.reopenIfReplacedAsync()) {
         process.stderr.write(
           '[CodeGraph MCP] The index was replaced on disk (e.g. a git worktree ' +
           'recreated at the same path); reopened the live database in place.\n'
         );
-        this.onDatabaseReopened?.(cg);
       }
     } catch {
       // Best-effort self-heal — a failed reopen must never break the tool call;
@@ -1938,11 +1948,14 @@ export class ToolHandler {
    * Close all cached project connections
    */
   closeAll(): void {
+    this.projectCacheClosed = true;
+    this.projectCacheGeneration++;
     for (const cg of this.projectCache.values()) {
       this.closeProject(cg);
     }
     this.projectCache.clear();
     this.projectGates.clear();
+    this.projectOpenPromises.clear();
     this.worktreeMismatchCache.clear();
   }
 
@@ -2000,7 +2013,7 @@ export class ToolHandler {
    * (e.g. nothing initialized yet), it reports "no mismatch" so a tool is never
    * broken by this check.
    */
-  private worktreeMismatchFor(projectPath?: string): WorktreeIndexMismatch | null {
+  private async worktreeMismatchFor(projectPath?: string): Promise<WorktreeIndexMismatch | null> {
     const startPath = projectPath ?? this.defaultProjectHint ?? process.cwd();
 
     // The verdict depends on BOTH the start path AND the index root it resolves
@@ -2014,7 +2027,7 @@ export class ToolHandler {
     // that first verdict until restart (#926).
     let indexRoot: string;
     try {
-      indexRoot = this.getCodeGraph(projectPath).getProjectRoot();
+      indexRoot = (await this.getCodeGraph(projectPath)).getProjectRoot();
     } catch {
       // No resolvable project (or any other resolution error) → nothing to warn.
       return null;
@@ -2037,9 +2050,9 @@ export class ToolHandler {
    * is no mismatch. `codegraph_status` is excluded — it embeds its own verbose
    * warning — so it stays out of this path.
    */
-  private withWorktreeNotice(result: ToolResult, projectPath?: string): ToolResult {
+  private async withWorktreeNotice(result: ToolResult, projectPath?: string): Promise<ToolResult> {
     if (result.isError) return result;
-    const mismatch = this.worktreeMismatchFor(projectPath);
+    const mismatch = await this.worktreeMismatchFor(projectPath);
     if (!mismatch) return result;
 
     const notice = worktreeMismatchNotice(mismatch);
@@ -2124,12 +2137,12 @@ export class ToolHandler {
     return stale;
   }
 
-  private withStalenessNotice(result: ToolResult, projectPath?: string): ToolResult {
+  private async withStalenessNotice(result: ToolResult, projectPath?: string): Promise<ToolResult> {
     if (result.isError) return result;
 
     let cg: CodeGraph;
     try {
-      cg = this.getCodeGraph(projectPath);
+      cg = await this.getCodeGraph(projectPath);
     } catch {
       return result; // no default project — leave as is
     }
@@ -2277,6 +2290,15 @@ export class ToolHandler {
       // thread against the watched default instance, so it is NEVER off-loaded to
       // a worker (whose read connection has no watcher). It also skips the
       // auto-banner wrapper to avoid duplicating its own pending-files section.
+      const project = await this.getCodeGraph(args.projectPath as string | undefined);
+      // A no-watch engine (or one that lost the writer lock) is a reader.
+      // Direct ToolHandlers have no engine lifecycle and retain their explicit
+      // catch-up behavior; watched projects share one replacement sync.
+      if ((!this.projectLifecycle || project.isWatching()) &&
+          !await project.syncIfReplaced(toolName !== 'codegraph_status')) {
+        return this.textResult('The index was replaced and its catch-up is not complete (another writer may be active). Retry shortly; no results from an unverified index were returned.');
+      }
+
       if (toolName === 'codegraph_status') {
         return await this.handleStatus(args);
       }
@@ -2309,13 +2331,13 @@ export class ToolHandler {
       // internal bookkeeping and must never reach the client, whether or not a
       // caller passed session state.
       const result = this.takeExploreEmission(raw, sessionState);
-      const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
+      const withWorktree = await this.withWorktreeNotice(result, args.projectPath as string | undefined);
       return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
     } catch (err) {
       // Expected condition, not a malfunction: answer as a SUCCESS so the
       // agent keeps trusting the toolset for projects that ARE indexed.
       // (An isError here teaches session-long abandonment — see NotIndexedError.)
-      if (err instanceof NotIndexedError) {
+      if (err instanceof NotIndexedError || err instanceof IndexUnavailableError) {
         return this.textResult(err.message);
       }
       // Security refusal: a clean error, no retry encouragement.
@@ -2398,7 +2420,7 @@ export class ToolHandler {
     try {
       return await this.dispatchTool(toolName, args);
     } catch (err) {
-      if (err instanceof NotIndexedError) {
+      if (err instanceof NotIndexedError || err instanceof IndexUnavailableError) {
         return this.textResult(err.message);
       }
       if (err instanceof PathRefusalError) {
@@ -2427,7 +2449,7 @@ export class ToolHandler {
       case 'codegraph_explore': {
         const result = await this.handleExplore(args);
         if (result.isError) return result;
-        const profile = this.getCodeGraph(args.projectPath as string | undefined).getHdlProfileStatus?.() ?? null;
+        const profile = (await this.getCodeGraph(args.projectPath as string | undefined)).getHdlProfileStatus?.() ?? null;
         const note = formatHdlProfileStatus(profile);
         const first = result.content[0];
         if (!note || first?.type !== 'text') return result;
@@ -2448,7 +2470,7 @@ export class ToolHandler {
     const query = this.validateString(args.query, 'query');
     if (typeof query !== 'string') return query;
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     const rawKind = args.kind as string | undefined;
     // The schema enum says 'type' (what agents naturally reach for); the
     // NodeKind is 'type_alias'. Without the mapping, kind: "type" silently
@@ -2508,7 +2530,7 @@ export class ToolHandler {
     const symbol = this.validateString(args.symbol, 'symbol');
     if (typeof symbol !== 'string') return symbol;
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     const limit = clamp((args.limit as number) || 20, 1, 100);
     const fileFilter = typeof args.file === 'string' ? args.file : undefined;
 
@@ -2589,7 +2611,7 @@ export class ToolHandler {
     const symbol = this.validateString(args.symbol, 'symbol');
     if (typeof symbol !== 'string') return symbol;
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     const limit = clamp((args.limit as number) || 20, 1, 100);
     const fileFilter = typeof args.file === 'string' ? args.file : undefined;
 
@@ -2667,7 +2689,7 @@ export class ToolHandler {
     const symbol = this.validateString(args.symbol, 'symbol');
     if (typeof symbol !== 'string') return symbol;
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     const depth = clamp((args.depth as number) || 2, 1, 10);
     const fileFilter = typeof args.file === 'string' ? args.file : undefined;
 
@@ -3441,7 +3463,7 @@ export class ToolHandler {
     // ranking all see the same canonical spelling (Erlang `mod:fn/arity`).
     const query = normalizeQuerySpelling(rawQuery);
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     const projectRoot = cg.getProjectRoot();
     if (args.hdlAccess !== undefined) {
       if (typeof args.hdlAccess !== 'string' || !HDL_ACCESS_FILTERS.includes(args.hdlAccess as HdlAccessFilter)) {
@@ -6309,7 +6331,7 @@ export class ToolHandler {
    * Handle codegraph_node
    */
   private async handleNode(args: Record<string, unknown>): Promise<ToolResult> {
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     // Default to false to minimize context usage
     const includeCode = args.includeCode === true;
     const fileHint = typeof args.file === 'string' && args.file.trim() ? args.file.trim() : undefined;
@@ -6697,7 +6719,7 @@ export class ToolHandler {
    * Handle codegraph_status
    */
   private async handleStatus(args: Record<string, unknown>): Promise<ToolResult> {
-    let cg = this.getCodeGraph(args.projectPath as string | undefined);
+    let cg = await this.getCodeGraph(args.projectPath as string | undefined);
     // Same trick as withStalenessNotice — when an explicit projectPath
     // resolves to the same project as the default session cg, prefer the
     // default so getPendingFiles() (only populated by the default's watcher)
@@ -6716,7 +6738,7 @@ export class ToolHandler {
     // Queries then reflect that tree's branch, not the worktree being edited.
     // status shows the verbose, multi-line form; the read tools get the compact
     // one-liner via withWorktreeNotice. Both share the cached detection.
-    const mismatch = this.worktreeMismatchFor(args.projectPath as string | undefined);
+    const mismatch = await this.worktreeMismatchFor(args.projectPath as string | undefined);
 
     const lines: string[] = [
       '**CodeGraph Status**',
@@ -6821,7 +6843,7 @@ export class ToolHandler {
    * Handle codegraph_files - get project file structure from the index
    */
   private async handleFiles(args: Record<string, unknown>): Promise<ToolResult> {
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     const pathFilter = args.path as string | undefined;
     const pattern = args.pattern as string | undefined;
     const format = (args.format as 'tree' | 'flat' | 'grouped') || 'tree';

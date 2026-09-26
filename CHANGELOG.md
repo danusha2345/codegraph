@@ -181,6 +181,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Java calls on a variable, parameter or field whose declared type is a library class (such as `Parcel`, `Context`, `List` or `Handler`), and static calls on an imported library class such as `Log.d(...)`, no longer link to an unrelated project method with the same name. Calls through `this.field`, `Outer.this.field`, a field read inside an anonymous or inner class, a chain of fields such as `owner.repo.save()`, and a variable declared with type arguments (`Map<String, Foo> byName`) now resolve on the declared type, and a type written with its package or outer class (`Map.Entry`, `play.api.mvc.BodyParser`) or imported as a nested class is no longer mistaken for a same-named type elsewhere in the project. Re-index Java projects to pick this up.
 
 - Java `record` declarations are now indexed as classes, with their methods, constructors, components and implicit accessors, so calls on a record-typed value like `info.remoteAddress()` resolve and records show up in callers, impact and implementations; re-index Java projects after upgrading.
+- Restarting after an interrupted index no longer gets trapped in repeated watchdog restarts while repairing the database. (#1887)
+- После полной переиндексации автообновление и MCP-запросы подхватывают новую базу и сверяют изменения, пропущенные во время её замены. (#1902)
+- Python docstrings модулей, классов и функций теперь доступны в поиске; для существующих проектов требуется переиндексация. (#1905)
 
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 

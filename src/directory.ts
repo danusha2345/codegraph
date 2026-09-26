@@ -103,11 +103,15 @@ export function getCodeGraphDir(projectRoot: string): string {
  * database that passes the header check but cannot be opened counts as
  * initialized (see hasNodesTable) — only a proven-absent schema says no.
  */
+export class IndexUnavailableError extends Error {
+  constructor(projectRoot: string) {
+    super(`The index at ${projectRoot} is temporarily unavailable; retry after the current writer finishes. No parent index was selected.`);
+    this.name = 'IndexUnavailableError';
+  }
+}
+
 export function isInitialized(projectRoot: string): boolean {
   const codegraphDir = getCodeGraphDir(projectRoot);
-  if (!fs.existsSync(codegraphDir) || !fs.statSync(codegraphDir).isDirectory()) {
-    return false;
-  }
   // Must have codegraph.db, not just .codegraph folder
   const dbPath = path.join(codegraphDir, 'codegraph.db');
   let st: fs.Stats;
@@ -190,7 +194,11 @@ function hasNodesTable(dbPath: string): boolean {
     db = new DatabaseSync(dbPath, { readOnly: true });
     const row = db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'nodes'").get();
     return row !== undefined;
-  } catch {
+  } catch (error) {
+    const err = error as { errcode?: number; message?: string };
+    if (err.errcode === 5 || err.errcode === 6 || /database (?:is )?(?:locked|busy)/i.test(err.message ?? '')) {
+      throw new IndexUnavailableError(path.dirname(path.dirname(dbPath)));
+    }
     return true;
   } finally {
     // Never hold the handle: Windows file locking would block the owner.
