@@ -1077,6 +1077,15 @@ export function formatDegradedBanner(reason: string | null): string {
   );
 }
 
+/** Re-armed watches are not proof of freshness until their full scan commits. */
+export function formatRecoveringBanner(): string {
+  return (
+    '⚠️ CodeGraph auto-sync is RECOVERING — file watching restarted after lock contention, ' +
+    'but the full index catch-up has not completed. Read files directly to confirm ' +
+    'current content before relying on these results.'
+  );
+}
+
 /**
  * MCP Tool definition
  */
@@ -2178,6 +2187,10 @@ export class ToolHandler {
     if (degraded) {
       const [head, ...tail] = result.content;
       if (!head || head.type !== 'text') return result;
+      if (cg.isWatcherRecovering?.()) {
+        const composed = `${formatRecoveringBanner()}\n\n${head.text}`;
+        return { ...result, content: [{ type: 'text', text: composed }, ...tail] };
+      }
       let reason: string | null = null;
       try {
         reason = cg.getWatcherDegradedReason?.() ?? null;
@@ -2291,6 +2304,12 @@ export class ToolHandler {
       // a worker (whose read connection has no watcher). It also skips the
       // auto-banner wrapper to avoid duplicating its own pending-files section.
       const project = await this.getCodeGraph(args.projectPath as string | undefined);
+      // Recover both the default and explicit-project watchers on demand after
+      // prolonged lock contention. The stale banner remains until the watcher
+      // finishes its full scan; frequent calls cannot bypass its cooldown.
+      if (this.projectLifecycle && project.rearmWatcherAfterLockContention()) {
+        process.stderr.write('[CodeGraph MCP] Re-armed file watcher; full catch-up pending.\n');
+      }
       // A no-watch engine (or one that lost the writer lock) is a reader.
       // Direct ToolHandlers have no engine lifecycle and retain their explicit
       // catch-up behavior; watched projects share one replacement sync.
@@ -6813,11 +6832,14 @@ export class ToolHandler {
     // but the index is frozen — call that out explicitly here, the one place an
     // agent asks "is the index caught up?".
     if (cg.isWatcherDegraded()) {
+      const recovering = cg.isWatcherRecovering();
       lines.push(
         '',
-        '**Auto-sync disabled:**',
-        `- ${cg.getWatcherDegradedReason() ?? 'live file watching stopped'}`,
-        '- The index is frozen; Read files directly for current content.'
+        recovering ? '**Auto-sync recovering:**' : '**Auto-sync disabled:**',
+        recovering
+          ? '- File watching restarted; full index catch-up has not completed.'
+          : `- ${cg.getWatcherDegradedReason() ?? 'live file watching stopped'}`,
+        '- The index may be stale; Read files directly for current content.'
       );
     }
 

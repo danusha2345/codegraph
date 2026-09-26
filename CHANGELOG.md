@@ -159,6 +159,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixes
 
 - Долгая индексация больше не теряет блокировку записи через две минуты: пока владелец жив, второй процесс ждёт освобождения индекса. (#1959)
+- После длительной конкуренции за lock MCP при следующем вызове повторно включает watcher и делает полный проход. До успешной синхронизации ответы явно помечены как потенциально устаревшие; повторные попытки ограничены паузой. (#1959)
 - Зависший при остановке общий MCP-демон теперь закрывает даже соединения без завершённого приветствия; резервный процесс при занятом writer lock продолжает обслуживать чтение без второго писателя. (#1963)
 - A file over the size limit is no longer read before it is skipped: committed video and blob fixtures used to be decoded in full — a 400 MB fixture cost 3.4 GB of memory — only to be discarded, and the same file was read again by every resolution pass. Its size stamp now stands in for its content, during indexing and when checking for changes. (#1910)
 
