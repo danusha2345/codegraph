@@ -158,6 +158,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- MCP status now shows when a file was last indexed and how many files were added, changed, or removed since then, so an out-of-date graph is visible even when file watching has stopped. (#1959)
+
 - The "edited since the last index sync" warning no longer names a file the answer never showed just because its path is part of one that it did, such as `src/app.ts` next to `src/app.tsx`. (#1968)
 
 - Долгая индексация больше не теряет блокировку записи через две минуты: пока владелец жив, второй процесс ждёт освобождения индекса. (#1959)
