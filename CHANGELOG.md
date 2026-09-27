@@ -228,6 +228,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- `codegraph impact --depth N`, multi-level callers and callees, and the viewer's blast radius no longer miss dependents within N hops when a longer path reaches one of them first. (#1974)
 - Repeated `codegraph_explore` calls from a running MCP server no longer re-rank the whole graph each time to find the project's core file; the answer is reused until the index changes. (#1864)
 - Running `codegraph index` while the MCP server is running no longer leaves live auto-sync writing into the old, replaced index: the server now switches to the rebuilt index before its next update and catches up on everything it would otherwise have missed. (#1902)
 - `codegraph_explore` no longer calls a file whose source it showed only in part "complete", and no longer suggests a tool your agent cannot see, so agents stop reading those files again to be sure. (#1918)
