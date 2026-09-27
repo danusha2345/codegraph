@@ -1189,6 +1189,31 @@ export class CodeGraph {
   // ===========================================================================
 
   /**
+   * Whether an OS watcher event points at a file whose index metadata is still
+   * current. Used on Windows to discard NTFS last-access notifications, which
+   * libuv reports through fs.watch as ordinary change events (#1451).
+   */
+  private isIndexedFileStateCurrent(filePath: string): boolean {
+    const tracked = this.queries.getFileByPath(filePath);
+    if (!tracked) return false;
+
+    try {
+      const stat = fs.statSync(path.join(this.projectRoot, filePath));
+      return (
+        stat.isFile() &&
+        Number.isFinite(stat.mtimeMs) &&
+        Number.isFinite(tracked.modifiedAt) &&
+        stat.size === tracked.size &&
+        Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)
+      );
+    } catch {
+      // Missing/inaccessible files must still reach sync so removals and
+      // transient filesystem failures are reconciled rather than hidden.
+      return false;
+    }
+  }
+
+  /**
    * Start watching for file changes and auto-syncing.
    *
    * Uses native OS file events (FSEvents on macOS, inotify on Linux 19+,
@@ -1208,6 +1233,9 @@ export class CodeGraph {
         return { filesChanged, durationMs: result.durationMs };
       },
       options,
+      process.platform === 'win32'
+        ? (filePath) => this.isIndexedFileStateCurrent(filePath)
+        : undefined,
       () => this.getHdlDependencyPaths()
     );
 
