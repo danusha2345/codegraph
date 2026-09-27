@@ -28,7 +28,8 @@ import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
-import { MAX_SOURCE_FILE_SIZE_BYTES, readBoundedSource, readBoundedSourceSync } from '../file-limits';
+import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
+export { oversizeStamp };
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
@@ -129,13 +130,17 @@ export interface SyncResult {
   nodesUpdated: number;
   durationMs: number;
   /**
-   * Set when NO reconciliation ran because another process holds the index
-   * lock (`.codegraph/codegraph.lock`, e.g. an MCP server mid-sync). The
+   * Set when NO reconciliation ran because the index lock
+   * (`.codegraph/codegraph.lock`) could not be taken: `locked` when a live
+   * process holds it (an MCP server or another CLI mid-sync), `lock-failed`
+   * for anything else (an unreadable lock, a directory in its place). The
    * counts above are then all zero and must not be read as "up to date".
    */
-  skippedReason?: 'locked';
-  /** PID of the process holding the lock, when it could be read. */
+  skippedReason?: 'locked' | 'lock-failed';
+  /** PID of the live process holding the lock (`locked`). */
   lockHolderPid?: number;
+  /** The lock's own error message, with its `codegraph unlock` hint (`lock-failed`). */
+  lockError?: string;
   changedFilePaths?: string[];
   /** Paths not absorbed because reading or extraction failed; retain for status/retry. */
   failedFilePaths?: string[];
@@ -162,18 +167,6 @@ export function hashContent(content: string): string {
   return crypto.createHash('sha256').update(content).digest('hex');
 }
 
-/**
- * What stands in for the content of a file over MAX_SOURCE_FILE_SIZE_BYTES. Such a file is
- * never parsed, so its bytes are never needed — reading them only to hash and
- * discard cost multi-GB RSS spikes on committed video/blob fixtures and could
- * fail outright with `Invalid string length` (#1910). The stamp is a function
- * of size alone: change detection compares it to the stored hash, so a
- * same-size rewrite of an oversize file is not a change (nothing about it is
- * indexed), while crossing the limit in either direction is.
- */
-export function oversizeStamp(size: number): string {
-  return `codegraph:oversize:${size}`;
-}
 
 /**
  * What change detection hashes for a file: its text when it is under the size
