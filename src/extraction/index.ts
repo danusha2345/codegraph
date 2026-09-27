@@ -35,7 +35,8 @@ import ignore, { Ignore } from 'ignore';
 import { detectFrameworks } from '../resolution/frameworks';
 import type { ResolutionContext } from '../resolution/types';
 import { createYielder, type MaybeYield } from '../resolution/cooperative-yield';
-import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
+import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
+export { oversizeStamp };
 
 /**
  * Number of files to read in parallel during indexing.
@@ -156,6 +157,16 @@ export interface SyncResult {
  */
 export function hashContent(content: string): string {
   return crypto.createHash('sha256').update(content).digest('hex');
+}
+
+
+/**
+ * What change detection hashes for a file: its text when it is under the size
+ * limit, the size stamp when it is over — an oversize file is never decoded.
+ */
+function readSourceOrStamp(fullPath: string): string {
+  const { stats, bytes } = readBoundedSourceSync(fullPath);
+  return bytes === null ? oversizeStamp(stats.size) : bytes.toString('utf8');
 }
 
 /**
@@ -1876,7 +1887,9 @@ export class ExtractionOrchestrator {
         const full = validatePathWithinRoot(rootDir, relativePath);
         if (!full) return null;
         try {
-          return fs.readFileSync(full, 'utf-8');
+          // Framework detectors scan source by name; a file over the size
+          // limit was never indexed and must not be decoded here either (#1910).
+          return readBoundedSourceSync(full).bytes?.toString('utf8') ?? null;
         } catch {
           return null;
         }
@@ -2290,17 +2303,21 @@ export class ExtractionOrchestrator {
               logWarn('Path traversal blocked in batch reader', { filePath: fp });
               return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: new Error('Path traversal blocked') };
             }
+            // Stat first: a file over the size limit is stored as skipped
+            // without ever being read or decoded (#1910), so ten oversize
+            // fixtures in one I/O batch no longer cost their size in RSS.
+            const { stats, bytes } = await readBoundedSource(fullPath);
+            if (bytes === null) {
+              return { filePath: fp, content: oversizeStamp(stats.size), stats, error: null as Error | null };
+            }
             // Read bytes, not text: a `.ts` that is really an MPEG transport
             // stream (#1910) is recognised from its head here, at no extra I/O,
-            // and never decoded or parsed. The scan already drops these; this
-            // guards the paths that hand files in by name (sync, watcher).
-            const bytes = await fsp.readFile(fullPath);
+            // and never decoded or parsed.
             if (hasMpegTsExtension(fp) && isMpegTransportStream(bytes.subarray(0, MPEG_TS_SNIFF_BYTES))) {
               logDebug('Skipping MPEG transport stream named .ts — not TypeScript', { filePath: fp });
               return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: null as Error | null, skipped: true };
             }
             const content = bytes.toString('utf-8');
-            const stats = await fsp.stat(fullPath);
             return { filePath: fp, content, stats, error: null as Error | null };
           } catch (err) {
             return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: err as Error };
@@ -2445,7 +2462,10 @@ export class ExtractionOrchestrator {
         try {
           const fullPath = validatePathWithinRoot(this.rootDir, filePath);
           if (!fullPath) continue;
-          content = await fsp.readFile(fullPath, 'utf-8');
+          // Bounded like the first read: the file may have grown since (#1910).
+          const bytes = (await readBoundedSource(fullPath)).bytes;
+          if (bytes === null) continue;
+          content = bytes.toString('utf8');
         } catch {
           continue;
         }
@@ -2497,7 +2517,9 @@ export class ExtractionOrchestrator {
           try {
             const fullPath = validatePathWithinRoot(this.rootDir, filePath);
             if (!fullPath) continue;
-            fullContent = await fsp.readFile(fullPath, 'utf-8');
+            const bytes = (await readBoundedSource(fullPath)).bytes;
+            if (bytes === null) continue;
+            fullContent = bytes.toString('utf8');
           } catch {
             continue;
           }
@@ -2627,8 +2649,10 @@ export class ExtractionOrchestrator {
     let content: string;
     let stats: fs.Stats;
     try {
-      stats = await fsp.stat(fullPath);
-      content = await fsp.readFile(fullPath, 'utf-8');
+      // An oversize file is stored as skipped; its bytes are never needed (#1910).
+      const read = await readBoundedSource(fullPath);
+      stats = read.stats;
+      content = read.bytes === null ? oversizeStamp(stats.size) : read.bytes.toString('utf8');
     } catch (error) {
       return {
         nodes: [],
@@ -3249,9 +3273,10 @@ export class ExtractionOrchestrator {
       }
 
       // New, or size/mtime changed — read + hash to confirm a real content change.
+      // (An oversize file hashes as its size stamp, unread — #1910.)
       let content: string;
       try {
-        content = fs.readFileSync(fullPath, 'utf-8');
+        content = readSourceOrStamp(fullPath);
       } catch (error) {
         logDebug('Skipping unreadable file during sync', { filePath, error: String(error) });
         failedFilePaths.push(filePath);
@@ -3418,7 +3443,7 @@ export class ExtractionOrchestrator {
           continue;
         }
         let content: string;
-        try { content = fs.readFileSync(fullPath, 'utf-8'); }
+        try { content = readSourceOrStamp(fullPath); }
         catch (error) {
           logDebug('Skipping unreadable file while detecting changes', { filePath, error: String(error) });
           continue;
@@ -3456,7 +3481,7 @@ export class ExtractionOrchestrator {
       const fullPath = path.join(this.rootDir, filePath);
       let content: string;
       try {
-        content = fs.readFileSync(fullPath, 'utf-8');
+        content = readSourceOrStamp(fullPath);
       } catch (error) {
         logDebug('Skipping unreadable file while detecting changes', { filePath, error: String(error) });
         continue;

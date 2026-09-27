@@ -182,6 +182,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The MCP server now recycles its query workers after they sit idle, releasing the memory a burst of large queries left behind while keeping one worker warm for the next call. (#1583)
 - Path search between two symbols no longer slows down sharply or grows its memory use on densely connected graphs. (#1583)
 - Tag-based ColdFusion (CFML) files no longer leak parser memory during indexing. (#1583)
+- A file over the size limit is no longer read before it is skipped. Large committed video and blob fixtures used to be loaded into memory in full, once per indexing pass, only to be discarded; indexing, change detection and the viewer now go by the file's size instead. (#1910)
 - An MPEG transport stream video that happens to be named `.ts` (golden fixtures under `testdata/`, e2e clips) is now recognised from its first bytes and skipped instead of being fed to the TypeScript parser, which spent a long time on each clip for no symbols. Real TypeScript files are still indexed. (#1910)
 - File watching no longer drops the full re-scan a removed directory asks for when that sync fails, so the deleted files leave the index instead of lingering. (#1964)
 - Running `codegraph index` while the MCP server is running no longer leaves live auto-sync writing into the old, replaced index: the server now switches to the rebuilt index before its next update and catches up on everything it would otherwise have missed. (#1902)
