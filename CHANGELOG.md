@@ -338,6 +338,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- A TypeScript or JavaScript call through an ES private field, such as `this.#items.add(x)`, now resolves on the field's declared or constructed type, like `this.items.add(x)` already did, instead of linking to whichever project method shares the name. (#1987)
 - Java packages named `build` under standard main and test source roots are now indexed without pulling Gradle or Maven build output into the graph. (#1642)
 - Erlang selective imports now resolve a bare call to the exact exported module, function, and arity, while unqualified calls stay within their own module instead of binding to an unrelated same-named project function. Re-index Erlang projects after upgrading. (#1610) (Erlang)
 - Incremental sync now applies WAL backpressure during changed-file storage and batched reference resolution, keeping long-lived readers from allowing the WAL to grow past its configured cap on large projects. (#1539)
