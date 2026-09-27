@@ -152,6 +152,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
 - A call to a function defined in the same file is no longer marked as an uncertain match when the file sits near the top of the project, and it now wins over a weaker same-named guess in another file.
+- A method calling another method of its own class — `render()` in Java, Kotlin, C#, Scala, Swift, C++, Dart or Ruby, or `this.render()` / `self.render()` / `$this->render()` — now links to that class's method (or the one it inherits or is nested in) instead of a same-named method of another class declared nearer in the file.
 
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)
 
