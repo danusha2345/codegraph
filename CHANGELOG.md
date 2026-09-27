@@ -339,6 +339,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- In `codegraph ui`, "Read as flow" now works on any trail the viewer can save, up to 64 hops, and a shared link to a long trail gets all its hop names back. A trail longer than that keeps its most recent 64 hops. (#1976)
 - In `codegraph ui`, routes whose handlers live in more than 60 different files are all linked to their handler, instead of the later ones showing "not in the index". (#1975)
 - The dead-code report no longer lists methods a framework or library base class calls, such as React lifecycle methods, a stream's `_transform` or NestJS `onModuleInit`, when the class extends or implements a type from outside the project. (#1973)
 - A TypeScript or JavaScript call through an ES private field, such as `this.#items.add(x)`, now resolves on the field's declared or constructed type, like `this.items.add(x)` already did, instead of linking to whichever project method shares the name. (#1987)
