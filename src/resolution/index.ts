@@ -39,6 +39,7 @@ import { lexicalPathWithinRoot } from '../utils';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
 import { JS_BUILT_INS } from './js-builtins';
+import { memoryBudgetBytes } from './memory-budget';
 
 /** Node kinds that can declare supertypes (extends/implements). */
 const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
@@ -298,8 +299,15 @@ export class ReferenceResolver {
     // The content cache is heavier (full file text), so we give it a
     // smaller budget than the metadata caches.
     const contentLimit = Math.max(64, Math.floor(limit / 5));
+    const contentBudget = Math.max(
+      8 * 1024 * 1024,
+      Math.min(64 * 1024 * 1024, Math.floor(memoryBudgetBytes() * 0.02))
+    );
     this.nodeCache = new LRUCache(limit);
-    this.fileCache = new LRUCache(contentLimit);
+    this.fileCache = new LRUCache(contentLimit, {
+      maxWeight: Math.floor(contentBudget / 4),
+      weightOf: (value) => value === null ? 1 : Math.max(64, value.length * 2),
+    });
     this.importMappingCache = new LRUCache(limit);
     this.reExportCache = new LRUCache(limit);
     this.nameCache = new LRUCache(limit);
@@ -307,7 +315,12 @@ export class ReferenceResolver {
     this.qualifiedNameCache = new LRUCache(limit);
     // Split-lines arrays are heavier than content strings; refs arrive
     // file-ordered, so a small cache still hits nearly always.
-    this.fileLinesCache = new LRUCache(contentLimit);
+    this.fileLinesCache = new LRUCache(contentLimit, {
+      maxWeight: Math.floor(contentBudget * 3 / 4),
+      weightOf: (value) => value === null
+        ? 1
+        : Math.max(64, value.length * 8 + value.reduce((sum, line) => sum + line.length * 2, 0)),
+    });
     this.methodMatchCache = new LRUCache(limit);
 
     this.context = this.createContext();
