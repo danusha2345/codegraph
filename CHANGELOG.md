@@ -168,7 +168,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Долгая индексация больше не теряет блокировку записи через две минуты: пока владелец жив, второй процесс ждёт освобождения индекса. (#1959)
 - После длительной конкуренции за lock MCP при следующем вызове повторно включает watcher и делает полный проход. До успешной синхронизации ответы явно помечены как потенциально устаревшие; повторные попытки ограничены паузой. (#1959)
 - Зависший при остановке общий MCP-демон теперь закрывает даже соединения без завершённого приветствия; резервный процесс при занятом writer lock продолжает обслуживать чтение без второго писателя. (#1963)
-- A file over the size limit is no longer read before it is skipped: committed video and blob fixtures used to be decoded in full — a 400 MB fixture cost 3.4 GB of memory — only to be discarded, and the same file was read again by every resolution pass. Its size stamp now stands in for its content, during indexing and when checking for changes. (#1910)
+- A file over the size limit is no longer read before it is skipped. Large committed video and blob fixtures used to be loaded into memory in full, once per indexing pass, only to be discarded; indexing, change detection and the viewer now go by the file's size instead. (#1910)
 
 - An MPEG transport stream video that happens to be named `.ts` (golden fixtures under `testdata/`, e2e clips) is now recognised from its first bytes and skipped instead of being fed to the TypeScript parser, which spent a long time on each clip for no symbols. Real TypeScript files are still indexed. (#1910)
 
