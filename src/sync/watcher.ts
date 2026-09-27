@@ -8,7 +8,8 @@
  * addon) with a per-platform strategy chosen to keep the open-descriptor /
  * kernel-watch cost BOUNDED rather than growing with the number of files:
  *
- *   - macOS / Windows: a SINGLE recursive `fs.watch(root, {recursive:true})`.
+ *   - macOS / Windows: a recursive `fs.watch(root, {recursive:true})`, plus
+ *     bounded supplemental streams for directory symlinks (#770).
  *     libuv maps this to one FSEvents stream (macOS) / one
  *     ReadDirectoryChangesW handle (Windows), so it costs O(1) descriptors no
  *     matter how large the tree. This is the fix for the macOS file-table
@@ -255,8 +256,8 @@ export interface PendingFile {
  * debounced sync operations via a provided callback.
  *
  * Design goals:
- * - Bounded resource usage: O(1) descriptors on macOS/Windows (one recursive
- *   watch), O(directories) inotify watches on Linux — never O(files), which
+ * - Bounded resource usage: one recursive stream plus capped symlink streams
+ *   on macOS/Windows, O(directories) inotify watches on Linux — never O(files), which
  *   was the system-crashing fd leak on macOS (#644/#496/#555/#628).
  * - Debounced to avoid thrashing on rapid saves
  * - Filters to supported source files by extension
@@ -267,7 +268,7 @@ export interface PendingFile {
 export class FileWatcher {
   /** macOS/Windows: the single recursive watcher. Null on Linux. */
   private recursiveWatcher: fs.FSWatcher | null = null;
-  /** Linux: one watcher per watched directory (keyed by absolute path). */
+  /** Linux directory watches / macOS and Windows supplemental symlink streams. */
   private dirWatchers = new Map<string, fs.FSWatcher>();
   /** Set once the per-directory watch cap is hit, so we log only once. */
   private dirCapWarned = false;
@@ -296,6 +297,15 @@ export class FileWatcher {
   private syncFailureRetryCount = 0;
   /** Test-only inert mode: started, but with no OS watcher installed. */
   private inert = false;
+  /**
+   * Resolved realpath of directories already watched (or skipped). Prevents
+   * infinite recursion via symlink cycles — mirrors the same guard used in
+   * the indexer's `walk()` (extraction/index.ts).
+   */
+  private visitedRealDirs = new Set<string>();
+  private knownDirs = new Map<string, string>();
+  private watchedRealDirs = new Map<string, string>();
+  private treeRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * True when the pending set does NOT exactly describe the change (a
@@ -355,11 +365,19 @@ export class FileWatcher {
   private readonly onSyncError?: WatchOptions['onSyncError'];
   private readonly onDegraded?: WatchOptions['onDegraded'];
   private readonly inertForTests: boolean;
+  /**
+   * Optional metadata guard supplied by the CodeGraph facade. Windows'
+   * ReadDirectoryChangesW stream includes last-access updates, so a read can
+   * otherwise look exactly like an edit. Returning true means the file's
+   * current size/mtime still match the indexed record and the event is noise.
+   */
+  private readonly isFileStateCurrent?: (relativePath: string) => boolean;
 
   constructor(
     projectRoot: string,
     syncFn: (paths?: string[]) => Promise<{ filesChanged: number; durationMs: number }>,
     options: WatchOptions = {},
+    isFileStateCurrent?: (relativePath: string) => boolean,
     getHdlDependencyPaths?: () => string[]
   ) {
     this.projectRoot = projectRoot;
@@ -370,6 +388,7 @@ export class FileWatcher {
     this.onSyncError = options.onSyncError;
     this.onDegraded = options.onDegraded;
     this.inertForTests = options.inertForTests ?? false;
+    this.isFileStateCurrent = isFileStateCurrent;
   }
 
   /**
@@ -384,6 +403,7 @@ export class FileWatcher {
     this.recoveringFromLock = false;
     this.lockRetryCount = 0;
     this.syncFailureRetryCount = 0;
+    this.needsFullScan = false;
 
     // Some environments make filesystem watching unusable — most notably
     // WSL2 /mnt/ drives, where the underlying fs.watch calls block long
@@ -406,11 +426,11 @@ export class FileWatcher {
       } else if (supportsRecursiveWatch()) {
         this.startRecursive();
       } else {
-        this.startPerDirectory();
+        this.refreshWatchTree();
       }
 
       // The per-directory (Linux) path catches watch-resource exhaustion inside
-      // watchTree and degrades synchronously rather than throwing, so it never
+      // watchDirectory and degrades synchronously rather than throwing, so it never
       // reaches the catch below. Surface that as a failed start here so both
       // strategies report exhaustion identically (start() === false).
       if (this.degradedReason) return false;
@@ -447,7 +467,7 @@ export class FileWatcher {
   }
 
   /**
-   * macOS/Windows: one recursive watcher for the whole tree. O(1) descriptors.
+   * macOS/Windows: one root stream, supplemented for directory symlinks.
    * `filename` arrives relative to the project root (with subdirectories), so
    * it maps straight to a project-relative path.
    */
@@ -455,10 +475,7 @@ export class FileWatcher {
     this.recursiveWatcher = watchImpl(
       this.projectRoot,
       { recursive: true, persistent: true },
-      (_event, filename) => {
-        if (this.stopped || filename == null) return;
-        this.handleChange(normalizePath(String(filename)));
-      }
+      (_event, filename) => this.handleDirEvent(this.projectRoot, filename)
     );
     this.recursiveWatcher.on('error', (err: unknown) => {
       if (isWatchResourceExhaustion(err)) {
@@ -467,58 +484,78 @@ export class FileWatcher {
       }
       logWarn('File watcher error', { error: String(err) });
     });
+    this.refreshWatchTree();
   }
 
-  /**
-   * Linux: walk the (non-ignored) tree and watch each directory. One inotify
-   * watch per directory reports create/modify/delete for that directory's
-   * direct children, so we never watch individual files.
-   */
-  private startPerDirectory(): void {
-    this.watchTree(this.projectRoot, /* markExisting */ false);
-  }
-
-  /**
-   * Add an inotify watch for `dir` and recurse into its non-ignored
-   * subdirectories. When `markExisting` is true (a directory that appeared
-   * AFTER startup), the source files already inside it are recorded as pending
-   * — this closes the `mkdir + write` race where files created before the new
-   * directory's watch is installed would otherwise be missed until the next
-   * full sync. The initial startup walk passes false (the engine's catch-up
-   * sync owns the baseline).
-   */
-  private watchTree(dir: string, markExisting: boolean, rescan = false): void {
-    // A degrade() mid-walk (exhaustion on an earlier directory) calls stop(),
-    // which sets `stopped`; bail so the recursion unwinds without adding more
-    // watches to a watcher that is shutting down. `inotifyLimitWarned` does the
-    // same after ENOSPC — the kernel budget is gone, so stop trying the rest of
-    // the tree (every add would fail) while keeping the watches already set.
-    if (this.stopped || (this.degradedReason && !this.recoveringFromLock) || this.inotifyLimitWarned) return;
-    if (this.dirWatchers.has(dir)) {
-      // A profile switch can admit a formerly ignored child of an already watched directory.
-      if (rescan) {
-        let entries: fs.Dirent[];
-        try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-        for (const entry of entries) if (entry.isDirectory()) {
+  /** Reconcile logical directory paths with real targets, including retargeted links. */
+  private refreshWatchTree(): void {
+    if (this.stopped || this.inert) return;
+    this.visitedRealDirs.clear();
+    const directories = new Map<string, string>();
+    const desired = new Map<string, string>();
+    const recursive = supportsRecursiveWatch();
+    const walk = (dir: string, linked: boolean): void => {
+      if (this.shouldIgnoreDir(dir)) return;
+      let real: string;
+      try {
+        real = fs.realpathSync(dir);
+        if (this.visitedRealDirs.has(real)) return;
+        this.visitedRealDirs.add(real);
+        directories.set(dir, real);
+        if (!recursive || linked) desired.set(dir, real);
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
           const child = path.join(dir, entry.name);
-          if (!this.shouldIgnoreDir(child)) this.watchTree(child, markExisting, true);
+          if (entry.isDirectory()) {
+            walk(child, false);
+          } else if (entry.isSymbolicLink()) {
+            // Follow directory symlinks just like the indexer's walk. Realpath
+            // deduplication includes ordinary directories and the root itself.
+            try {
+              if (fs.statSync(child).isDirectory()) walk(child, true);
+            } catch { /* broken link */ }
+          }
         }
-      }
-      return;
+      } catch { /* removed or unreadable directory */ }
+    };
+    walk(this.projectRoot, false);
+    this.knownDirs = directories;
+    for (const dir of this.dirWatchers.keys()) {
+      if (desired.get(dir) !== this.watchedRealDirs.get(dir)) this.unwatchDir(dir);
     }
-    if (this.dirWatchers.size >= maxDirWatches()) {
+    for (const [dir, real] of desired) this.watchDirectory(dir, real, recursive);
+  }
+
+  /** Coalesce directory topology events before walking; file edits never walk the tree. */
+  private scheduleTreeRefresh(): void {
+    if (this.treeRefreshTimer || this.inert || this.stopped) return;
+    this.treeRefreshTimer = setTimeout(() => {
+      this.treeRefreshTimer = null;
+      this.refreshWatchTree();
+      if (this.stopped) return;
+      // A new/retargeted directory can already contain files before its watch
+      // is installed; a full reconcile closes that race and removes old paths.
+      this.needsFullScan = true;
+      this.scheduleSync();
+    }, 50);
+  }
+
+  private watchDirectory(dir: string, real: string, recursive: boolean): void {
+    if (this.stopped || (this.degradedReason && !this.recoveringFromLock) || this.inotifyLimitWarned) return;
+    if (this.dirWatchers.has(dir)) return;
+    // Recursive streams cost more than inotify entries. Keep a separate hard
+    // ceiling while honouring a lower user-configured directory watch budget.
+    const cap = recursive ? Math.min(256, maxDirWatches()) : maxDirWatches();
+    if (this.dirWatchers.size >= cap) {
       if (!this.dirCapWarned) {
         this.dirCapWarned = true;
-        logWarn('File watcher hit directory-watch cap; remaining subtrees rely on manual/periodic sync', {
-          cap: maxDirWatches(),
-        });
+        logWarn('File watcher hit directory-watch cap; remaining subtrees rely on manual/periodic sync', { cap });
       }
       return;
     }
 
     let w: fs.FSWatcher;
     try {
-      w = watchImpl(dir, { persistent: true }, (_event, filename) =>
+      w = watchImpl(dir, { persistent: true, recursive }, (_event, filename) =>
         this.handleDirEvent(dir, filename)
       );
     } catch (err) {
@@ -543,59 +580,40 @@ export class FileWatcher {
       if (isInotifyWatchExhaustion(err)) {
         this.warnInotifyLimit({ error: String(err), dir });
       }
-      this.unwatchSubtree(dir);
-      this.maybeScheduleForRemovedDir(normalizePath(path.relative(this.projectRoot, dir)));
+      this.unwatchDir(dir);
     });
     this.dirWatchers.set(dir, w);
 
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      const child = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        if (this.shouldIgnoreDir(child)) continue;
-        this.watchTree(child, markExisting);
-      } else if (markExisting && entry.isFile()) {
-        this.handleChange(normalizePath(path.relative(this.projectRoot, child)));
-      }
-    }
+    this.watchedRealDirs.set(dir, real);
   }
 
-  /**
-   * Linux per-directory event handler. `filename` is relative to `dir`. A new
-   * sub-directory is picked up by extending the watch tree; everything else is
-   * routed through the shared change handler.
-   */
+  /** Events are relative to a watch's logical path, even for an external target. */
   private handleDirEvent(dir: string, filename: string | Buffer | null): void {
-    if (this.stopped || filename == null) return;
+    if (this.stopped) return;
+    if (filename == null) {
+      this.scheduleTreeRefresh();
+      return;
+    }
     const full = path.join(dir, String(filename));
-
-    // A newly-created directory needs its own watch (recursive isn't available
-    // on Linux). statSync is cheap and these events are rare relative to file
-    // edits. If the path vanished (rapid create/delete) the stat throws and we
-    // fall through to the change handler, which no-ops on a non-source path.
+    const rel = normalizePath(path.relative(this.projectRoot, full));
+    if (!rel || rel === '.') {
+      this.scheduleTreeRefresh();
+      return;
+    }
+    // Churn under an ignored directory (node_modules, dist, .git) is dropped
+    // before any per-event fs call; `.git/info/exclude` still reaches the scope
+    // refresh in handleChange (#1728).
+    if (rel !== '.git/info/exclude' && this.shouldIgnoreDir(path.dirname(full))) return;
     try {
       if (fs.statSync(full).isDirectory()) {
-        if (!this.shouldIgnoreDir(full)) this.watchTree(full, /* markExisting */ true);
+        if (this.shouldIgnoreDir(full)) return;
+        // Existing directory notifications can represent a retargeted link.
+        if (this.knownDirs.get(full) !== fs.realpathSync(full)) this.scheduleTreeRefresh();
         return;
       }
-    } catch {
-      // If this path used to own a watch, it was a directory. Linux often emits
-      // only the parent's rename event and no watcher error for the removed
-      // subtree, so close every descendant watch here and force a scan-diff.
-      if (this.unwatchSubtree(full) > 0) {
-        this.needsFullScan = true;
-        this.scheduleSync();
-        return;
-      }
-      // Deleted/inaccessible ordinary file — treat as a normal change below.
-    }
-
-    this.handleChange(normalizePath(path.relative(this.projectRoot, full)));
+    } catch { /* deleted/inaccessible */ }
+    if (this.knownDirs.has(full) && !this.shouldIgnoreDir(full)) this.scheduleTreeRefresh();
+    this.handleChange(rel);
   }
 
   /**
@@ -647,6 +665,20 @@ export class FileWatcher {
       return;
     }
 
+    try {
+      if (this.isFileStateCurrent?.(rel)) {
+        logDebug('Ignoring file event with unchanged indexed metadata', { file: rel });
+        return;
+      }
+    } catch (error) {
+      // The guard is an optimization, never a correctness boundary. If the
+      // stat/DB lookup fails, keep the event so a sync can reconcile it.
+      logDebug('Could not verify file event metadata; treating it as a change', {
+        file: rel,
+        error: String(error),
+      });
+    }
+
     logDebug('File change detected', { file: rel });
     if (this.ready) {
       const now = Date.now();
@@ -683,15 +715,16 @@ export class FileWatcher {
   private refreshScope(rel: string): void {
     logDebug('Scope config changed; rebuilding watcher scope', { file: rel });
     this.ignoreMatcher = buildScopeIgnore(this.projectRoot);
-    this.refreshHdlScope();
+    this.hdlScope.refresh();
+    this.scheduleTreeRefresh();
     this.needsFullScan = true;
     this.scheduleSync();
   }
 
   private refreshHdlScope(): void {
-    if (this.hdlScope.refresh() && !this.inert && !this.recursiveWatcher && this.dirWatchers.size > 0) {
-      this.watchTree(this.projectRoot, false, true);
-    }
+    // A profile switch can admit a formerly ignored directory; the walk adds
+    // its watches (and drops ones no longer in scope).
+    if (this.hdlScope.refresh()) this.refreshWatchTree();
   }
 
   /**
@@ -724,33 +757,26 @@ export class FileWatcher {
     this.scheduleSync();
   }
 
-  /** Close and forget a removed directory and every watched descendant. */
-  private unwatchSubtree(dir: string): number {
-    let removed = 0;
-    const prefix = dir.endsWith(path.sep) ? dir : dir + path.sep;
-    for (const [watchedDir, w] of [...this.dirWatchers]) {
-      if (watchedDir !== dir && !watchedDir.startsWith(prefix)) continue;
+  /** Close and forget the watch for a directory that errored/was removed. */
+  private unwatchDir(dir: string): void {
+    const w = this.dirWatchers.get(dir);
+    if (w) {
       try {
         w.close();
       } catch {
         /* already closed */
       }
-      this.dirWatchers.delete(watchedDir);
-      removed++;
+      this.dirWatchers.delete(dir);
+      this.watchedRealDirs.delete(dir);
     }
-    return removed;
   }
 
   /** Our own dirs are always ignored, regardless of .gitignore. */
   private isAlwaysIgnored(rel: string): boolean {
-    // First path segment. Ignore any CodeGraph data dir — the active one AND a
+    // Ignore any CodeGraph data dir — the active one AND a
     // sibling like `.codegraph-win` a second environment (Windows/WSL) created
     // in the same tree, so neither side watches the other's index (#636).
-    const top = rel.split('/')[0] ?? rel;
-    return (
-      isCodeGraphDataDir(top) ||
-      rel === '.git' || rel.startsWith('.git/')
-    );
+    return rel.split('/').some(part => isCodeGraphDataDir(part) || part === '.git');
   }
 
   /**
@@ -853,6 +879,10 @@ export class FileWatcher {
    */
   stop(): void {
     this.stopped = true;
+    if (this.treeRefreshTimer) clearTimeout(this.treeRefreshTimer);
+    this.treeRefreshTimer = null;
+    this.knownDirs.clear();
+    this.watchedRealDirs.clear();
     this.recoveringFromLock = false;
 
     if (this.debounceTimer) {
@@ -882,6 +912,7 @@ export class FileWatcher {
     this.syncFailureRetryCount = 0;
     // NB: degradedReason is intentionally NOT reset here — it must survive the
     // stop() that degrade() triggers so isDegraded() stays true. start() clears it.
+    this.visitedRealDirs.clear();
     this.inert = false;
 
     this.pendingFiles.clear();
@@ -998,11 +1029,13 @@ export class FileWatcher {
         ? [...this.pendingFiles.keys()]
         : undefined;
 
+    // Consume this request before yielding so a topology/scope change during
+    // the full sync remains pending for the next reconcile.
+    if (!scoped) this.needsFullScan = false;
     try {
       const result = await this.syncFn(scoped);
       this.refreshHdlScope();
-      if (!scoped) this.needsFullScan = false;
-      if (this.recoveringFromLock && !scoped) {
+      if (this.recoveringFromLock && !scoped && !this.needsFullScan) {
         this.degradedReason = null;
         this.recoveringFromLock = false;
       }
@@ -1022,6 +1055,7 @@ export class FileWatcher {
       }
       this.onSyncComplete?.(result);
     } catch (err) {
+      if (!scoped) this.needsFullScan = true;
       if (err instanceof LockUnavailableError) {
         this.lockRetryCount += 1;
         // Lock-failure no-op (another writer holds the lock). pendingFiles
@@ -1080,9 +1114,10 @@ export class FileWatcher {
       // sync resets both counters so normal edits keep the fast debounce. Use
       // the larger streak so interleaved failures still back off. A degrade()
       // above already set `stopped`, so this won't reschedule a watcher that
-      // has given up. A scope change (`codegraph.json`, an HDL filelist) that
-      // landed while a SCOPED sync was in flight adds no pending file, only
-      // `needsFullScan` — it still owes the full reconcile it asked for.
+      // has given up. A directory removal whose full sync failed adds no
+      // pending file, only `needsFullScan` — it still owes the full reconcile
+      // it asked for (#1964). So does a scope change (`codegraph.json`, an HDL
+      // filelist) that landed while a SCOPED sync was in flight.
       if ((this.pendingFiles.size > 0 || this.needsFullScan) && !this.stopped) {
         const retryCount = Math.max(this.lockRetryCount, this.syncFailureRetryCount);
         if (retryCount > 0) {

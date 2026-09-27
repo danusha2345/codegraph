@@ -1,49 +1,5 @@
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
-import type { Node as SyntaxNode } from 'web-tree-sitter';
-
-/** Read prose from the first statement, never an arbitrary string in a body. */
-export function pythonBodyDocstring(node: SyntaxNode): string | undefined {
-  const body = node.type === 'module' ? node : node.childForFieldName('body');
-  const statement = body?.namedChildren.find(child => child.type !== 'comment');
-  if (statement?.type !== 'expression_statement') return undefined;
-  function literal(value: SyntaxNode | null): string | undefined {
-    if (!value) return undefined;
-    if (value.type === 'parenthesized_expression') return literal(value.namedChildren.find(child => child.type !== 'comment') ?? null);
-    if (value.type === 'concatenated_string') {
-      const parts = value.namedChildren.filter(child => child.type !== 'comment').map(literal);
-      return parts.every(part => part !== undefined) ? parts.join('') : undefined;
-    }
-    if (value.type !== 'string') return undefined;
-    const match = /^([ru]*)("""|'''|"|')/i.exec(value.text);
-    if (!match || !value.text.endsWith(match[2]!)) return undefined;
-    // Keep source escapes verbatim, as with preceding comments; do not execute
-    // or interpolate Python. Bytes and f-strings are not Python docstrings.
-    return value.text.slice(match[0].length, -match[2]!.length);
-  }
-  const text = literal(statement.namedChildren[0] ?? null);
-  if (text === undefined) return undefined;
-  // Python whitespace and code-point columns, shared with the Rust walker.
-  const whitespace = /[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/;
-  const leading = (line: string[]) => {
-    const first = line.findIndex(char => !whitespace.test(char));
-    return first < 0 ? line.length : first;
-  };
-  const lines = text.replace(/\r\n?/g, '\n').split('\n').map(line => {
-    const expanded: string[] = [];
-    for (const char of line) {
-      if (char === '\t') expanded.push(...' '.repeat(8 - expanded.length % 8));
-      else expanded.push(char);
-    }
-    return expanded;
-  });
-  const margins = lines.slice(1).filter(line => leading(line) !== line.length).map(leading);
-  const margin = margins.length ? Math.min(...margins) : 0;
-  const cleaned = [lines[0]!.slice(leading(lines[0]!)), ...lines.slice(1).map(line => line.slice(margin))];
-  while (cleaned.length && cleaned[0]!.every(char => whitespace.test(char))) cleaned.shift();
-  while (cleaned.length && cleaned[cleaned.length - 1]!.every(char => whitespace.test(char))) cleaned.pop();
-  return cleaned.map(line => line.join('')).join('\n') || undefined;
-}
 
 export const pythonExtractor: LanguageExtractor = {
   functionTypes: ['function_definition'],
@@ -60,7 +16,40 @@ export const pythonExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   returnField: 'return_type',
-  getBodyDocstring: pythonBodyDocstring,
+  /**
+   * Python states intent in a docstring — a bare string literal as the first
+   * statement of the body — not in a preceding comment, so the comment-sibling
+   * walk never reached it and the prose never entered the index (#1905).
+   *
+   * Reads `string_content` rather than slicing quotes off the raw text: the
+   * grammar already separates delimiters from body, which keeps `r`/`u`
+   * prefixes and both `"""` and `'''` forms working without a regex per case.
+   * Bytes and f-strings are not Python docstrings.
+   */
+  getBodyDocstring: (node, source) => {
+    const body = node.type === 'module' ? node : getChildByField(node, 'body');
+    if (!body) return undefined;
+    const first = body.namedChildren.find((c) => c.type !== 'comment');
+    if (!first || first.type !== 'expression_statement') return undefined;
+    if (first.namedChildCount !== 1 || first.children.some((c) => c.type === ',')) return undefined;
+    let literal = first.namedChild(0);
+    while (literal?.type === 'parenthesized_expression') {
+      literal = literal.namedChildren.find((c) => c.type !== 'comment') ?? null;
+    }
+    if (!literal) return undefined;
+    const strings = literal.type === 'concatenated_string'
+      ? literal.namedChildren.filter((c) => c.type !== 'comment') : [literal];
+    let raw = '';
+    for (const string of strings) {
+      if (string.type !== 'string') return undefined;
+      const start = string.namedChildren.find((c) => c.type === 'string_start');
+      if (!start || /[bf]/i.test(getNodeText(start, source))) return undefined;
+      if (!string.namedChildren.some((c) => c.type === 'string_end')) return undefined;
+      const content = string.namedChildren.find((c) => c.type === 'string_content');
+      if (content) raw += getNodeText(content, source);
+    }
+    return dedentDocstring(raw) || undefined;
+  },
   getSignature: (node, source) => {
     const params = getChildByField(node, 'parameters');
     const returnType = getChildByField(node, 'return_type');
@@ -96,3 +85,31 @@ export const pythonExtractor: LanguageExtractor = {
     return null;
   },
 };
+
+/**
+ * A docstring is indented to its definition, so every line after the first
+ * carries that indentation. Strip the common prefix (PEP 257's rule: the first
+ * line is exempt because it starts right after the opening quotes) and drop
+ * blank edges, so the stored prose reads the same as a comment-derived one.
+ */
+function dedentDocstring(raw: string): string {
+  const lines = raw.replace(/\r\n?/g, '\n').split('\n').map((line) => {
+    let column = 0;
+    return Array.from(line, (char) => {
+      const width = char === '\t' ? 8 - column % 8 : 1;
+      column += width;
+      return char === '\t' ? ' '.repeat(width) : char;
+    }).join('');
+  });
+  const rest = lines.slice(1).filter((l) => l.trim().length > 0);
+  const indent = rest.length === 0
+    ? 0
+    : Math.min(...rest.map((l) => l.length - l.trimStart().length));
+  const out = [
+    lines[0]?.trim() ?? '',
+    ...lines.slice(1).map((l) => l.slice(indent).trimEnd()),
+  ];
+  while (out.length > 0 && out[0]!.trim() === '') out.shift();
+  while (out.length > 0 && out[out.length - 1]!.trim() === '') out.pop();
+  return out.join('\n');
+}

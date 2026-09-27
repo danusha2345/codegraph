@@ -20,8 +20,8 @@ import * as os from 'os';
 import * as path from 'path';
 import CodeGraph from '../src/index';
 import { createGraphApi, startUiServer, type GraphApi, type UiServerHandle } from '../src/ui-server';
-import { TEST_CALLER_BUDGET } from '../src/ui-server/api/wire';
 import { buildRoutes } from '../src/ui-server/api/routes';
+import { TEST_CALLER_BUDGET } from '../src/ui-server/api/wire';
 
 interface Response {
   status: number;

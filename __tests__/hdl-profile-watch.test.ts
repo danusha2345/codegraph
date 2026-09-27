@@ -29,7 +29,7 @@ function project() {
 it('watches profile filelists, explicit ignored sources and external-to-source header dependencies through the real event filter', async () => {
   const {root,write} = project(); const calls: Array<string[]|undefined> = [];
   const watcher = new FileWatcher(root, async paths => { calls.push(paths); return {filesChanged:1,durationMs:1}; },
-    {inertForTests:true,debounceMs:5}, () => ['private/flags.inc']);
+    {inertForTests:true,debounceMs:5}, undefined, () => ['private/flags.inc']);
   try {
     expect(watcher.start()).toBe(true);
     watcher.ingestEventForTests('private/flags.inc');

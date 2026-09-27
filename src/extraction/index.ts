@@ -28,8 +28,6 @@ import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
-import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
-export { oversizeStamp };
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
@@ -39,6 +37,8 @@ import ignore, { Ignore } from 'ignore';
 import { detectFrameworks } from '../resolution/frameworks';
 import type { ResolutionContext } from '../resolution/types';
 import { createYielder, type MaybeYield } from '../resolution/cooperative-yield';
+import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
+export { oversizeStamp };
 
 /**
  * Number of files to read in parallel during indexing.
@@ -123,24 +123,18 @@ export interface IndexResult {
  * Result of a sync operation
  */
 export interface SyncResult {
+  /** References attempted by the pending-reference recovery sweep, if run. */
+  pendingRefsProcessed?: number;
+  /** Pending references successfully resolved by the recovery sweep. */
+  pendingRefsResolved?: number;
+  /** Pending references the recovery sweep could not resolve. */
+  pendingRefsUnresolved?: number;
   filesChecked: number;
   filesAdded: number;
   filesModified: number;
   filesRemoved: number;
   nodesUpdated: number;
   durationMs: number;
-  /**
-   * Set when NO reconciliation ran because the index lock
-   * (`.codegraph/codegraph.lock`) could not be taken: `locked` when a live
-   * process holds it (an MCP server or another CLI mid-sync), `lock-failed`
-   * for anything else (an unreadable lock, a directory in its place). The
-   * counts above are then all zero and must not be read as "up to date".
-   */
-  skippedReason?: 'locked' | 'lock-failed';
-  /** PID of the live process holding the lock (`locked`). */
-  lockHolderPid?: number;
-  /** The lock's own error message, with its `codegraph unlock` hint (`lock-failed`). */
-  lockError?: string;
   changedFilePaths?: string[];
   /** Paths not absorbed because reading or extraction failed; retain for status/retry. */
   failedFilePaths?: string[];
@@ -258,12 +252,13 @@ const DEFAULT_IGNORE_PATTERNS: string[] = [
   'bazel-*/',        // Bazel output symlink trees
   // Android resource dirs at any depth, with their qualifier variants (#1047).
   ...ANDROID_RES_TYPES.map((t) => `**/res/${t}*/`),
-  // `build` is also a legal Java package segment. Keep it under conventional
-  // Java source roots while continuing to exclude module/build output (#1642).
-  '!**/src/main/java/**/build/',
-  '!**/src/main/java/**/build/**',
-  '!**/src/test/java/**/build/',
-  '!**/src/test/java/**/build/**',
+  // `build` is also a legal JVM package segment. Keep it under conventional
+  // source roots (any source set: main, test, androidTest, ...) while continuing
+  // to exclude module/build output (#1642). Unignore only the directory, not its
+  // subtree: other defaults still apply.
+  '!**/src/*/java/**/build/',
+  '!**/src/*/kotlin/**/build/',
+  '!**/src/*/scala/**/build/',
 ];
 
 /** True if `buf` decodes as strict UTF-8 (no invalid byte sequences). */
@@ -3221,7 +3216,9 @@ export class ExtractionOrchestrator {
      * is stored, when no extraction transaction is open, so a checkpoint can
      * safely catch up before the next file grows the WAL further.
      */
-    backpressure?: () => Promise<void> | null
+    backpressure?: () => Promise<void> | null,
+    /** Inspect changed inputs before deletion/re-extraction cascades their edges. */
+    onFileChange?: (filePath: string, content?: string) => void
   ): Promise<SyncResult> {
     this.prepareHdlContext();
     if (this.hdlForce) scopedPaths = undefined;
@@ -3345,6 +3342,7 @@ export class ExtractionOrchestrator {
             this.queries.replaceResolutionEdgesWithUnresolvedRefs([], resurrected);
           }
         }
+        onFileChange?.(tracked.path);
         this.queries.deleteFile(tracked.path);
         filesRemoved++;
       }
@@ -3395,10 +3393,12 @@ export class ExtractionOrchestrator {
       const contentHash = hashContent(content);
 
       if (!tracked) {
+        onFileChange?.(filePath, content);
         filesToIndex.push(filePath);
         changedFilePaths.push(filePath);
         filesAdded++;
       } else if (tracked.contentHash !== contentHash || this.forceHdlFile(filePath)) {
+        onFileChange?.(filePath, content);
         filesToIndex.push(filePath);
         changedFilePaths.push(filePath);
         filesModified++;

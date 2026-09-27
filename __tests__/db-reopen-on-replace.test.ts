@@ -14,7 +14,7 @@
  * repros are gated to non-Windows; `isReplacedOnDisk` is verified to stay false
  * on Windows.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -77,6 +77,23 @@ describe('CodeGraph.reopenIfReplaced (issue #925)', () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
+  posixOnly('preserves read-only access after replacing the database (#1963)', async () => {
+    const initial = CodeGraph.initSync(root);
+    await initial.indexAll();
+    initial.close();
+    const reader = CodeGraph.openSync(root, { readOnly: true });
+    try {
+      fs.rmSync(getCodeGraphDir(root), { recursive: true, force: true });
+      const replacement = CodeGraph.initSync(root);
+      await replacement.indexAll();
+      replacement.close();
+      expect(reader.reopenIfReplaced()).toBe(true);
+      expect(reader.searchNodes('fooOld').length).toBeGreaterThan(0);
+      // The reopened handle must not silently become a writer.
+      expect(() => reader.clear()).toThrow(/readonly|read-only/i);
+    } finally { reader.close(); }
+  });
+
   posixOnly('heals a held connection after the index is removed and recreated at the same path', async () => {
     // The "server" opens and holds the DB for its lifetime.
     const server = CodeGraph.initSync(root);
@@ -113,31 +130,5 @@ describe('CodeGraph.reopenIfReplaced (issue #925)', () => {
     await server.indexAll();
     expect(server.reopenIfReplaced()).toBe(false);
     server.destroy();
-  });
-
-  it('does not publish a replacement connection after close wins the race', async () => {
-    const server = CodeGraph.initSync(root);
-    const stale = (server as unknown as { db: DatabaseConnection }).db;
-    const fresh = DatabaseConnection.initialize(path.join(root, 'replacement.db'));
-    let finishOpen!: (connection: DatabaseConnection) => void;
-    const openGate = new Promise<DatabaseConnection>((resolve) => { finishOpen = resolve; });
-    const replacedSpy = vi.spyOn(stale, 'isReplacedOnDisk').mockReturnValue(true);
-    const openSpy = vi.spyOn(DatabaseConnection, 'openAsync').mockReturnValue(openGate);
-
-    try {
-      const reopening = server.reopenIfReplacedAsync();
-      await vi.waitFor(() => expect(openSpy).toHaveBeenCalledOnce());
-      server.close();
-      finishOpen(fresh);
-
-      expect(await reopening).toBe(false);
-      expect(fresh.isOpen()).toBe(false);
-      expect(openSpy).toHaveBeenCalledOnce();
-    } finally {
-      replacedSpy.mockRestore();
-      openSpy.mockRestore();
-      try { server.close(); } catch { /* may already be closed */ }
-      try { fresh.close(); } catch { /* recovery closes it on the guarded path */ }
-    }
   });
 });

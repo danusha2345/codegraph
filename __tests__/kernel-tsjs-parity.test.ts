@@ -98,6 +98,20 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
 
   it.each([
     ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('same-line accessors retain distinct identities after Unicode: %s (#1349)', (ext, language) => {
+    const source = 'class Point { /* é😀 */ get x() { return read(); } set x(v) { write(v); } }';
+    const result = assertParity(`point.${ext}`, source, language);
+    const x = result.nodes.filter((n) => n.name === 'x');
+    expect(x).toHaveLength(2);
+    expect(x[1]!.id).toBe(`${x[0]!.id}:${source.indexOf('set x')}`);
+    expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => [r.fromNodeId, r.referenceName]))
+      .toEqual([[x[0]!.id, 'read'], [x[1]!.id, 'write']]);
+    // No state leaks between files or repeated extractions.
+    expect(canon(assertParity(`point.${ext}`, source, language))).toEqual(canon(result));
+  });
+
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
   ] as const)('leaves nested identifier receivers unresolved and keeps argument calls: %s (#1566)', (ext, language) => {
     const result = assertParity(`fixture.${ext}`, `
 function readKey() { return 'answer'; }
@@ -122,6 +136,26 @@ function nested(holder) {
         'readKey', 'holder.deep.values.get', 'readKey',
       ]);
     expect(result.unresolvedReferences.some((r) => r.referenceName === 'values.get')).toBe(true);
+  });
+
+  describe.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('private field receivers: %s (#1987)', (ext, language) => {
+    it.each(['LF', 'CRLF'])('preserves private fields and optional calls (%s)', (ending) => {
+      const source = `
+class Mailer { send() {} }
+class Vault {
+  #mailer = new Mailer();
+  #items = new Set();
+  notify() { this.#mailer?.send(); }
+  optional() { this.#mailer.send?.(); }
+  put() { this.#items?.add('x'); }
+}
+`;
+      const result = assertParity(`vault.${ext}`, ending === 'CRLF' ? source.replace(/\n/g, '\r\n') : source, language);
+      expect(result.unresolvedReferences.filter(r => r.referenceKind === 'calls').map(r => r.referenceName))
+        .toEqual(['this.#mailer.send', 'this.#mailer.send', 'this.#items.add']);
+    });
   });
 
   it.each([
@@ -182,9 +216,53 @@ async function exprReceivers(x, y) {
     assertParity('fixtures/torture.py', fs.readFileSync(file, 'utf8'), 'python');
   });
 
+  it.each(['LF', 'CRLF'])('Python body docstrings parity (%s, #1905)', (ending) => {
+    const source = fs.readFileSync(path.join(FIXTURE_DIR, 'docstrings.py'), 'utf8');
+    const result = assertParity('ledger.py', ending === 'CRLF' ? source.replace(/\n/g, '\r\n') : source, 'python');
+    expect(result.nodes.find((n) => n.kind === 'file')?.docstring).toBe('Ledger module documentation.');
+    expect(result.nodes.find((n) => n.name === 'settle')?.docstring).toBe('Method comment.\n\nSettle the ledger.');
+  });
+
   it('torture fixture (go): receivers, embedding, interfaces, composite literals', () => {
     const file = path.join(FIXTURE_DIR, 'torture.go');
     assertParity('fixtures/torture.go', fs.readFileSync(file, 'utf8'), 'go');
+  });
+
+  it('Python member values preserve receivers across callback, assignment and collection positions (#1820)', () => {
+    const result = assertParity('members.py', `
+class Store:
+    def fetch(self, ids):
+        return ids
+class Consumer:
+    def wire(self, pool, obj):
+        pool.submit(self.store.fetch, obj.fetch)
+        cb = self.store.fetch
+        table = [obj.fetch, Store.fetch, self.fetch, cls.fetch]
+        keyword(callback=obj.fetch)
+        obj.fetch([])
+        pool.submit(factory().fetch, obj[0].fetch)
+`, 'python');
+    const names = result.unresolvedReferences.filter(r => r.referenceKind === 'function_ref').map(r => r.referenceName);
+    expect(names.sort()).toEqual(['Store.fetch', 'cls.fetch', 'obj.fetch', 'self.fetch', 'self.store.fetch']);
+    expect(result.unresolvedReferences.some(r => r.referenceKind === 'calls' && r.referenceName === 'obj.fetch')).toBe(true);
+  });
+
+  it('Go method values preserve receivers and exclude invocation receivers (#1820)', () => {
+    const result = assertParity('members.go', `package demo
+ type Store struct{}
+ func (s *Store) Fetch() {}
+ func wire(c *Store, pool Pool) {
+   Submit(c.Fetch)
+   cb := c.Fetch
+   table := []func(){c.Fetch, Store.Fetch}
+   Submit(c.store.Fetch)
+   go c.Fetch()
+   Submit(factory().Fetch, items[0].Fetch)
+ }
+`, 'go');
+    const names = result.unresolvedReferences.filter(r => r.referenceKind === 'function_ref').map(r => r.referenceName);
+    expect(names.sort()).toEqual(['Store.Fetch', 'c.Fetch', 'c.store.Fetch']);
+    expect(result.unresolvedReferences.some(r => r.referenceKind === 'calls' && r.referenceName === 'c.Fetch')).toBe(true);
   });
 
   it.each(REAL_SOURCES)('real source parity: %s', (rel) => {

@@ -16,12 +16,12 @@ import {
   UnresolvedReference,
 } from '../types';
 import { getParser, detectLanguage, isLanguageSupported, isFileLevelOnlyLanguage } from './grammars';
-import { generateNodeId, getNodeText, getChildByField, getPrecedingDocstring } from './tree-sitter-helpers';
+import { NodeIdAllocator, getNodeText, getChildByField, getPrecedingDocstring } from './tree-sitter-helpers';
 import { FN_REF_SPECS, captureFnRefCandidates, type FnRefSpec, type FnRefCandidate } from './function-ref';
 import { isGeneratedFile } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
-import { stripCppTemplateArgs } from './languages/c-cpp';
+import { stripCppTemplateArgs, isCppConstructorDeclaration } from './languages/c-cpp';
 import { rustImplTypeName } from './languages/rust';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
@@ -484,11 +484,27 @@ function keepsBareTsJsReceiver(node: SyntaxNode, source: string): boolean {
 const REACT_HANDLER_HOOKS = /^(?:React\.)?use(?:Callback|EffectEvent|Event)$/;
 
 export class TreeSitterExtractor {
+  /**
+   * The node's prose, from either place it can live: a preceding comment
+   * sibling (every language) or a docstring inside the body (Python's bare
+   * first-statement string, and the same shape in other languages that opt in
+   * via `getBodyDocstring`). When a node carries both, they are joined rather
+   * than one winning — they are two separate things the author wrote about the
+   * same symbol, and the column holds free text (#1905).
+   */
+  private docstringFor(node: SyntaxNode): string | undefined {
+    const preceding = getPrecedingDocstring(node, this.source);
+    const body = this.extractor?.getBodyDocstring?.(node, this.source);
+    if (preceding && body) return `${preceding}\n\n${body}`;
+    return body || preceding;
+  }
+
   private filePath: string;
   private language: Language;
   private source: string;
   private tree: Tree | null = null;
   private nodes: Node[] = [];
+  private nodeIds = new NodeIdAllocator();
   private edges: Edge[] = [];
   private unresolvedReferences: UnresolvedReference[] = [];
   // Value-reference edges (default ON; set CODEGRAPH_VALUE_REFS=0 to disable; see flushValueRefs).
@@ -529,7 +545,6 @@ export class TreeSitterExtractor {
   // point (this instance is the wasm fallback for a kernel-deferred file) —
   // don't blank it a second time.
   private sourceIsPreParsed = false;
-  private kotlinObjectScopeDepth = 0;
 
   constructor(
     filePath: string,
@@ -614,9 +629,10 @@ export class TreeSitterExtractor {
         startColumn: 0,
         endColumn: 0,
         isExported: false,
-        docstring: this.extractor?.getBodyDocstring?.(this.tree.rootNode, this.source),
         updatedAt: Date.now(),
       };
+      const fileDocstring = this.extractor?.getBodyDocstring?.(this.tree.rootNode, this.source);
+      if (fileDocstring) fileNode.docstring = fileDocstring;
       this.nodes.push(fileNode);
 
       // Push file node onto stack so top-level declarations get contains edges
@@ -1076,6 +1092,11 @@ export class TreeSitterExtractor {
       if (skipChildren) return;
     }
 
+    if (this.language === 'cpp' && isCppConstructorDeclaration(node)) {
+      this.extractMethod(node);
+      return;
+    }
+
     // C/C++ function-like macros (`#define TRACE(x) ...`) become `constant`
     // nodes carrying the directive as their signature. A macro is a value,
     // never an executable callee: the resolver reads these to recognize a
@@ -1146,6 +1167,8 @@ export class TreeSitterExtractor {
         this.extractInterface(node);
       } else if (classification === 'trait') {
         this.extractClass(node, 'trait');
+      } else if (classification === 'module') {
+        this.extractClass(node, 'module');
       } else {
         this.extractClass(node);
       }
@@ -1416,14 +1439,6 @@ export class TreeSitterExtractor {
         skipChildren = true;
       }
     }
-    // Kotlin `object : IFoo.Stub() { ... }` — structurally distinct from
-    // INSTANTIATION_KINDS (multiple repeatable `delegation_specifier`
-    // supertypes, no single constructor/type field), so it gets its own
-    // dedicated extraction rather than being folded into extractInstantiation.
-    else if (nodeType === 'object_literal') {
-      this.extractKotlinObjectLiteral(node);
-      skipChildren = true;
-    }
     // (Decorator handling lives inside the symbol-creating extractors
     // — extractClass / extractFunction / extractProperty — because the
     // decorator node sits BEFORE the symbol in the AST and the walker
@@ -1469,15 +1484,7 @@ export class TreeSitterExtractor {
       return null;
     }
 
-    // HDL declarations can share a name and source line (`wire a, a_n;`).
-    // Include the UTF-16 column for Verilog so their edges cannot alias.
-    const column = this.language === 'verilog' ? node.startPosition.column : undefined;
-    // Members in different Kotlin anonymous objects can share both name and
-    // line. Bind their identity to the enclosing owner as well.
-    const identityName = this.kotlinObjectScopeDepth > 0
-      ? `${this.nodeStack[this.nodeStack.length - 1]}::${name}`
-      : name;
-    const id = generateNodeId(this.filePath, kind, identityName, node.startPosition.row + 1, column);
+    const id = this.nodeIds.generate(this.filePath, kind, name, node.startPosition.row + 1, node.startPosition.column);
 
     // Some grammars (e.g. Dart) model a function/method body as a *sibling* of
     // the signature node, so the declaration node's own range is just the
@@ -1675,12 +1682,6 @@ export class TreeSitterExtractor {
   /**
    * Extract a function
    */
-  private definitionDocstring(node: SyntaxNode): string | undefined {
-    const comment = getPrecedingDocstring(node, this.source);
-    const body = this.extractor?.getBodyDocstring?.(node, this.source);
-    return [comment, body].filter(Boolean).join('\n\n') || undefined;
-  }
-
   private extractFunction(node: SyntaxNode, nameOverride?: string): void {
     if (!this.extractor) return;
 
@@ -1752,7 +1753,7 @@ export class TreeSitterExtractor {
       return;
     }
 
-    const docstring = this.definitionDocstring(node);
+    const docstring = this.docstringFor(node);
     const signature = this.extractor.getSignature?.(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = commonJsExport || this.extractor.isExported?.(node, this.source);
@@ -1870,7 +1871,7 @@ export class TreeSitterExtractor {
     if (this.extractor.skipBodilessClass && !resolvedBody) return;
 
     const name = extractName(node, this.source, this.extractor);
-    const docstring = this.definitionDocstring(node);
+    const docstring = this.docstringFor(node);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
 
@@ -1954,7 +1955,7 @@ export class TreeSitterExtractor {
       return;
     }
 
-    const docstring = this.definitionDocstring(node);
+    const docstring = this.docstringFor(node);
     const signature = this.extractor.getSignature?.(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
     const isAsync = this.extractor.isAsync?.(node);
@@ -2030,7 +2031,7 @@ export class TreeSitterExtractor {
     if (!this.extractor) return;
 
     const name = extractName(node, this.source, this.extractor);
-    const docstring = getPrecedingDocstring(node, this.source);
+    const docstring = this.docstringFor(node);
     const isExported = this.extractor.isExported?.(node, this.source);
 
     const kind: NodeKind = this.extractor.interfaceKind ?? 'interface';
@@ -2089,7 +2090,7 @@ export class TreeSitterExtractor {
       return;
 
     const name = extractName(node, this.source, this.extractor);
-    const docstring = getPrecedingDocstring(node, this.source);
+    const docstring = this.docstringFor(node);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
 
@@ -2133,7 +2134,7 @@ export class TreeSitterExtractor {
     if (!body) return;
 
     const name = extractName(node, this.source, this.extractor);
-    const docstring = getPrecedingDocstring(node, this.source);
+    const docstring = this.docstringFor(node);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
 
@@ -2199,7 +2200,7 @@ export class TreeSitterExtractor {
   private extractProperty(node: SyntaxNode): Node | null {
     if (!this.extractor) return null;
 
-    const docstring = getPrecedingDocstring(node, this.source);
+    const docstring = this.docstringFor(node);
     const visibility = this.extractor.getVisibility?.(node);
     const isStatic = this.extractor.isStatic?.(node) ?? false;
 
@@ -2269,7 +2270,7 @@ export class TreeSitterExtractor {
   private extractField(node: SyntaxNode): void {
     if (!this.extractor) return;
 
-    const docstring = getPrecedingDocstring(node, this.source);
+    const docstring = this.docstringFor(node);
     const visibility = this.extractor.getVisibility?.(node);
     const isStatic = this.extractor.isStatic?.(node) ?? false;
 
@@ -2408,6 +2409,11 @@ export class TreeSitterExtractor {
         const value = getChildByField(member, 'value');
         if (key && value && (value.type === 'arrow_function' || value.type === 'function_expression')) {
           this.extractFunction(value, this.objectKeyName(key));
+        } else if (value?.type === 'call_expression') {
+          // `key: Effect.fn("…")(function* () {…})` — see curriedWrapperBoundName.
+          const fn = getChildByField(value, 'arguments')?.namedChild(0);
+          const bound = fn ? this.curriedWrapperBoundName(fn) : null;
+          if (fn && bound) this.extractFunction(fn, bound);
         }
       } else if (member.type === 'method_definition') {
         // Method shorthand: `{ fetchUser() {...} }`. extractMethod deliberately
@@ -2801,7 +2807,7 @@ export class TreeSitterExtractor {
 
     const isConst = this.extractor.isConst?.(node) ?? false;
     const kind: NodeKind = isConst ? 'constant' : 'variable';
-    const docstring = getPrecedingDocstring(node, this.source);
+    const docstring = this.docstringFor(node);
     const isExported = this.extractor.isExported?.(node, this.source) ?? false;
 
     // Extract variable declarators based on language
@@ -3274,7 +3280,7 @@ export class TreeSitterExtractor {
 
     const name = extractName(node, this.source, this.extractor);
     if (name === '<anonymous>') return false;
-    const docstring = getPrecedingDocstring(node, this.source);
+    const docstring = this.docstringFor(node);
     const isExported = this.extractor.isExported?.(node, this.source);
 
     // Check if this type alias is actually a struct or interface definition
@@ -3438,7 +3444,7 @@ export class TreeSitterExtractor {
           ? 'method'
           : this.isTsFunctionTypedProperty(child) ? 'method' : 'property';
 
-        const docstring = getPrecedingDocstring(child, this.source);
+        const docstring = this.docstringFor(child);
         const signature = getNodeText(child, this.source);
         this.createNode(memberKind, memberName, child, {
           docstring,
@@ -5262,13 +5268,13 @@ export class TreeSitterExtractor {
    *  - an `init_declarator` whose `value` is an `argument_list` (`(args)`) or
    *    `initializer_list` (`{args}`) carries constructor arguments — arity is
    *    the argument count. An array declarator's braces hold ELEMENTS, not
-   *    constructor arguments, so it counts as construction but has no arity;
+   *    constructor arguments, so each braced element has its own arity;
    *  - pointer / reference / function declarators construct nothing:
    *    `T* p{}` is a null pointer, `T& r{x}` binds a reference, and the
    *    most-vexing-parse `T c();` is a function declaration.
    *
-   * `instantiates` (the type) is emitted when any declarator carries
-   * arguments — exactly the #1035 shape. `calls` (`T::T/arity`, resolved to
+   * `instantiates` (the type) is retained for initialized declarations,
+   * preserving the #1035 dependency edges. `calls` (`T::T/arity`, resolved to
    * the constructor by src/resolution/cpp-constructor.ts, #1839) is emitted
    * for every declarator with an arity, default construction included.
    * Mirrored in the kernel (ccpp/mod.rs cpp_stack_constructions).
@@ -5290,7 +5296,8 @@ export class TreeSitterExtractor {
       const child = node.namedChild(i);
       if (!child) continue;
       if (child.type === 'storage_class_specifier' && getNodeText(child, this.source) === 'extern') return none;
-      if (child.type === 'identifier') {
+      if (child.type === 'identifier' || child.type === 'array_declarator') {
+        if (child.type === 'array_declarator' && !this.cppObjectArray(child)) continue;
         arities.push(0);
         continue;
       }
@@ -5302,9 +5309,38 @@ export class TreeSitterExtractor {
       instantiates = true;
       if (declarator.type === 'identifier') {
         arities.push(value.namedChildren.filter((c) => c.type !== 'comment').length);
+      } else if (this.cppObjectArray(declarator)) {
+        const dimensions: number[] = [];
+        let array: SyntaxNode | null = declarator;
+        while (array?.type === 'array_declarator') {
+          const size = getChildByField(array, 'size')?.text ?? '';
+          dimensions.unshift(/^\d+$/.test(size) && Number.isSafeInteger(Number(size)) ? Number(size) : NaN);
+          array = getChildByField(array, 'declarator');
+        }
+        const elements = (list: SyntaxNode, depth: number): void => {
+          const entries = list.namedChildren.filter((c) => c.type !== 'comment');
+          let elided = false;
+          for (const entry of entries) {
+            if (depth + 1 < dimensions.length) {
+              if (entry.type === 'initializer_list') elements(entry, depth + 1);
+              else elided = true; // Unbraced multidimensional layout needs type information.
+            } else {
+              arities.push(entry.type === 'initializer_list'
+                ? entry.namedChildren.filter((c) => c.type !== 'comment').length : 1);
+            }
+          }
+          if (!elided && (entries.length === 0 || dimensions[depth]! > entries.length)) arities.push(0);
+        };
+        elements(value, 0);
       }
     }
     return { instantiates, arities };
+  }
+
+  private cppObjectArray(node: SyntaxNode): boolean {
+    let element = getChildByField(node, 'declarator');
+    while (element?.type === 'array_declarator') element = getChildByField(element, 'declarator');
+    return element?.type === 'identifier';
   }
 
   /**
@@ -5408,22 +5444,16 @@ export class TreeSitterExtractor {
     if (!this.extractor) return;
 
     // The instantiated type sits in the same field/position that
-    // extractInstantiation reads from.
+    // extractInstantiation reads from. Use the same lookup so the anon
+    // class's `extends` target matches the `instantiates` edge.
     const typeNode =
       getChildByField(node, 'constructor') ||
       getChildByField(node, 'type') ||
       getChildByField(node, 'name') ||
       node.namedChild(0);
-    let fullTypeName = typeNode ? getNodeText(typeNode, this.source) : 'Object';
-    const ltIdx = fullTypeName.indexOf('<');
-    if (ltIdx > 0) fullTypeName = fullTypeName.slice(0, ltIdx);
-    fullTypeName = fullTypeName.trim() || 'Object';
-
-    // The anon class's own (cosmetic) name is deliberately the short, bare
-    // form — matching extractInstantiation's `instantiates` truncation, since
-    // that edge resolves by bare class name (a real in-project nested type's
-    // own node is named by its last segment too).
-    let typeName = fullTypeName;
+    let typeName = typeNode ? getNodeText(typeNode, this.source) : 'Object';
+    const ltIdx = typeName.indexOf('<');
+    if (ltIdx > 0) typeName = typeName.slice(0, ltIdx);
     const lastDot = Math.max(typeName.lastIndexOf('.'), typeName.lastIndexOf('::'));
     if (lastDot >= 0) typeName = typeName.slice(lastDot + 1).replace(/^[:.]/, '');
     typeName = typeName.trim() || 'Object';
@@ -5432,19 +5462,14 @@ export class TreeSitterExtractor {
     const classNode = this.createNode('class', anonName, node, {});
     if (!classNode) return;
 
-    // The anonymous class implicitly extends/implements the named type. The
-    // `extends` reference itself must NOT be truncated to the bare last
-    // segment the way the anon class's own name and the `instantiates` edge
-    // are: a NAMED class's real `extends IFoo.Stub` clause is extracted
-    // verbatim (untruncated) so qualified-name resolution can find the
-    // nested type. Truncating this to "Stub" loses the enclosing interface.
+    // The anonymous class implicitly extends/implements the named type.
     // We can't tell at extraction time whether T is a class or an interface,
     // so emit `extends`. Resolution will still bind T to whatever it is, and
     // Phase 5.5 (which already handles both `extends` and `implements`) will
     // bridge T's methods to the override names found in the anon body.
     this.unresolvedReferences.push({
       fromNodeId: classNode.id,
-      referenceName: fullTypeName,
+      referenceName: typeName,
       referenceKind: 'extends',
       line: typeNode?.startPosition.row ?? node.startPosition.row,
       column: typeNode?.startPosition.column ?? node.startPosition.column,
@@ -5458,128 +5483,6 @@ export class TreeSitterExtractor {
       if (child) this.visitNode(child);
     }
     this.nodeStack.pop();
-  }
-
-  /**
-   * Extract a Kotlin anonymous object expression — `object : IFoo.Stub() { ... }`
-   * — a common AIDL Stub implementation idiom. This has a different AST shape from Java/C#'s
-   * `object_creation_expression`, so it cannot reuse `extractAnonymousClass`:
-   *
-   *   object_literal
-   *     delegation_specifier            (one per supertype, repeatable —
-   *       constructor_invocation          Kotlin allows `object : Base(), I1, I2 { }`)
-   *         user_type
-   *           type_identifier ...         (dotted segments, e.g. IFoo, Stub)
-   *       -- OR, for an interface with no constructor call --
-   *       user_type
-   *         type_identifier ...
-   *     class_body
-   *
-   * Before this function existed, `object_literal` was not in
-   * INSTANTIATION_KINDS and had no anonymous-class handling at all, so this
-   * idiom produced neither an `instantiates` nor an `extends` reference —
-   * the interface→impl synthesizer cannot see these implementations.
-   */
-  private extractKotlinObjectLiteral(node: SyntaxNode): void {
-    if (!this.extractor) return;
-    const body = this.findAnonymousClassBody(node);
-    if (!body) return;
-
-    const delegationSpecifiers: SyntaxNode[] = [];
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
-      if (child && child.type === 'delegation_specifier') delegationSpecifiers.push(child);
-    }
-
-    // A specifier contains a constructor invocation, an explicit `by`
-    // delegation, or a bare interface type. Only the first constructs a
-    // supertype; a call in a delegate expression does not. Preserve all
-    // dotted name segments for qualified lookup, excluding type arguments.
-    const superTypes: { fullName: string; userType: SyntaxNode; hasCall: boolean }[] = [];
-    for (const spec of delegationSpecifiers) {
-      let userType: SyntaxNode | null = null;
-      let hasCall = false;
-      for (let i = 0; i < spec.namedChildCount; i++) {
-        const child = spec.namedChild(i);
-        if (!child) continue;
-        if (child.type === 'constructor_invocation' || child.type === 'explicit_delegation') {
-          hasCall = child.type === 'constructor_invocation';
-          for (let j = 0; j < child.namedChildCount; j++) {
-            const grandchild = child.namedChild(j);
-            if (grandchild && grandchild.type === 'user_type') {
-              userType = grandchild;
-              break;
-            }
-          }
-          break;
-        }
-        if (child.type === 'user_type') {
-          userType = child;
-          break;
-        }
-      }
-      if (!userType) continue;
-      // Read only direct name segments: Outer<T>.Inner<U> is Outer.Inner,
-      // and types nested in type_arguments are never supertypes themselves.
-      const fullName = userType.namedChildren
-        .filter((child) => child.type === 'type_identifier')
-        .map((child) => getNodeText(child, this.source).trim())
-        .join('.');
-      if (fullName) superTypes.push({ fullName, userType, hasCall });
-    }
-    // Header expressions execute in the enclosing scope, not as members of
-    // the new class. Visit each spec once so constructor arguments, delegates,
-    // and objects nested in either retain their calls and structure.
-    for (const spec of delegationSpecifiers) this.visitNode(spec);
-
-    if (this.nodeStack.length > 0) {
-      const fromId = this.nodeStack[this.nodeStack.length - 1];
-      const primaryCtor = superTypes.find((s) => s.hasCall);
-      if (fromId && primaryCtor) {
-        this.unresolvedReferences.push({
-          fromNodeId: fromId,
-          referenceName: primaryCtor.fullName,
-          referenceKind: 'instantiates',
-          line: node.startPosition.row + 1,
-          column: node.startPosition.column,
-        });
-      }
-    }
-
-    // The anon class's own (cosmetic) name uses the first supertype's bare
-    // last segment, matching extractAnonymousClass's convention.
-    let typeName = superTypes[0]?.fullName ?? 'Object';
-    const lastDot = typeName.lastIndexOf('.');
-    if (lastDot >= 0) typeName = typeName.slice(lastDot + 1);
-    typeName = typeName.trim() || 'Object';
-
-    // createNode IDs use name + line; include the column to distinguish
-    // same-type literals nested or adjacent on the same source line.
-    const anonName = `<${typeName}$anon@${node.startPosition.row + 1}:${node.startPosition.column}>`;
-    const classNode = this.createNode('class', anonName, node, {});
-    if (!classNode) return;
-
-    for (const { fullName, userType } of superTypes) {
-      this.unresolvedReferences.push({
-        fromNodeId: classNode.id,
-        referenceName: fullName,
-        referenceKind: 'extends',
-        line: userType.startPosition.row,
-        column: userType.startPosition.column,
-      });
-    }
-
-    this.nodeStack.push(classNode.id);
-    this.kotlinObjectScopeDepth++;
-    try {
-      for (let i = 0; i < body.namedChildCount; i++) {
-        const child = body.namedChild(i);
-        if (child) this.visitNode(child);
-      }
-    } finally {
-      this.kotlinObjectScopeDepth--;
-      this.nodeStack.pop();
-    }
   }
 
   /**
@@ -5598,6 +5501,21 @@ export class TreeSitterExtractor {
    * (most non-decorator-using languages), the function is a no-op.
    */
   private extractDecoratorsFor(declNode: SyntaxNode, decoratedId: string): void {
+    // Rust outer attributes are siblings, not children of the function.
+    // Preserve Tauri's runtime registration for the dead-code decorator rule.
+    if (this.language === 'rust' && declNode.type === 'function_item') {
+      for (let sibling = declNode.previousNamedSibling; sibling; sibling = sibling.previousNamedSibling) {
+        if (sibling.type === 'line_comment' || sibling.type === 'block_comment') continue;
+        if (sibling.type !== 'attribute_item') break;
+        const attribute = sibling.namedChild(0);
+        const name = attribute?.namedChild(0)?.text.replace(/\s/g, '');
+        if (name === 'tauri::command') {
+          const decorated = this.nodes.find(n => n.id === decoratedId);
+          if (decorated) decorated.decorators = ['tauri::command'];
+          break;
+        }
+      }
+    }
     const consider = (n: SyntaxNode | null): void => {
       if (!n) return;
       // Solidity `modifier_invocation` (unique to that grammar) sits
@@ -5908,6 +5826,71 @@ export class TreeSitterExtractor {
     return nameNode?.type === 'identifier' ? getNodeText(nameNode, this.source) : null;
   }
 
+  /**
+   * The declarator name for an anonymous function passed to a CURRIED wrapper
+   * call — `const NAME = factory(...)(function () {…})` — or the property key
+   * when the call is an object member, `{ NAME: factory(...)(fn) }`; else null.
+   *
+   * `reactHookBoundName` above already names a function through the declarator
+   * that binds it; the shape is general, but that method is deliberately
+   * bounded to the three React handler hooks. This is the same shape with a
+   * different, equally decidable bound: the callee is itself a call, i.e. a
+   * factory that returns the wrapper (#1747).
+   *
+   * Requiring the callee to be a call is what keeps this narrow. It admits
+   * `Effect.fn("Session.run")(function* () {…})`, `connect(mapState)(fn)` and
+   * a project's own `wrap("name")(fn)`, and it does not admit the one-call
+   * forms where the argument is a computation rather than a body worth a node
+   * of its own — `useMemo(() => 1 + 1, [])`, `arr.map(() => …)` — which stay
+   * anonymous exactly as before.
+   *
+   * Generators are included here and not in `reactHookBoundName`: a React
+   * handler is never a generator, while `function*` is the common form in the
+   * ecosystem this shape comes from.
+   */
+  private curriedWrapperBoundName(node: SyntaxNode): string | null {
+    if (
+      this.language !== 'typescript' &&
+      this.language !== 'javascript' &&
+      this.language !== 'tsx' &&
+      this.language !== 'jsx'
+    ) {
+      return null;
+    }
+    if (
+      node.type !== 'arrow_function' &&
+      node.type !== 'function_expression' &&
+      node.type !== 'generator_function'
+    ) {
+      return null;
+    }
+    const args = node.parent;
+    if (!args || args.type !== 'arguments') return null;
+    const first = args.namedChild(0);
+    if (!first || first.startIndex !== node.startIndex || first.endIndex !== node.endIndex) return null;
+    const call = args.parent;
+    if (!call || call.type !== 'call_expression') return null;
+    // The bound that replaces the hook allowlist: the thing being called is
+    // itself a call, so this is the second application of a curried wrapper.
+    const callee = getChildByField(call, 'function');
+    if (!callee || callee.type !== 'call_expression') return null;
+    const binder = call.parent;
+    if (!binder) return null;
+    // `{ getMode: Effect.fn("…")(function* () {…}) }` — a service is often an
+    // object a factory returns, so the wrapper's result lands in a `pair`. The
+    // property key names it, as extractObjectLiteralFunctions names
+    // `key: () => {}`.
+    if (binder.type === 'pair') {
+      const key = getChildByField(binder, 'key');
+      const value = getChildByField(binder, 'value');
+      if (!key || !value || value.startIndex !== call.startIndex || value.endIndex !== call.endIndex) return null;
+      return this.objectKeyName(key);
+    }
+    if (binder.type !== 'variable_declarator') return null;
+    const nameNode = getChildByField(binder, 'name');
+    return nameNode?.type === 'identifier' ? getNodeText(nameNode, this.source) : null;
+  }
+
   private visitFunctionBody(body: SyntaxNode, _functionId: string): void {
     if (!this.extractor) return;
 
@@ -5944,11 +5927,6 @@ export class TreeSitterExtractor {
           this.extractAnonymousClass(node, anonBody);
           return;
         }
-      } else if (nodeType === 'object_literal') {
-        // Kotlin `object : IFoo.Stub() { ... }` inside a function body —
-        // same rationale and structure as the visitNode branch above.
-        this.extractKotlinObjectLiteral(node);
-        return;
       } else if (this.extractor!.extractBareCall) {
         const calleeName = this.extractor!.extractBareCall(node, this.source);
         if (calleeName && this.nodeStack.length > 0) {
@@ -6077,6 +6055,16 @@ export class TreeSitterExtractor {
           this.extractFunction(node, hookBound);
           return;
         }
+        // `const run = Effect.fn("Session.run")(function* () {…})` (#1747) —
+        // the same declarator binding through a curried wrapper. Without a node
+        // the body's calls attribute to the enclosing container, so the file or
+        // the outer function picks up an outgoing edge that belongs to this
+        // function and the callee's caller list names the wrong thing.
+        const wrapperBound = this.curriedWrapperBoundName(node);
+        if (wrapperBound) {
+          this.extractFunction(node, wrapperBound);
+          return;
+        }
         // `const handleClear = () => {…}` inside a body (#1669) — the same
         // binding that names a function at module scope names one here, and in
         // a React component it is how every handler that skips `useCallback`
@@ -6099,6 +6087,7 @@ export class TreeSitterExtractor {
         else if (classification === 'enum') this.extractEnum(node);
         else if (classification === 'interface') this.extractInterface(node);
         else if (classification === 'trait') this.extractClass(node, 'trait');
+        else if (classification === 'module') this.extractClass(node, 'module');
         else this.extractClass(node);
         return;
       }

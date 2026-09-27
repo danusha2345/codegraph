@@ -647,13 +647,11 @@ export class GraphTraverser {
         budget.truncated = true;
         continue;
       }
-      if (firstExpansion) {
-        if (edges.length >= budget.maxEdges) {
-          budget.truncated = true;
-          continue;
-        }
-        edges.push(edge);
+      if (edges.length >= budget.maxEdges) {
+        budget.truncated = true;
+        continue;
       }
+      if (firstExpansion) edges.push(edge);
       if (this.nearerThanBefore(visited, sourceNode.id, currentDepth + 1)) {
         nodes.set(sourceNode.id, sourceNode);
         this.getImpactRecursive(sourceNode.id, maxDepth, currentDepth + 1, nodes, edges, visited, expanded, budget);

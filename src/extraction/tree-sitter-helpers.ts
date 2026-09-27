@@ -13,23 +13,37 @@ import { NodeKind } from '../types';
  * Generate a unique node ID
  *
  * Uses a 32-character (128-bit) hash to avoid collisions when indexing
- * large codebases with many files containing similar symbols. The optional
- * UTF-16 column distinguishes same-line declarations (HDL); omitted columns
- * preserve the existing identity format for other extraction paths.
+ * large codebases with many files containing similar symbols.
  */
 export function generateNodeId(
   filePath: string,
   kind: NodeKind,
   name: string,
-  line: number,
-  column?: number
+  line: number
 ): string {
   const hash = crypto
     .createHash('sha256')
-    .update(`${filePath}:${kind}:${name}:${line}${column === undefined ? '' : `:${column}`}`)
+    .update(`${filePath}:${kind}:${name}:${line}`)
     .digest('hex')
     .substring(0, 32);
   return `${kind}:${hash}`;
+}
+
+/** Per-extraction identities: preserve legacy IDs unless distinct source positions collide. */
+export class NodeIdAllocator {
+  private firstColumns = new Map<string, number>();
+
+  generate(filePath: string, kind: NodeKind, name: string, line: number, column: number): string {
+    const id = generateNodeId(filePath, kind, name, line);
+    const firstColumn = this.firstColumns.get(id);
+    if (firstColumn === undefined) {
+      this.firstColumns.set(id, column);
+      return id;
+    }
+    // Columns are zero-based UTF-16 code units in both wasm and the kernel.
+    // Revisiting the same declaration must still produce the same identity.
+    return firstColumn === column ? id : `${id}:${column}`;
+  }
 }
 
 /**

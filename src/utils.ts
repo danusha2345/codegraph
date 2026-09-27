@@ -311,19 +311,6 @@ export class FileLock {
   }
 
   /**
-   * PID written in the lock file when that process is alive — real contention —
-   * or null when the file is absent, unreadable, or names a dead process.
-   */
-  readLiveHolderPid(): number | null {
-    try {
-      const pid = parseInt(fs.readFileSync(this.lockPath, 'utf-8').trim(), 10);
-      return !Number.isNaN(pid) && this.isProcessAlive(pid) ? pid : null;
-    } catch {
-      return null;
-    }
-  }
-
-  /**
    * Release the lock
    */
   release(): void {

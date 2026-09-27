@@ -5,10 +5,10 @@
  */
 
 import * as fs from 'fs';
-import { readBoundedSourceSync } from '../file-limits';
 import * as path from 'path';
 import { Language, Node, UnresolvedReference, Edge } from '../types';
 import { QueryBuilder } from '../db/queries';
+import { SynthesisStage } from '../db/synthesis-stage';
 import {
   UnresolvedRef,
   ResolvedRef,
@@ -16,23 +16,24 @@ import {
   ResolutionContext,
   FrameworkResolver,
   ImportMapping,
-  SUPERTYPE_TARGET_KINDS,
+  isSupertypeTarget,
   isInheritanceRef,
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { matchKotlinReceiverChain, matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos, GO_STDLIB_PACKAGES } from './name-matcher';
+import { matchKotlinReceiverChain, matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, GO_STDLIB_PACKAGES } from './name-matcher';
+import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
+import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isVerilogMemberRef, matchVerilogMember } from './verilog-members';
 import { isVerilogPortRef, matchVerilogPort } from './verilog-ports';
 import { isVerilogWildcardRef, matchVerilogWildcard } from './verilog-wildcard';
-import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
-import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
+import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
@@ -40,8 +41,8 @@ import { logDebug } from '../errors';
 import { lexicalPathWithinRoot } from '../utils';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
-import { memoryBudgetBytes } from './memory-budget';
 import { JS_BUILT_INS } from './js-builtins';
+import { memoryBudgetBytes } from './memory-budget';
 
 /** Node kinds that can declare supertypes (extends/implements). */
 const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
@@ -432,7 +433,12 @@ export class ReferenceResolver {
       // Import resolvers may follow package metadata to an archive (`file:*.har`,
       // for example). Reject anything extraction would not accept before UTF-8
       // decoding can multiply a large binary blob into gigabytes of V8 heap.
-      const content = readBoundedSourceSync(fullPath).bytes?.toString('utf8') ?? null;
+      const stats = fs.statSync(fullPath);
+      if (!stats.isFile() || stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
+        this.fileCache.set(filePath, null);
+        return null;
+      }
+      const content = fs.readFileSync(fullPath, 'utf-8');
       this.fileCache.set(filePath, content);
       return content;
     } catch (error) {
@@ -635,7 +641,9 @@ export class ReferenceResolver {
         if (hit && hit.gen === this.supertypeGen) return hit.supers;
         const typeNodes = this.context
           .getNodesByName(typeName)
-          .filter((n) => SUPERTYPE_BEARING_KINDS.has(n.kind) && n.language === language);
+          // Scala singletons can inherit members even though they cannot be parents.
+          .filter((n) => n.language === language && (SUPERTYPE_BEARING_KINDS.has(n.kind) ||
+            (n.language === 'scala' && n.kind === 'module')));
         let supers: string[];
         if (typeNodes.length === 0) {
           supers = [];
@@ -892,7 +900,10 @@ export class ReferenceResolver {
     // translation unit is a macro expansion, not a call — it must never bind
     // to a same-named function in another file (#1838).
     if (isVisibleCppMacro(ref, this.context)) return null;
-    const resolved = this.gateTargetKind(this.resolveOneInner(ref), ref);
+    const candidate = this.gateTargetKind(this.resolveOneInner(ref), ref);
+    const resolved = candidate?.resolvedBy === 'framework'
+      ? this.gateFrameworkLanguage(candidate, ref)
+      : this.gateLanguage(candidate, ref);
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
 
     const target = this.queries.getNodeById(resolved.targetNodeId);
@@ -903,20 +914,21 @@ export class ReferenceResolver {
     const forwarded = resolveAliasBinding(target, memberName, this.context);
     if (!forwarded || forwarded.id === resolved.targetNodeId) return resolved;
 
-    return {
+    return this.gateLanguage({
       ...resolved,
       targetNodeId: forwarded.id,
       confidence: Math.min(resolved.confidence, 0.85),
-    };
+    }, ref);
   }
 
   private resolveOneInner(ref: UnresolvedRef): ResolvedRef | null {
-    if (isVerilogWildcardRef(ref)) return matchVerilogWildcard(ref, this.context, matchReference);
-    if (isVerilogPortRef(ref)) return matchVerilogPort(ref, this.context, matchReference);
-    if (isVerilogMemberRef(ref)) return matchVerilogMember(ref, this.context);
     // A local C++ object construction (`T obj(args)`, ref `ns::T::T/1`)
     // resolves ONLY to a constructor of the lexically nearest `T` (#1839).
     if (isCppConstructorRef(ref)) return matchCppConstructor(ref, this.context);
+
+    if (isVerilogWildcardRef(ref)) return matchVerilogWildcard(ref, this.context, matchReference);
+    if (isVerilogPortRef(ref)) return matchVerilogPort(ref, this.context, matchReference);
+    if (isVerilogMemberRef(ref)) return matchVerilogMember(ref, this.context);
     // A Kotlin call through a receiver chain (`engine.pump.drain()`) resolves
     // on the chain's declared type, or gets no edge when that type is a
     // library one. An untyped chain resolves as the bare method name, the ref
@@ -992,6 +1004,9 @@ export class ReferenceResolver {
       if (ref.referenceName.startsWith('this.')) {
         return this.gateLanguage(this.resolveThisMemberFnRef(ref), ref);
       }
+      if ((ref.language === 'python' || ref.language === 'go') && ref.referenceName.includes('.')) {
+        return this.gateLanguage(matchFunctionRef(ref, this.context), ref);
+      }
       const viaImport = this.gateLanguage(resolveViaImport(ref, this.context), ref);
       if (viaImport) {
         const target = this.queries.getNodeById(viaImport.targetNodeId);
@@ -1038,9 +1053,7 @@ export class ReferenceResolver {
 
     // Strategy 1: Try framework-specific resolution. Cross-language bridges
     // are deliberately preserved (Drupal `routing.yml` → PHP controller, RN
-    // JS → native `calls`) — `gateFrameworkLanguage` only drops a type/import
-    // edge between two KNOWN families (see its doc), never a `calls` bridge or
-    // a config↔code edge.
+    // JS → native `calls`); other code references obey the shared family gate.
     const tFw = this.profileStages ? process.hrtime.bigint() : 0n;
     let fwEarly: ResolvedRef | null = null;
     for (const framework of this.frameworks) {
@@ -1721,7 +1734,8 @@ export class ReferenceResolver {
        *  each per-batch DELETE's B-tree work (DatabaseConnection.beginBulkRefLoad). */
       refIndexLoad?: { begin: () => void; end: () => void | Promise<void> };
       backpressure?: () => Promise<void> | null;
-    }
+    },
+    synthesize: boolean = true
   ): Promise<ResolutionResult> {
     // Resolution runs on the indexer's MAIN thread, and the #850 liveness
     // watchdog SIGKILLs a process whose event loop stalls past its window (60s
@@ -2143,7 +2157,7 @@ export class ReferenceResolver {
     // loop. See docs/design/callback-edge-synthesis.md.
     const tSynth = Date.now();
     try {
-      aggregateStats.byMethod['callback-synthesis'] = await synthesizeCallbackEdges(
+      if (synthesize) aggregateStats.byMethod['callback-synthesis'] = await synthesizeCallbackEdges(
         this.queries,
         this.context,
         onSynthesisProgress,
@@ -2169,6 +2183,25 @@ export class ReferenceResolver {
       unresolved: [],
       stats: aggregateStats,
     };
+  }
+
+  /** Replace synthesis only after every base-resolution pass has finished. */
+  async refreshSynthesis(
+    dbPath: string,
+    onProgress?: (done: number, total: number) => void,
+    backpressure?: () => Promise<void> | null
+  ): Promise<number> {
+    this.clearCaches();
+    const stage = new SynthesisStage(dbPath);
+    try {
+      const fresh = new ReferenceResolver(this.projectRoot, stage.queries);
+      const count = await synthesizeCallbackEdges(stage.queries, fresh.context, onProgress, null, backpressure);
+      await stage.publish(backpressure);
+      return count;
+    } finally {
+      stage.close();
+      this.clearCaches();
+    }
   }
 
   /**
@@ -2373,18 +2406,6 @@ export class ReferenceResolver {
     return node?.language || 'unknown';
   }
 
-  /**
-   * Drop an import/name-strategy resolution that crosses a language family.
-   * Two regimes (mirrors `applyLanguageGate`'s candidate filter):
-   *  - `references` (type usage): STRICT — a `Type.member` static read names a
-   *    same-family type, never a coincidentally same-named symbol in another
-   *    language. Drops any non-same-family target.
-   *  - `imports` (import binding / `#include`): both-known — a C++ `#include
-   *    "X.h"` must not resolve to a same-named ObjC header on another platform
-   *    (basename collision), but a singleton-family / SFC language (`vue` →
-   *    `.ts`) importing across is left alone.
-   * Applies to the import (strategy 2) + name-match (strategy 3) results.
-   */
   /**
    * Collect the `@using` namespaces in scope for a `.razor`/`.cshtml` file: its
    * own `@using` directives plus every `_Imports.razor` from the file's folder up
@@ -2722,40 +2743,28 @@ export class ReferenceResolver {
 
     if (!isInheritanceRef(ref)) return result;
     const target = this.queries.getNodeById(result.targetNodeId);
-    if (target && !SUPERTYPE_TARGET_KINDS.has(target.kind)) return null;
+    if (target && !isSupertypeTarget(target)) return null;
     if (isBoundToOutOfRepoImport(ref, this.context)) return null;
     return result;
   }
 
   private gateLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result) return result;
-    const tgt = this.getLanguageFromNodeId(result.targetNodeId);
-    if (!tgt || !ref.language) return result;
-    if ((ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') && !sameLanguageFamily(tgt, ref.language)) return null;
-    if (ref.referenceKind === 'imports' && crossesKnownFamily(tgt, ref.language)) return null;
-    return result;
+    return gateLanguageMatch(result, ref, this.context);
   }
 
   /**
-   * Drop a FRAMEWORK-strategy resolution that crosses two *known* language
-   * families for a type-usage (`references`) or import-binding (`imports`)
-   * edge. The framework strategy is intentionally ungated for cross-language
-   * bridges, but those legitimate bridges are either `calls` edges (RN/Expo
-   * JS → native) or config↔code edges whose config side (`yaml`/`blade`/…) is
-   * not a known programming-language family. A `references`/`imports` edge
-   * between two *known* families is always a coincidental name collision — the
-   * React/Svelte/Vue PascalCase component resolvers name-match `getNodesByName`
-   * without a language check, so a TS `<TestRunner>` ref happily matched a
-   * Kotlin `class TestRunner`. Gating only the both-known-cross-family case
-   * lets config bridges and `calls` bridges through untouched.
+   * Framework calls carry bridge evidence (RN/Expo JS → native). Other
+   * framework results obey the same code-family boundary as name matches;
+   * markup/config transitions remain open.
    */
   private gateFrameworkLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result) return result;
-    if (ref.referenceKind !== 'references' && ref.referenceKind !== 'imports') return result;
+    if (ref.referenceKind === 'calls') return result;
     const tgt = this.getLanguageFromNodeId(result.targetNodeId);
     // Package imports cannot target prose found by a framework's name lookup.
     if (ref.referenceKind === 'imports' && (tgt as string) === 'markdown' && (ref.language as string) !== 'markdown') return null;
-    if (tgt && ref.language && crossesKnownFamily(tgt, ref.language)) return null;
+    if (tgt && ref.language && crossesCodeBoundary(tgt, ref.language)) return null;
     return result;
   }
 }

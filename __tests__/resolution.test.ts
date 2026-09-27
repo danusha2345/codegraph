@@ -39,55 +39,48 @@ describe('Resolution Module', () => {
     fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 5 });
   });
 
+  it.each(['c', 'cpp'] as const)('connects single-argument function macros in %s (#1373)', async (language) => {
+    const file = `main.${language}`;
+    fs.writeFileSync(path.join(tempDir, file), [
+      '#define NATIVE_FN(name) int name(void)',
+      'int helper(void) { return 1; }',
+      'NATIVE_FN(get_version) { return helper(); }',
+      'int use_it(void) { return get_version(); }',
+      'int plain_func(void) { return 42; }',
+      '',
+    ].join('\n'));
+    cg = await CodeGraph.init(tempDir, { index: true });
+    const functions = cg.getNodesByKind('function');
+    const recovered = functions.find((n) => n.name === 'get_version');
+    expect(recovered).toBeDefined();
+    expect(cg.getCallers(recovered!.id).map((c) => c.node.name)).toContain('use_it');
+    expect(cg.getCallees(recovered!.id).map((c) => c.node.name)).toContain('helper');
+    const caller = functions.find((n) => n.name === 'use_it')!;
+    expect(cg.getCallees(caller.id).map((c) => c.node.id)).toContain(recovered!.id);
+    expect(functions.map((n) => n.name)).toContain('plain_func');
+    const { ToolHandler } = await import('../src/mcp/tools');
+    const result = await new ToolHandler(cg).execute('codegraph_explore', { query: 'use_it get_version helper' });
+    expect(result.isError).toBeUndefined();
+    const text = result.content[0]!.text!;
+    expect(text).toContain('Flow');
+    expect(text).toMatch(/use_it[^\n]*get_version[^\n]*helper/);
+
+  });
+
+  it('does not turn cross-language name collisions into call or constructor edges (#1986)', async () => {
+    fs.writeFileSync(path.join(tempDir, 'foreign.py'), 'class ForeignThing:\n    pass\ndef mystery():\n    pass\n');
+    fs.writeFileSync(path.join(tempDir, 'caller.ts'), 'export function build() { return new ForeignThing(); }');
+    fs.writeFileSync(path.join(tempDir, 'Caller.swift'), 'func consumer() { mystery() }');
+    cg = await CodeGraph.init(tempDir, { silent: true });
+    await cg.indexAll();
+    for (const name of ['build', 'consumer']) {
+      const caller = cg.getNodesByName(name).find((n) => n.kind === 'function')!;
+      expect(caller).toBeDefined();
+      expect(cg.getOutgoingEdges(caller.id).filter((e) => e.kind === 'calls' || e.kind === 'instantiates')).toEqual([]);
+    }
+  });
+
   describe('Name Matcher', () => {
-    it('does not match a Kotlin local anonymous-object method from a sibling function', () => {
-      const node = (id: string, kind: Node['kind'], name: string, qualifiedName: string, filePath: string, startLine: number, endLine: number): Node => ({
-        id, kind, name, qualifiedName, filePath, language: 'kotlin',
-        startLine, endLine, startColumn: 0, endColumn: 0, updatedAt: 0,
-      });
-      const outer = node('outer', 'method', 'otherTest', 'ProbeTest::otherTest', 'ProbeTest.kt', 10, 20);
-      const anon = node('anon', 'class', '<Probe$anon@12:8>', 'ProbeTest::otherTest::<Probe$anon@12:8>', 'ProbeTest.kt', 12, 18);
-      const localMethod = node('local', 'method', 'probe', `${anon.qualifiedName}::probe`, 'ProbeTest.kt', 13, 17);
-      const interfaceMethod = node('interface', 'method', 'probe', 'Probe::probe', 'Probe.kt', 1, 2);
-      const nodes = [outer, anon, localMethod, interfaceMethod];
-      const context = {
-        getNodesByName: (name: string) => nodes.filter((n) => n.name === name),
-        getNodesByQualifiedName: (name: string) => nodes.filter((n) => n.qualifiedName === name),
-        getNodesInFile: (filePath: string) => nodes.filter((n) => n.filePath === filePath),
-        getNodesByKind: (kind: Node['kind']) => nodes.filter((n) => n.kind === kind),
-        fileExists: () => true, readFile: () => null,
-        getProjectRoot: () => tempDir, getAllFiles: () => ['ProbeTest.kt', 'Probe.kt'],
-      } as ResolutionContext;
-      const ref: UnresolvedRef = {
-        fromNodeId: 'testA', referenceName: 'probe.probe', referenceKind: 'calls',
-        filePath: 'ProbeTest.kt', language: 'kotlin', line: 5, column: 0,
-      };
-
-      expect(matchMethodCall(ref, context)?.targetNodeId).toBe(interfaceMethod.id);
-      expect(matchMethodCall({ ...ref, fromNodeId: outer.id, line: 15 }, context)?.targetNodeId).toBe(localMethod.id);
-    });
-
-    it('accepts every supported supertype kind in exact-name inheritance matching', () => {
-      for (const kind of ['component', 'namespace'] as const) {
-        const target: Node = {
-          id: `${kind}:base`, kind, name: 'Base', qualifiedName: 'Base',
-          filePath: 'model.ts', language: 'typescript', startLine: 1, endLine: 1,
-          startColumn: 0, endColumn: 0, updatedAt: 0,
-        };
-        const context = {
-          getNodesByName: () => [target], getNodesInFile: () => [target],
-          getNodesByQualifiedName: () => [], getNodesByKind: () => [],
-          fileExists: () => true, readFile: () => null,
-          getProjectRoot: () => tempDir, getAllFiles: () => ['model.ts'],
-        } as ResolutionContext;
-        const ref: UnresolvedRef = {
-          fromNodeId: 'class:derived', referenceName: 'Base', referenceKind: 'extends',
-          filePath: 'model.ts', language: 'typescript', line: 2, column: 0,
-        };
-        expect(matchByExactName(ref, context)?.targetNodeId).toBe(target.id);
-      }
-    });
-
     it('should match exact name references', () => {
       // Create a mock context
       const mockNodes: Node[] = [
@@ -5276,6 +5269,151 @@ class Use {
         cg = await CodeGraph.init(tempDir, { index: true });
         expect(edgesFrom('load')).toContainEqual({ kind: 'calls', qn: 'com.acme.http::WebSocket::fromString', lang: 'java' });
       });
+
+      it('resolves Outer.Inner(...) to a nested Scala object that defines apply', async () => {
+        // A Scala `object` is indexed as a `module`, not a class.
+        write('scala/app/WebSocket.scala', `package app
+object WebSocket {
+  object Accepted {
+    def apply(flow: String): String = flow
+  }
+}
+`);
+        write('scala/app/Use.scala', `package app
+class Use {
+  def accept(): Unit = { WebSocket.Accepted("f") }
+}
+`);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const out = edgesFrom('accept');
+        expect(out.filter((e) => e.lang === 'java')).toEqual([]);
+        expect(out).toContainEqual({ kind: 'calls', qn: 'WebSocket::Accepted', lang: 'scala' });
+      });
+
+      it('prefers the case class over its companion object declared first', async () => {
+        write('scala/app/WebSocket.scala', `package app
+object WebSocket {
+  object Accepted {
+    def apply(): Accepted = Accepted("default")
+  }
+  final case class Accepted(flow: String)
+}
+`);
+        write('scala/app/Use.scala', `package app
+class Use {
+  def accept(): Unit = { WebSocket.Accepted("f") }
+}
+`);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const out = edgesFrom('accept');
+        expect(out.filter((e) => e.lang === 'java')).toEqual([]);
+        expect(out).toContainEqual({ kind: 'instantiates', qn: 'WebSocket::Accepted', lang: 'scala' });
+        expect(out).not.toContainEqual({ kind: 'calls', qn: 'WebSocket::Accepted', lang: 'scala' });
+      });
+    });
+  });
+
+  describe('Scala companion object vs extends resolution', () => {
+    for (const parentKind of ['trait', 'class'] as const) {
+      for (const objectFirst of [true, false]) {
+        it.each([false, true])(
+          `resolves ${parentKind} companions (objectFirst=${objectFirst}, imported=%s) through every impact depth`,
+          async (imported) => {
+            const typeDef = `${parentKind} ExtAgreement {
+  def extId: String = "x"
+}
+`;
+            const objectDef = `object ExtAgreement {
+  val Kind = "agreement"
+}
+`;
+            fs.writeFileSync(path.join(tempDir, 'ExtAgreement.scala'),
+              'package contracts\n' + (objectFirst ? objectDef + typeDef : typeDef + objectDef));
+            fs.writeFileSync(path.join(tempDir, 'Audit.scala'),
+              'package contracts\nobject Audit {}\ntrait Audit { def audit(): String = "ok" }\n');
+            fs.writeFileSync(path.join(tempDir, 'MExtAgreement.scala'),
+              (imported ? 'package model\nimport contracts.ExtAgreement\nimport contracts.Audit\n' : 'package contracts\n') +
+              'class MExtAgreement extends ExtAgreement with Audit {\n  def render(): String = extId\n}\n');
+            fs.writeFileSync(path.join(tempDir, 'LeafAgreement.scala'),
+              (imported ? 'package model\n' : 'package contracts\n') +
+              'class LeafAgreement extends MExtAgreement {\n  def leaf(): String = render()\n}\n');
+            cg = await CodeGraph.init(tempDir, { index: true });
+
+            const parent = cg.getNodesByKind(parentKind).find((n) => n.name === 'ExtAgreement');
+            const companion = cg.getNodesByKind('module').find((n) => n.name === 'ExtAgreement');
+            expect(parent).toBeDefined();
+            expect(companion).toBeDefined();
+            expect(cg.getIncomingEdges(parent!.id).filter((e) => e.kind === 'extends')).toHaveLength(1);
+            for (const name of ['ExtAgreement', 'Audit']) {
+              const obj = cg.getNodesByKind('module').find((n) => n.name === name)!;
+              expect(cg.getIncomingEdges(obj.id).filter((e) => e.kind === 'extends')).toEqual([]);
+            }
+            const audit = cg.getNodesByKind('trait').find((n) => n.name === 'Audit')!;
+            expect(cg.getIncomingEdges(audit.id).filter((e) => e.kind === 'extends')).toHaveLength(1);
+
+            // Impact must traverse THROUGH the type to descendants and their methods.
+            const impactNames = [...cg.getImpactRadius(parent!.id, 5).nodes.values()].map((n) => n.name);
+            expect(impactNames).toEqual(expect.arrayContaining(['MExtAgreement', 'render', 'LeafAgreement', 'leaf']));
+          }
+        );
+      }
+    }
+
+    it.each([false, true])('rejects a sole singleton parent (imported=%s)', async (imported) => {
+      fs.writeFileSync(path.join(tempDir, 'OnlyObject.scala'),
+        'package contracts\nobject OnlyObject { def value(): Int = 1 }\n');
+      fs.writeFileSync(path.join(tempDir, 'Invalid.scala'),
+        (imported ? 'package model\nimport contracts.OnlyObject\n' : 'package contracts\n') +
+        'class Invalid extends OnlyObject {}\ntrait AlsoInvalid extends OnlyObject {}\n');
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const obj = cg.getNodesByKind('module').find((n) => n.name === 'OnlyObject')!;
+      expect(obj).toBeDefined();
+      expect(cg.getIncomingEdges(obj.id).filter((e) => e.kind === 'extends' || e.kind === 'implements')).toEqual([]);
+    });
+
+    it('keeps singleton objects as inheritance sources and owners of methods', async () => {
+      fs.writeFileSync(path.join(tempDir, 'Service.scala'),
+        'trait Service { def inherited(): Int = 1 }\nobject LiveService extends Service { def run(): Int = this.inherited() }\n');
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const service = cg.getNodesByKind('trait').find((n) => n.name === 'Service')!;
+      const obj = cg.getNodesByKind('module').find((n) => n.name === 'LiveService')!;
+      expect(cg.getIncomingEdges(service.id).some((e) => e.kind === 'extends' && e.source === obj.id)).toBe(true);
+      const run = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'LiveService::run')!;
+      expect(cg.getOutgoingEdges(obj.id).some((e) => e.kind === 'contains' && e.target === run.id)).toBe(true);
+      const inherited = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Service::inherited')!;
+      expect(cg.getIncomingEdges(inherited.id).some((e) => e.kind === 'calls' && e.source === run.id)).toBe(true);
+    });
+
+    it('resolves inherited methods through a singleton receiver', async () => {
+      fs.writeFileSync(path.join(tempDir, 'Service.scala'),
+        'trait Service { def inherited(): Int = 1 }\n' +
+        'object LiveService extends Service {}\n' +
+        'object Unrelated { def inherited(): Int = 2 }\n' +
+        'object Client { def use(): Int = { val receiver = LiveService; receiver.inherited() } }\n');
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const inherited = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Service::inherited')!;
+      const use = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Client::use')!;
+      expect(cg.getIncomingEdges(inherited.id).some((e) => e.kind === 'calls' && e.source === use.id)).toBe(true);
+    });
+
+    it('keeps object method calls anchored to their receiver', async () => {
+      fs.writeFileSync(path.join(tempDir, 'Api.scala'),
+        'class API { def send(): Int = 2 }\n' +
+        'object Api { def send(): Int = 1 }\n' +
+        'object Client { def run(): Int = Api.send() }\n');
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const send = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Api::send')!;
+      const run = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Client::run')!;
+      expect(cg.getIncomingEdges(send.id).some((e) => e.kind === 'calls' && e.source === run.id)).toBe(true);
+    });
+
+    it('preserves Ruby module inclusion', async () => {
+      fs.writeFileSync(path.join(tempDir, 'trackable.rb'),
+        'module Trackable\n  def track; end\nend\nclass Record\n  include Trackable\nend\n');
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const mod = cg.getNodesByKind('module').find((n) => n.name === 'Trackable')!;
+      expect(cg.getIncomingEdges(mod.id).some((e) =>
+        (e.kind === 'extends' || e.kind === 'implements') && cg.getNode(e.source)?.name === 'Record')).toBe(true);
     });
   });
 
@@ -6026,54 +6164,6 @@ in
     });
   });
 
-  describe('A dotted qualified extends/implements reference resolves to a real nested type', () => {
-    it('resolves `extends Outer.Inner` (named class) and `new Outer.Inner() { ... }` (anonymous class) to the SAME real, indexed nested type', async () => {
-      // Every qualifiedName the engine builds joins scope with `::`
-      // (buildQualifiedName), but a Java/C# extends clause or anonymous-class
-      // constructor type is recorded verbatim with a dot (`Outer.Inner`). A
-      // real in-project nested type must still resolve — this is not an
-      // AOSP-specific concern (an absent AIDL Stub staying unresolved is
-      // correct there), it's the general case where the target genuinely
-      // exists in the index.
-      fs.writeFileSync(
-        path.join(tempDir, 'Host.java'),
-        `package p;
-class Outer { static class Inner { public void run() {} } }
-class Named extends Outer.Inner {}
-class Host {
-    Object field = new Outer.Inner() { public void run() {} };
-}
-`
-      );
-
-      cg = await CodeGraph.init(tempDir, { index: true });
-      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
-      const innerId = db
-        .getDb()
-        .prepare("select id from nodes where kind = 'class' and name = 'Inner'")
-        .get() as { id: string } | undefined;
-      expect(innerId, 'the real Outer.Inner class should be indexed').toBeDefined();
-
-      const extendsTargets = db
-        .getDb()
-        .prepare(
-          `select src.name as sourceName, dst.id as targetId
-             from edges e
-             join nodes src on src.id = e.source
-             join nodes dst on dst.id = e.target
-            where e.kind = 'extends' and dst.id = ?`
-        )
-        .all(innerId!.id) as Array<{ sourceName: string; targetId: string }>;
-
-      const sourceNames = extendsTargets.map((r) => r.sourceName).sort();
-      // `Named` (a real named class) and the anonymous class inside `Host`
-      // (named `<Inner$anon@...>`) must BOTH resolve their extends edge to
-      // the real `Inner` node — neither should stay in unresolved_refs.
-      expect(sourceNames.some((n) => n === 'Named')).toBe(true);
-      expect(sourceNames.some((n) => /Inner\$anon@/.test(n))).toBe(true);
-    });
-  });
-
   describe('Bindings in a module that exports nothing (#1719)', () => {
     it('does not treat documentation headings as package imports', () => {
       // Inject the planned Markdown node shape without depending on its extractor.
@@ -6337,115 +6427,6 @@ bracketed()
       expect(reachedFrom('consumer.ts', 'StrayFace')).toBe(true);
       expect(reachedFrom('consumer.ts', 'HiddenFace')).toBe(false);
     }, 30000);
-  });
-
-  describe('Inheritance references never use method-call resolution', () => {
-    it('does not resolve bare extends/implements names to same-named methods', async () => {
-      fs.writeFileSync(
-        path.join(tempDir, 'Hierarchy.java'),
-        `class Child extends Missing {}
-class Implementer implements Missing {}
-class Other {
-  void Missing() {}
-}
-`
-      );
-
-      cg = await CodeGraph.init(tempDir, { index: true });
-      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
-      const rows = db
-        .getDb()
-        .prepare(
-          `select src.name as sourceName, dst.kind as targetKind
-             from edges e
-             join nodes src on src.id = e.source
-             join nodes dst on dst.id = e.target
-            where e.kind in ('extends', 'implements')
-              and src.name in ('Child', 'Implementer')`
-        )
-        .all() as Array<{ sourceName: string; targetKind: string }>;
-
-      expect(rows.filter((row) => row.targetKind === 'method')).toEqual([]);
-    });
-
-    it('does not resolve Java extends IBar.Stub to an unrelated Stub constructor', async () => {
-      // IBar intentionally has no in-project declaration: this mirrors generated
-      // AIDL Stub bases that are absent from a sparse source checkout. An explicit
-      // constructor is required because implicit Java constructors are not nodes.
-      fs.writeFileSync(
-        path.join(tempDir, 'AService.java'),
-        `package com.example;
-class AService {
-  final class BinderService extends IBar.Stub {}
-}
-`
-      );
-      fs.writeFileSync(
-        path.join(tempDir, 'UiModeManagerService.java'),
-        `package com.example;
-class UiModeManagerService {
-  class Stub { Stub() {} }
-}
-`
-      );
-
-      cg = await CodeGraph.init(tempDir, { index: true });
-      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
-      const rows = db
-        .getDb()
-        .prepare(
-          `select dst.kind as targetKind, dst.qualified_name as targetQualifiedName,
-                  e.metadata as metadata
-             from edges e
-             join nodes src on src.id = e.source
-             join nodes dst on dst.id = e.target
-            where e.kind = 'extends' and src.name = 'BinderService'`
-        )
-        .all() as Array<{ targetKind: string; targetQualifiedName: string; metadata: string }>;
-
-      // An inheritance reference is a type reference, never a receiver.method()
-      // call. In particular, an absent IBar must not make `Stub` fall through to
-      // the sole same-named constructor elsewhere in the project.
-      expect(rows.filter((row) => row.targetKind === 'method')).toEqual([]);
-    });
-
-    it('resolves a nested Java supertype to the closest source tree', async () => {
-      for (const tree of ['framework', 'androidx']) {
-        const dir = path.join(tempDir, tree);
-        fs.mkdirSync(dir);
-        fs.writeFileSync(path.join(dir, 'RecyclerView.java'),
-          `package ${tree}; class RecyclerView { static class LayoutManager {} }`);
-      }
-      fs.writeFileSync(path.join(tempDir, 'androidx', 'LinearLayoutManager.java'),
-        'package androidx; class LinearLayoutManager extends RecyclerView.LayoutManager {}');
-
-      cg = await CodeGraph.init(tempDir, { index: true });
-      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
-      const rows = db.getDb().prepare(
-        `select dst.file_path as targetPath from edges e
-         join nodes src on src.id = e.source
-         join nodes dst on dst.id = e.target
-         where e.kind = 'extends' and src.name = 'LinearLayoutManager'`
-      ).all() as Array<{ targetPath: string }>;
-      expect(rows.map((row) => row.targetPath)).toEqual(['androidx/RecyclerView.java']);
-    });
-
-    it('does not let Spring naming conventions invent an inheritance edge', async () => {
-      fs.writeFileSync(path.join(tempDir, 'Service.java'),
-        '@Service class Service {} class Child implements View.OnClickListener {}');
-      fs.writeFileSync(path.join(tempDir, 'OnClickListener.java'),
-        'package unrelated; class OnClickListener {}');
-
-      cg = await CodeGraph.init(tempDir, { index: true });
-      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
-      const rows = db.getDb().prepare(
-        `select dst.qualified_name as target from edges e
-         join nodes src on src.id = e.source
-         join nodes dst on dst.id = e.target
-         where e.kind = 'implements' and src.name = 'Child'`
-      ).all() as Array<{ target: string }>;
-      expect(rows).toEqual([]);
-    });
   });
 
   describe('Name-only method match never binds a delegating call to its own caller', () => {

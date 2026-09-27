@@ -62,7 +62,6 @@ import { BROWSER_ENV, DEFAULT_UI_PORT } from '../ui-server/constants';
 import type { UiServerHandle } from '../ui-server';
 import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
 import type { Node, Edge } from '../types';
-import type { SyncResult } from '../extraction';
 import { isTestPath } from '../search/query-utils';
 
 // Decided once, before `--color`/`--no-color` are stripped from argv below
@@ -968,65 +967,45 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
 
-      // sync() returns all-zero counts when it could not take the index lock.
-      // That is not "up to date": say why, and exit 1 even under --quiet,
-      // which suppresses progress but never a failure. Only a live holder is
-      // contention; any other lock failure keeps the lock's own message.
-      const lockedMessage = (result: SyncResult): string | null => {
-        if (result.skippedReason === 'locked') {
-          const holder = result.lockHolderPid != null ? ` (PID ${result.lockHolderPid})` : '';
-          return `Nothing synced: another process holds the index lock${holder}. Retry, or run "codegraph sync" when it exits.`;
+      try {
+        if (options.quiet) {
+          await cg.sync();
+          return;
         }
-        if (result.skippedReason === 'lock-failed') {
-          return `Nothing synced: the index lock could not be taken. ${result.lockError ?? ''}`.trimEnd();
-        }
-        return null;
-      };
 
-      if (options.quiet) {
-        const result = await cg.sync();
+        const clack = await importESM('@clack/prompts');
+        clack.intro('Syncing CodeGraph');
+
+        process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+        const progress = createShimmerProgress();
+
+        const result = await cg.sync({
+          onProgress: progress.onProgress,
+        }).finally(() => progress.stop());
+
+        const totalChanges = result.filesAdded + result.filesModified + result.filesRemoved;
+
+        if (totalChanges === 0 && !result.pendingRefsProcessed) {
+          clack.log.info('Already up to date');
+        } else if (totalChanges > 0) {
+          clack.log.success(`Synced ${formatNumber(totalChanges)} changed files`);
+          const details: string[] = [];
+          if (result.filesAdded > 0) details.push(`Added: ${result.filesAdded}`);
+          if (result.filesModified > 0) details.push(`Modified: ${result.filesModified}`);
+          if (result.filesRemoved > 0) details.push(`Removed: ${result.filesRemoved}`);
+          clack.log.info(`${details.join(', ')} ${getGlyphs().dash} ${formatNumber(result.nodesUpdated)} nodes in ${formatDuration(result.durationMs)}`);
+        }
+
+        if (result.pendingRefsProcessed) {
+          const unresolved = result.pendingRefsUnresolved
+            ? ` (${formatNumber(result.pendingRefsUnresolved)} unresolved)` : '';
+          clack.log.info(`Resolved ${formatNumber(result.pendingRefsResolved ?? 0)} pending references${unresolved}`);
+        }
+
+        clack.outro('Done');
+      } finally {
         cg.destroy();
-        const locked = lockedMessage(result);
-        if (locked) {
-          process.stderr.write(`codegraph sync: ${locked}\n`);
-          process.exit(1);
-        }
-        return;
       }
-
-      const clack = await importESM('@clack/prompts');
-      clack.intro('Syncing CodeGraph');
-
-      process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-      const progress = createShimmerProgress();
-
-      const result = await cg.sync({
-        onProgress: progress.onProgress,
-      });
-
-      await progress.stop();
-
-      const locked = lockedMessage(result);
-      if (locked) {
-        cg.destroy();
-        throw new Error(locked);
-      }
-
-      const totalChanges = result.filesAdded + result.filesModified + result.filesRemoved;
-
-      if (totalChanges === 0) {
-        clack.log.info('Already up to date');
-      } else {
-        clack.log.success(`Synced ${formatNumber(totalChanges)} changed files`);
-        const details: string[] = [];
-        if (result.filesAdded > 0) details.push(`Added: ${result.filesAdded}`);
-        if (result.filesModified > 0) details.push(`Modified: ${result.filesModified}`);
-        if (result.filesRemoved > 0) details.push(`Removed: ${result.filesRemoved}`);
-        clack.log.info(`${details.join(', ')} ${getGlyphs().dash} ${formatNumber(result.nodesUpdated)} nodes in ${formatDuration(result.durationMs)}`);
-      }
-
-      clack.outro('Done');
-      cg.destroy();
     } catch (err) {
       if (!options.quiet) {
         error(`Failed to sync: ${err instanceof Error ? err.message : String(err)}`);
@@ -2348,13 +2327,16 @@ for (const direction of ['callers', 'callees'] as const) {
             return { group, nodes: [...nodes.values()], edges: [...edges.values()] };
           });
 
+          const relationships = (node: Node, edges: Edge[]) => [...new Set(edges
+            .filter((edge) => (direction === 'callers' ? edge.source : edge.target) === node.id)
+            .map((edge) => edge.kind))];
           if (options.json) {
             const definitions = collected.map(({ group, nodes, edges }) => {
               const limited = nodes.slice(0, limit);
               const shown = new Set(limited.map((node) => node.id));
               return {
                 ...cliDefinition(group),
-                [direction]: limited.map((node) => ({ id: node.id, ...cliNode(node) })),
+                [direction]: limited.map((node) => ({ id: node.id, ...cliNode(node), relationships: relationships(node, edges) })),
                 edges: edges.filter((edge) => shown.has(direction === 'callers' ? edge.source : edge.target)),
                 total: nodes.length,
                 limit,
@@ -2375,7 +2357,8 @@ for (const direction of ['callers', 'callees'] as const) {
               filteredOut,
               note,
               definitions,
-              [direction]: [...union.values()].slice(0, limit).map(cliNode),
+              [direction]: [...union.values()].slice(0, limit).map((node) => ({ ...cliNode(node),
+                relationships: relationships(node, collected.flatMap((entry) => entry.edges)) })),
               total,
               limit,
               truncated: total > limit,
@@ -2385,7 +2368,7 @@ for (const direction of ['callers', 'callees'] as const) {
             if (ambiguous) {
               console.log(chalk.bold(`\n${title} of "${symbol}" — ${groups.length} distinct definitions (narrow with --file):`));
             }
-            for (const { group, nodes } of collected) {
+            for (const { group, nodes, edges } of collected) {
               const limited = nodes.slice(0, limit);
               const total = nodes.length;
               const truncated = total > limit;
@@ -2402,7 +2385,9 @@ for (const direction of ['callers', 'callees'] as const) {
               }
               for (const node of limited) {
                 const loc = node.startLine ? `:${node.startLine}` : '';
-                console.log(chalk.cyan(node.kind.padEnd(12)) + chalk.white(node.name));
+                const kinds = relationships(node, edges).filter((kind) => kind !== 'calls');
+                const relation = kinds.length ? ` [${kinds.join(', ')}]` : '';
+                console.log(chalk.cyan(node.kind.padEnd(12)) + chalk.white(node.name) + chalk.dim(relation));
                 console.log(chalk.dim(`  ${node.filePath}${loc}`));
                 console.log();
               }

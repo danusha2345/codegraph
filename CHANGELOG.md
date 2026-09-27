@@ -25,6 +25,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- `codegraph serve --mcp --no-telemetry` turns telemetry off for one MCP server entry, so a shared MCP config can opt out without an environment variable. (#1908)
 - **Verilog and SystemVerilog are indexed.** Modules, packages, interfaces and modports, named instances, ports and signals, always/assign blocks and generate scopes are searchable, and `codegraph_explore` surfaces the instantiation path from a top module down to a nested one; based on the extractor contributed in #402 by @FHYQ-Dong. Re-index projects that contain Verilog files.
 
 - **A derived parameter depends on the parameters it is computed from.** `localparam K = (N + 1) * 2;` links `K` to `N`, so impact on a width or depth parameter follows the whole chain of `localparam`s built on it, inside its own module. Suggested by @FHYQ-Dong.
@@ -36,7 +37,6 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **HDL build profiles.** An optional `hdl` section in `codegraph.json` selects source files or filelists, include directories and defines; conditional-compilation branches are indexed under the active profile, `codegraph status` reports the configured versus the indexed profile, and the file watcher follows filelists and included headers.
 
 - **Computed parameters and port widths.** `codegraph hdl-semantic` runs an installed slang (or pyslang through `--python`) on the active profile and returns evaluated parameters, port widths and macro origins as a separate answer, without touching the indexed graph.
-- `codegraph serve --mcp --no-telemetry` turns telemetry off for one MCP server entry, so a shared MCP config can opt out without an environment variable. (#1908)
 
 - **Codex and Astra read project guidance from `AGENTS.md`.** The canonical agent guide now lives in `AGENTS.md` (with a nested `docs/AGENTS.md` for long validation notes); `CLAUDE.md` is a thin `@AGENTS.md` wrapper for Claude Code. Codex/Astra no longer miss the old CLAUDE-only instructions.
 
@@ -158,55 +158,21 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
-- При остановленном watcher `codegraph_explore` больше не отдаёт исходный код из изменившихся после индексации файлов: он называет их и просит проверить напрямую, продолжая отвечать по неизменённым файлам. (#1959)
-- While auto-sync is off, `codegraph_search`, `codegraph_callers`, `codegraph_callees` and `codegraph_impact` likewise refuse an answer that names a file changed since its last sync, and name that file instead. (#1959)
-
-- MCP status now shows when a file was last indexed and how many files were added, changed, or removed since then, so an out-of-date graph is visible even when file watching has stopped. (#1959)
-
-- The "edited since the last index sync" warning no longer names a file the answer never showed just because its path is part of one that it did, such as `src/app.ts` next to `src/app.tsx`. (#1968)
-
-- Долгая индексация больше не теряет блокировку записи через две минуты: пока владелец жив, второй процесс ждёт освобождения индекса. (#1959)
-- После длительной конкуренции за lock MCP при следующем вызове повторно включает watcher и делает полный проход. До успешной синхронизации ответы явно помечены как потенциально устаревшие; повторные попытки ограничены паузой. (#1959)
-- Зависший при остановке общий MCP-демон теперь закрывает даже соединения без завершённого приветствия; резервный процесс при занятом writer lock продолжает обслуживать чтение без второго писателя. (#1963)
-- A file over the size limit is no longer read before it is skipped. Large committed video and blob fixtures used to be loaded into memory in full, once per indexing pass, only to be discarded; indexing, change detection and the viewer now go by the file's size instead. (#1910)
-
-- An MPEG transport stream video that happens to be named `.ts` (golden fixtures under `testdata/`, e2e clips) is now recognised from its first bytes and skipped instead of being fed to the TypeScript parser, which spent a long time on each clip for no symbols. Real TypeScript files are still indexed. (#1910)
+- When a project keeps copies of the same code in several modules, a call now links to the copy in the caller's own module, even in deeply nested trees where it could previously land on another module's copy.
 
 - The Claude Code prompt hook no longer runs on the task-notification messages Claude Code injects when a background agent finishes, removing a multi-second stall on every such turn. (#1832)
-- Projects queried through `projectPath` (a repository other than the server's default, such as an indexed child of an un-indexed workspace) now stay in sync like the default project does: the first call catches up edits made while no server was running, and a file watcher keeps the index current for as long as the project stays open in that session. Up to 8 such projects are kept open per server, the least recently used one is closed when a ninth is opened, and all are closed when the server stops. A project another live server already syncs is left to that server. (#1835)
 
-- `codegraph sync` no longer reports success when it could not take the index lock: it exits with status 1 and prints one line on stderr, also with `--quiet`. When another process (an MCP server or another CLI mid-index) holds the lock, the line names it and asks you to retry; any other lock problem keeps its `codegraph unlock` hint. A script of your own that checks the exit code can now tell a skipped sync from an up-to-date one.
-- An empty or table-less `codegraph.db` left behind in a parent directory (by an interrupted `codegraph init`, or a never-populated `~/.codegraph/`) no longer counts as an initialized project, so it can no longer hide the real index of every project beneath it. Only a database that actually carries the codegraph schema is treated as initialized, and `codegraph init` in the directory with the broken file now repairs it instead of refusing with "Already initialized". (#1895)
-- Scala classes that extend a parent with several argument lists keep every `with` parent, and Scala 3 capture types and `given … with` bodies parse, because the bundled Scala grammar moved to its v0.26.2 release. Re-index Scala projects to pick this up. (#1823)
-
+- Java `record` declarations are now indexed as classes, with their methods, constructors, components and implicit accessors, so calls on a record-typed value like `info.remoteAddress()` resolve and records show up in callers, impact and implementations; re-index Java projects after upgrading.
+- Java calls on a variable, parameter or field whose declared type is a library class (such as `Parcel`, `Context`, `List` or `Handler`), and static calls on an imported library class such as `Log.d(...)`, no longer link to an unrelated project method with the same name. Calls through `this.field`, `Outer.this.field`, a field read inside an anonymous or inner class, a chain of fields such as `owner.repo.save()`, and a variable declared with type arguments (`Map<String, Foo> byName`) now resolve on the declared type, and a type written with its package or outer class (`Map.Entry`, `play.api.mvc.BodyParser`) or imported as a nested class is no longer mistaken for a same-named type elsewhere in the project. Re-index Java projects to pick this up.
 - Kotlin calls through a class property, a primary-constructor property, or a variable set from a function call now resolve on the declared type, and a call on a library type (such as `Regex` or a JDK class) no longer links to an unrelated project method with the same name. Chained receivers such as `engine.pump.drain()`, `this.engine.drain()` and `Mode.ON.next()` resolve the same way, as do properties inherited from a project base class and variables of the enclosing function used inside an anonymous `object : …`. Re-index Kotlin projects to pick this up.
 - Kotlin `fun interface` declarations are indexed, and no longer hide the declaration that follows them.
 
-- Java and Kotlin inheritance now resolves nested types more precisely, and anonymous implementations retain their members after re-indexing.
-
-- In TypeScript and JavaScript, calling a function through an object that lists it by name (`const api = { getUser }` or `{ getUser: getUser }`) now counts as a caller in the object's own file too, so the function no longer looks unused. (#1932)
-
-- When a project keeps copies of the same code in several modules, a call now links to the copy in the caller's own module, even in deeply nested trees where it could previously land on another module's copy.
-
-- A call like `Logger.log()` now links to `Logger`'s own method instead of the same-named method of a class whose name merely contains it, such as `FileLogger`.
-- Java calls on a variable, parameter or field whose declared type is a library class (such as `Parcel`, `Context`, `List` or `Handler`), and static calls on an imported library class such as `Log.d(...)`, no longer link to an unrelated project method with the same name. Calls through `this.field`, `Outer.this.field`, a field read inside an anonymous or inner class, a chain of fields such as `owner.repo.save()`, and a variable declared with type arguments (`Map<String, Foo> byName`) now resolve on the declared type, and a type written with its package or outer class (`Map.Entry`, `play.api.mvc.BodyParser`) or imported as a nested class is no longer mistaken for a same-named type elsewhere in the project. Re-index Java projects to pick this up.
-
-- Java `record` declarations are now indexed as classes, with their methods, constructors, components and implicit accessors, so calls on a record-typed value like `info.remoteAddress()` resolve and records show up in callers, impact and implementations; re-index Java projects after upgrading.
-- Restarting after an interrupted index no longer gets trapped in repeated watchdog restarts while repairing the database. (#1887)
-- После полной переиндексации автообновление и MCP-запросы подхватывают новую базу и сверяют изменения, пропущенные во время её замены. (#1902)
-- Python docstrings модулей, классов и функций теперь доступны в поиске; для существующих проектов требуется переиндексация. (#1905)
-
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
-- A C or C++ macro invocation such as `TRACE_POINT(1)` no longer shows up as a call to a same-named function in another file when the macro is defined in that file or one of its included headers; function-like macros are indexed as constants, never as callees. (#1838)
-
-- C++ local object initialization — `Widget w;`, `Widget w(1);`, `Widget w{1};` — now calls the constructor defined for the type in the nearest namespace, picking the overload whose parameter count fits when exactly one does, instead of pointing at the class itself; plain aggregates, pointers, references and `extern` declarations produce no call. (#1839)
 - A call to a function defined in the same file is no longer marked as an uncertain match when the file sits near the top of the project, and it now wins over a weaker same-named guess in another file.
-- A method called on the result of an expression, such as `(await list()).map(...)` in TypeScript or `v.iter().map(...)` in Rust, no longer links to an unrelated same-named method, and calls no longer link into another language they cannot reach, such as Rust onto a TypeScript class or Kotlin onto a JavaScript function.
-
+- A method calling another method of its own class — `render()` in Java, Kotlin, C#, Scala, Swift, C++, Dart or Ruby, or `this.render()` / `self.render()` / `$this->render()` — now links to that class's method (or the one it inherits or is nested in) instead of a same-named method of another class declared nearer in the file.
 - In TypeScript and JavaScript, a method called on a freshly constructed object, such as `new RegExp(p).exec(s)` or `new URL(u).toString()`, now links only to that class's own (or inherited) method and no longer to an unrelated project method of the same name.
 - Standard-library calls on a value of unknown type, such as `name.len()` in Rust, `list.isEmpty()` in Kotlin, `options.setdefault(...)` in Python, `conn.Close()` in Go, `opt.map(...)` in Scala or `Task.Run(...)` in C#, no longer link to a project method that merely shares the name.
-- A method calling another method of its own class — `render()` in Java, Kotlin, C#, Scala, Swift, C++, Dart or Ruby, or `this.render()` / `self.render()` / `$this->render()` — now links to that class's method (or the one it inherits or is nested in) instead of a same-named method of another class declared nearer in the file.
 
 - Java calls on a value of unknown type, such as `map.put(...)`, `s.toString()`, `KEY.equals(...)` on a constant, or `Objects.hash(...)` and `Collections.emptyMap()` under a wildcard `java.util.*` import, no longer link to a project method that merely shares the name.
 - Go method calls now resolve through the receiver's declared type — an unexported or package-qualified parameter, a constructor's result, or a variable named like a standard-library package (`ring`, `token`) — and a receiver typed outside the project (`net.Conn`, `*bytes.Buffer`, `error`) no longer links to an unrelated project method of the same name; re-index to pick this up.
@@ -223,20 +189,31 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A Kotlin `private val` / `private var` no longer captures calls from other files.** Properties were indexed without their visibility modifier, so the file-local rule that already declines a `private fun` read every property as public: an Android app's `token(...)` validator resolved onto another class's `@Volatile private var token`, and JavaScript, Go and Python callers landed on Kotlin test fixtures' private fields. Both the WebAssembly and the native path now record `private` / `internal` / `protected` on properties. Re-index after upgrading. (#1731)
 - Calling a built-in method on an awaited value no longer records a call into an unrelated class that happens to declare a method of the same name, and a variable bound to an awaited call now resolves methods on the type that call returns. Thanks @maxmilian. (#1840)
 - Spring mappings now include every declared path combination and resolve constants declared in the same file, while unresolved paths no longer appear as false root routes. (#1461)
+- `codegraph node` now accepts a file reference that carries a line number — `src/app.ts:42`, `src/app.ts:42-80`, `src/app.ts#L42`, `src/app.ts#L42-L80` — instead of reporting the file as not indexed; the line range becomes the window that is read, and an `--offset`/`--limit` you pass yourself still wins. A path that really is named that way is still looked up as written. (#1831)
 - `codegraph callers`, `codegraph callees` and `codegraph impact` now resolve qualified names, group results and JSON edges by definition, and accept `--file` to narrow ambiguous names; thanks @ferrine. (#1512, #1656)
 - `codegraph callers`, `codegraph callees` and `codegraph impact` (CLI and MCP) now report missing names with did-you-mean suggestions instead of another symbol's results, and exact matches with no callers stay empty; thanks @uvmplus. (#1473, #1481)
 
 #### MCP / indexing
 
-- `codegraph impact --depth N`, multi-level callers and callees, and the viewer's blast radius no longer miss dependents within N hops when a longer path reaches one of them first. (#1974)
 - Repeated `codegraph_explore` calls from a running MCP server no longer re-rank the whole graph each time to find the project's core file; the answer is reused until the index changes. (#1864)
-- Running `codegraph index` while the MCP server is running no longer leaves live auto-sync writing into the old, replaced index: the server now switches to the rebuilt index before its next update and catches up on everything it would otherwise have missed. (#1902)
 - `codegraph_explore` no longer calls a file whose source it showed only in part "complete", and no longer suggests a tool your agent cannot see, so agents stop reading those files again to be sure. (#1918)
+- An empty or table-less `codegraph.db` left behind in a parent directory (by an interrupted `codegraph init`, or a never-populated `~/.codegraph/`) no longer counts as an initialized project, so it can no longer hide the real index of every project beneath it. Only a database that actually carries the codegraph schema is treated as initialized, and `codegraph init` in the directory with the broken file now repairs it instead of refusing with "Already initialized". (#1895)
+- Indexing and sync on large projects, especially C and C++ codebases with huge generated headers, now keep cached source text and preprocessor data within a fixed memory budget, so the final resolution pass no longer runs out of memory. (#1583)
+- `codegraph_impact` on a heavily referenced symbol now stops at a safety limit and says the answer was truncated, instead of exhausting the MCP server's memory; narrow it with `file` or a smaller `depth`. (#1583)
+- The MCP server now recycles its query workers after they sit idle, releasing the memory a burst of large queries left behind while keeping one worker warm for the next call. (#1583)
+- Path search between two symbols no longer slows down sharply or grows its memory use on densely connected graphs. (#1583)
+- Tag-based ColdFusion (CFML) files no longer leak parser memory during indexing. (#1583)
+- A file over the size limit is no longer read before it is skipped. Large committed video and blob fixtures used to be loaded into memory in full, once per indexing pass, only to be discarded; indexing, change detection and the viewer now go by the file's size instead. (#1910)
+- An MPEG transport stream video that happens to be named `.ts` (golden fixtures under `testdata/`, e2e clips) is now recognised from its first bytes and skipped instead of being fed to the TypeScript parser, which spent a long time on each clip for no symbols. Real TypeScript files are still indexed. (#1910)
+- File watching no longer drops the full re-scan a removed directory asks for when that sync fails, so the deleted files leave the index instead of lingering. (#1964)
+- Running `codegraph index` while the MCP server is running no longer leaves live auto-sync writing into the old, replaced index: the server now switches to the rebuilt index before its next update and catches up on everything it would otherwise have missed. (#1902)
 - Daemon startup and cleanup now preserve live legacy PID-only locks while still reclaiming dead or identity-disproved records, preventing two writers from serving the same project.
 - Incremental sync now keeps edge rebinding crash-safe: replacing a resolved edge with its recovery reference commits atomically, so an interruption cannot permanently remove the relationship.
 - Status now detects committed but unindexed changes and restored edits without scanning every source file; thanks @inth3shadows. (#1829)
 
 - The prompt hook no longer injects unrelated projects when run from your home directory or a broader directory containing a stray workspace manifest. (#1454)
+
+- `codegraph_explore` now says so when a query names an extension-less file the index doesn't hold. A path like `scripts/deploy` has no extension on its last segment, so it failed the shape test that decides a span is a path beyond doubt — the name was left in the query, shredded into `scripts` and `deploy`, and the answer came back as a pile of unrelated source with no hint that the file you named was never consulted. Such a span is now checked against the project directory: if it is a real file, the answer carries the same `No indexed file uniquely matches ...` note a misspelled `src/foo.ts` already got. Slashed prose — `and/or`, `input/output`, `gen_server:call/2` — has no file behind it and is still left in the query untouched. (#1830)
 
 - Indexing now succeeds when Node.js's SQLite lacks FTS5, with search falling back to name and fuzzy matching; thanks @aniruddhaadak80. (#1532)
 
@@ -263,9 +240,32 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `codegraph install` now honors `CLAUDE_CONFIG_DIR` and `CODEX_HOME` for global Claude Code and Codex setup so CodeGraph loads in your chosen profile (thanks @seanchann; #1627).
 
+- `codegraph install --refresh` no longer leaves a `.backup` file beside the config of an agent it isn't set up for. Checking whether an agent already has CodeGraph meant reading its config, and a config that wasn't valid JSON — an empty `mcp_config.json` next to an Antigravity install, say — got copied aside with a warning that CodeGraph was about to overwrite it, even though the agent was then skipped untouched. Checking is silent now; a config that can't be read is still backed up, but only when CodeGraph really is replacing it. Thanks @Gotman08. (#1870)
+
 - Files opted in with `includeIgnored` now stay indexed on Git older than 2.36, and embedded repositories remain visible to the watcher (thanks @maxmilian and @newshowardz777; #1549).
 
 - `codegraph init` and `codegraph index` now list unsupported file extensions and explain that CodeGraph is inactive when no supported source files are found (#1502).
+- `codegraph_explore` now flags a dynamic `import()`/`require()` built from a template literal with a substitution or from string concatenation, while an escaped `\${…}` stays a plain string. Thanks @inth3shadows. (#1967)
+- The stale-file warning no longer names a pending file just because its path is a prefix or suffix of a path the answer shows (`src/app.ts` vs `src/app.tsx`). Thanks @inth3shadows. (#1968)
+- When `codegraph_explore` finds nothing, it now says that matching is lexical, lists the query words the index doesn't contain, and suggests real symbol names to retry with. Thanks @iacore. (#1904)
+- `codegraph_explore` now finds a file when the query is its exact Chinese filename, with or without the extension. Thanks @Syh1906. (#1372)
+- Java, Kotlin and Scala packages named `build` under a source root are indexed again, while real build-output directories stay excluded. Thanks @CmmVoid for the report and @danusha2345. (#1642)
+- Files over the 1 MB source limit, such as a package archive an import points at, are now rejected before they are read during resolution, removing a multi-gigabyte memory spike at startup. Thanks @hcg1023 for the report and @danusha2345. (#1553)
+- `codegraph sync` now reports that the index is busy and exits non-zero when another process holds the write lock, instead of printing "Already up to date". Thanks @inth3shadows. (#1361)
+- `codegraph sync` now reports the pending references it resolved instead of printing "Already up to date" while it did that work. Thanks @inth3shadows. (#1360)
+- An incremental sync now refreshes event, callback and cross-tier links when a change touches a registration, a handler or a file that feeds them, so the graph matches a full re-index; ordinary edits stay as fast as before. Thanks @bompus. (#1988)
+- Edits inside a symlinked directory now auto-sync on macOS, Windows and Linux, including links added, removed or retargeted while watching. Thanks @ztibeike for the report and @dengzhongyuan365-dev. (#770)
+- A project queried through `projectPath` now catches up on first access and stays in sync like the default project, coordinating with any daemon that already owns it. Thanks @nakisen for the report and @danusha2345. (#1835)
+- Two spellings of one repository (a symlink, or different casing on a case-insensitive drive such as WSL `/mnt/c`) now share one index connection instead of opening it twice. Thanks @yjtdkj for the report and @inth3shadows. (#1057)
+- Direct (non-daemon) MCP sessions now serve concurrent calls from a small off-thread query pool (2 workers by default; `CODEGRAPH_QUERY_POOL_SIZE` changes it). Thanks @blabla-yy. (#1465)
+- `impact --depth N`, and callers/callees at a depth, now find every dependent within N hops even when a longer path reaches one of them first. Thanks @inth3shadows for the report and @danusha2345. (#1974)
+- Path finding no longer re-queues the same node many times through a dense fan-in hub. Thanks @inth3shadows. (#1359)
+- Everyday Portuguese/Spanish "como" and German "wie" no longer escalate a prompt to a full code search on their own. Thanks @AndreLFSMartins. (#1654)
+- The Antigravity installer now saves the permanent path of `codegraph` rather than fnm's per-shell directory, so the command keeps working after the installing shell exits. Thanks @kevocodes. (#1443)
+- A live writer's index lock is no longer treated as stale after two minutes, and the file watcher re-arms and reconciles after lock contention instead of leaving `serve --mcp` answering from a frozen index; the non-git scan fallback keeps honoring `.git/info/exclude`. Thanks @LunarWerxs for the report and @danusha2345. (#1959)
+- A shared daemon now closes connections that are still mid-handshake when it stops, a peer that disconnects mid-handshake no longer leaves a phantom client that blocks idle exit, and a fallback that finds another process holding the writer lock serves reads instead of refusing. Thanks @bompus and @inth3shadows for the reports and @danusha2345. (#1963, #1356)
+- A query worker whose database open fails is now retired and replaced instead of answering every routed call with an error. Thanks @inth3shadows. (#1357)
+- Very large watchdog or startup-handshake timeouts are now capped at the largest delay a timer can hold, so they no longer fire after about 1 ms. Thanks @inth3shadows. (#1966)
 
 #### Screens, links and navigation
 
@@ -336,25 +336,20 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **ASP.NET Minimal API endpoint groups are routes.** The handler-first form — `groupBuilder.MapPost(CreateTodoItem)`, `MapPut(UpdateTodoItem, "{id}")` inside an `IEndpointGroup` / `EndpointGroupBase` class (the Clean Architecture template and its descendants) — now registers `POST /api/TodoItems` and `PUT /api/TodoItems/{id}`, with the `/api/` head read from the app's own `MapGroup($"/api/{groupName}")` and a class's `RoutePrefix` honoured, each bound to its handler so the Steps tab starts there and lists its `TypedResults` replies by status code.
 
 - **A FastAPI service that lives in one directory of a monorepo is detected.** `backend/pyproject.toml` and `backend/app/main.py` count, not only files at the repository root — the official full-stack template's routes now appear in Entry points and the Steps tab.
+- React Router routes are now read from each `<Route>` tag's own attributes and each route object's own fields, so an `element` no longer bleeds into a sibling or parent route. Thanks @inth3shadows. (#1348)
+- MyBatis mappers with whitespace inside a closing tag, and `<include refid>` references to another namespace, are now extracted correctly. Thanks @ESPINS for the report and @fengshao1227. (#1209)
+- `render`, `include`, `section` and `assign` written inside a `{% liquid %}` block are now extracted with their real line numbers, and commented or raw content is ignored. Thanks @Puma7. (#1906)
+- Rust functions annotated `#[tauri::command]` are no longer reported as dead code. Thanks @vdavid. (#1543)
 
 #### Symbols, tests and the viewer
 
-- In `codegraph ui`, "Read as flow" now works on any trail the viewer can save, up to 64 hops, and a shared link to a long trail gets all its hop names back. A trail longer than that keeps its most recent 64 hops. (#1976)
-- In `codegraph ui`, routes whose handlers live in more than 60 different files are all linked to their handler, instead of the later ones showing "not in the index". (#1975)
-- The dead-code report no longer lists methods a framework or library base class calls, such as React lifecycle methods, a stream's `_transform` or NestJS `onModuleInit`, when the class extends or implements a type from outside the project. (#1973)
-- A TypeScript or JavaScript call through an ES private field, such as `this.#items.add(x)`, now resolves on the field's declared or constructed type, like `this.items.add(x)` already did, instead of linking to whichever project method shares the name. (#1987)
-- Java packages named `build` under standard main and test source roots are now indexed without pulling Gradle or Maven build output into the graph. (#1642)
 - Erlang selective imports now resolve a bare call to the exact exported module, function, and arity, while unqualified calls stay within their own module instead of binding to an unrelated same-named project function. Re-index Erlang projects after upgrading. (#1610) (Erlang)
-- Incremental sync now applies WAL backpressure during changed-file storage and batched reference resolution, keeping long-lived readers from allowing the WAL to grow past its configured cap on large projects. (#1539)
+- **A Scala `Outer.Inner(...)` call now reaches the Scala case class it builds, not a Java constructor.** A companion `apply` such as `RemoteNode.Obfuscated("x")` was linked to an unrelated Java class's constructor that merely shared the words in its name; it now links to the Scala type of that name, and a Java constructor is never guessed that way.
 
-- Resolution no longer reads oversized dependency archives such as HarmonyOS `.har` packages as source text, preventing a single package target from exhausting the JavaScript heap during indexing or sync.
-
-- Dynamic-dispatch analysis no longer repeatedly copies every source prefix while scanning match-dense files, avoiding quadratic work and excessive peak memory during the final resolution pass.
+- In `codegraph ui`, routes whose handlers live in more than 60 different files are all linked to their handler, instead of the later ones showing "not in the index". (#1975)
 - **Saved trails stay inside the indexed project even when a directory or trail file is a symlink.** The viewer refuses paths whose nearest existing directory resolves outside the project, opens trail files without following links and without blocking on a named pipe left in the trails directory, and creates its atomic temporary file exclusively so a pre-planted link cannot capture a read or write.
 
 - **Saved-trail authors are now resolved per project.** An embedded host serving several projects in one process no longer reuses the first repository's Git user name for every later trail.
-- **A Scala `Outer.Inner(...)` call now reaches the Scala case class it builds, not a Java constructor.** A companion `apply` such as `RemoteNode.Obfuscated("x")` was linked to an unrelated Java class's constructor that merely shared the words in its name; it now links to the Scala type of that name, and a Java constructor is never guessed that way.
-
 - Kotlin functions and methods now carry their signature — `(params): ReturnType` — in `codegraph_explore`, `node` and the viewer, instead of no signature at all. Re-index Kotlin projects after upgrading. (#1495)
 - TypeScript/JavaScript value aliases — `export const alias = fn`, `export { fn as alias }`, object-literal `api = { run: fn }`, and same-file `const local = fn` — now forward calls edges to the aliased function, so callers and impact on the implementation include consumers that call through the alias instead of stopping at the binding. Genuine wrappers (`() => fn()`) are unchanged. Re-index after upgrading. Thanks @valkyriweb. (#1482, #1485)
 - `codegraph affected` now finds Go, Python and JVM test files that previously went unreported, while preserving custom `--filter` behavior (thanks @danusha2345; #1507, #1688).
@@ -368,6 +363,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Imports from Node built-ins or npm packages no longer connect to unrelated type members with matching names; re-index after upgrading to clear existing false dependencies. Thanks @ctype-lab. (#1537)
 
 - Inheritance relationships no longer attach external Rust or npm supertypes to unrelated local symbols with the same name, including in Svelte, Vue and Astro components; re-index after upgrading to clear existing false relationships. Thanks @ctype-lab. (#1536)
+
+- Spring's dependency-injection resolution patterns no longer capture inheritance references or references from other languages. In a polyglot repository where Spring is detected (a sibling Java module is enough), a Scala or Kotlin `extends`/`implements` reference could be resolved by Spring's directory-convention heuristics to an unrelated same-named class — for example a test fixture — corrupting the inheritance graph that `codegraph_impact` and `codegraph_explore` walk. Inheritance now always resolves through imports and name matching, and the Spring DI patterns only apply to Java/Kotlin references. Re-index after upgrading. (#1825)
 
 - PHP static calls through imported class aliases now reach the correct class when services and repositories share method names, so callers and impact analysis show the right dependencies after re-indexing. (#1545)
 - TypeScript/JavaScript: a call through a field of the enclosing class — `this.mailer.send()` — now resolves on the field's declared type, so a delegating wrapper that shares the method's name no longer records itself as its own callee and `callers`, `impact` and trace stop lying on that shape. A field whose type is external or a builtin stays unresolved rather than guessed. Re-index after upgrading. (#1496)
@@ -390,6 +387,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A bare call inside a JavaScript or TypeScript method no longer resolves to the method itself.** When a method and a module-scope function share a name, `serialize(this.raw)` written inside `Record.serialize` means the function, but the nearest same-named definition won the tie and the graph recorded the method calling itself. A call written without a receiver can never reach a method in JS/TS, so methods are no longer candidates for it; `this.serialize()` and `other.serialize()` resolve as before. (#1714)
 - **Fuzzy matching no longer lands on a closure it cannot reach.** A function nested inside another function is only callable from inside its container, and exact-name matching already declined such candidates; the fuzzy fallback did not, so a builtin method call (`res.text()`, `items.push()`) whose only same-named project symbol was some file's closure resolved onto that closure. The fallback now checks that the one candidate it would commit to is reachable, and declines otherwise — it does not filter the candidate list first, which would turn a crowd of same-named definitions into a single "unique" survivor and hand it every call of that name. On vite that removes the 12 edges onto nested functions and adds none. Re-index after upgrading. Thanks @bompus. (#1708, #1709)
 - **An import that names the emitted extension resolves to its source.** Under `moduleResolution: node16 | nodenext | bundler` TypeScript requires `import { x } from './util.js'` for `util.ts`, and no file of that name exists, so the import resolver returned nothing and every name imported that way fell through to bare-name matching: a method wrapping the same-named helper it imports (`renderDockStyles() { return renderDockStyles(); }`) resolved to itself, and cross-module edges in such projects were name guesses. `.js` / `.jsx` / `.mjs` / `.cjs` specifiers now retry with the source extensions TypeScript compiles from when the emitted file is absent; a real `.js` beside the `.ts` still wins. On a 582-file repo whose `.ts` files import this way, import-backed `calls`/`imports` edges went from 4,002 to 7,312 and the eight wrapper-method self-edges disappeared. Re-index after upgrading. Thanks @bompus. (#1705, #1706)
+- **Go methods now record whether they are exported.** A method on a Go type (`func (w *writer) Close()`) was always indexed as unexported, whatever the case of its name; only plain functions carried the flag. Both the native kernel and the WebAssembly path now apply Go's rule — an uppercase first letter — to methods too, so a tool asking "can another package call this?" gets the right answer. Re-index after upgrading.
 - **A name imported from a package no longer fuzzy-matches a project symbol.** `import { scan } from 'rolldown/experimental'` names a symbol that is not in the graph at all, but the fuzzy fallback matched it by name anyway — in that case onto the importing file's own `scan`, a self-edge. Fuzzy matching now declines when the call site's binding is a bare specifier (a builtin or an npm package); relative, alias and workspace imports still fall through, and only JS/TS is affected, since elsewhere a project's own modules are imported by absolute name too. On vite this removed 4 wrong edges and added none. Re-index after upgrading.
 - **A name imported from a package no longer fuzzy-matches a project symbol.** `import type { EvaluatedModules } from 'vite/module-runner'` names a symbol that is not in the graph at all, but the fuzzy fallback matched it by name anyway — and the match is case-insensitive, so on vitest it landed on the unrelated method `VitestMocker::evaluatedModules`. Fuzzy matching now declines when the call site's binding is a bare specifier (a builtin or an npm package); relative, alias, workspace and `link:`/`file:` imports still fall through, and only JS/TS is affected, since elsewhere a project's own modules are imported by absolute name too. Across vitest, svelte, vite and rollup this removed 46 wrong edges and added none. Re-index after upgrading.
 
@@ -399,7 +397,6 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **The Map groups a repository the way that repository is shaped.** It always drew top-level directories, so a project whose whole program lives under one `src/` opened as a picture of four boxes — `src`, `ios`, `.github`, `(root files)` — with two thirds of the code inside one of them and nothing to say about it. The Map now picks its own grouping: the shallowest one that is not a single box holding the program, so a mobile app opens on `src/app`, `src/components`, `src/api`, `ios/CaptureView` and the rest, and a project packaged as `frontend/src/…` opens on the screens, components and reducers instead of on the word `frontend`. A repository whose top-level directories really are its modules is left exactly where it was. A new **Grouping** control on the right says which one was chosen and lets you take it a level in or out, and a leaf directory is now named for itself rather than as `…/(root files)`. Each box now also says how much leans on it — how many files elsewhere reference straight into it — with a bar along its bottom edge scaled against the most depended-on box on screen, so the folder you have to be careful with is the one you can see at a glance rather than the one with the longest name. The Map also has a **Key** now, like the Screens and Steps tabs — including what the dashed maroon lines mean, which only appear once you select a module: that module reaching back UP into something that depends on it.
 
 - **The Symbol tab opens the Symbol tab.** With no symbol open and no trail to return to, clicking **Symbol** in the top bar took you to the landing page — which, on any project that has screens, is the Screens tab. So the button said Symbol and gave you somebody else's view. It now has an address of its own (`#/s`) that opens the "nothing selected" screen: the search prompt and the where-to-start list of routes, entry files and the symbols the most code depends on.
-- **Go methods now record whether they are exported.** A method on a Go type (`func (w *writer) Close()`) was always indexed as unexported, whatever the case of its name; only plain functions carried the flag. Both the native kernel and the WebAssembly path now apply Go's rule — an uppercase first letter — to methods too, so a tool asking "can another package call this?" gets the right answer. Re-index after upgrading.
 
 - **Files under an `e2e/` directory count as tests.** Their calls no longer appear as production callers in Steps, dead-code and test badges.
 
@@ -420,6 +417,24 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Fixed a long-running `codegraph ui` session serving a symbol that a sync had already deleted. The viewer keeps one connection to your index open, and its in-memory lookup didn't notice when another process — your agent's sync, or `codegraph sync` — rewrote the file underneath it, so a symbol screen could keep showing a body with no callers while search correctly reported it had moved. Because a symbol's identity includes the line it starts on, this happened after almost any edit above it.
 
 - Python calls and file dependencies through `from package import module as alias` now appear in the graph, so renamed imports no longer hide live callers or imported modules. Thanks @JoeyNPP. (#1626)
+- Python docstrings are now indexed alongside preceding comments, so their prose is searchable and shown. Thanks @iacore for the report and @maxmilian. (#1905)
+- A Dart 3 `extension type` is now indexed as a type with its members attached. Thanks @bompus for the report and @Dshuishui. (#1784)
+- A receiver-less Go call (a function parameter or local func value) no longer links to a same-named method. Thanks @PCeltide for the report and @maxmilian. (#1857)
+- A function passed to a curried wrapper (`Effect.fn("x")(function* () {…})`, `connect(m)(fn)`) is now indexed under its declarator or property name. Thanks @Dshuishui for the report and @maxmilian. (#1747)
+- The bundled Scala grammar is now the official tree-sitter-scala v0.26.2, so classes with several parameter lists keep all their inheritance edges. Thanks @htarnacki for the report and @danusha2345. (#1823)
+- A Scala `object` is now indexed as a module, so `extends`/`with` resolves to the trait or class rather than its companion object. Thanks @htarnacki. (#1824)
+- C/C++ functions defined through a single-argument macro are now indexed under their real name when the macro's own `#define` proves it. Thanks @Dshuishui. (#1373)
+- MSVC COM `interface` declarations in C++ headers are now indexed as types with their methods. Thanks @timxx. (#1519)
+- A function-like C/C++ macro invocation no longer binds to a same-named function in another file, and a local C++ object initialization now records a call to its constructor. Thanks @netbrah for the reports and @danusha2345. (#1838, #1839)
+- A Delphi DFM component's range now runs to its closing `end`, so its properties and event bindings belong to it. Thanks @inth3shadows. (#1350)
+- Two same-named symbols on one line (a one-line getter/setter pair) no longer collide and drop one; existing symbol IDs are unchanged. Thanks @inth3shadows. (#1349)
+- A callback registered with `subscribe(this.handler)` now links to that exact handler, not the first same-named method in the project. Thanks @inth3shadows. (#1355)
+- Calls through an object-literal member that references an outer function (`{ fn }`, `{ fn: fn }`) now resolve to that function. Thanks @nikamodis for the report and @danusha2345. (#1932)
+- Calls, constructors and inheritance no longer link to a same-named symbol in an unrelated language, while real interop (web, JVM, native, .NET, cgo) keeps its edges. Thanks @bompus for the report and @danusha2345. (#1986)
+- A built-in method call such as `list.map()` or `cache.get()` on an untyped value no longer links to a same-named project method, and `this.#field.method()` resolves on the field's type. Thanks @bompus for the report and @danusha2345. (#1987)
+- Python and Go methods passed as values (`executor.submit(self.store.fetch)`) now appear in callers and impact results. Thanks @JosefAschauer. (#1820)
+- Methods called by a base class outside the index (React lifecycle methods, a stream's `_transform`, NestJS hooks) are no longer reported as dead code. Thanks @inth3shadows for the report and @danusha2345. (#1973)
+- A viewer trail now holds up to 64 hops everywhere — the trail bar, saved trails and "Read as flow". Thanks @inth3shadows for the report and @danusha2345. (#1976)
 
 ## [1.6.0] - 2026-08-26
 

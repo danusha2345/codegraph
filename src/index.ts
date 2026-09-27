@@ -24,8 +24,8 @@ import {
   TaskContext,
   BuildContextOptions,
   FindRelevantContextOptions,
-  ImpactOptions,
   UnresolvedReference,
+  ImpactOptions,
 } from './types';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
@@ -54,6 +54,7 @@ import {
   createResolver,
   ResolutionResult,
 } from './resolution';
+import { hasSynthesisPattern } from './resolution/callback-synthesizer';
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
@@ -162,15 +163,11 @@ export class CodeGraph {
   // Mutex for preventing concurrent indexing operations (in-process)
   private indexMutex = new Mutex();
 
-  private replacementSync: Promise<boolean> | null = null;
-
   // File lock for preventing concurrent writes across processes (CLI, MCP, git hooks)
   private fileLock: FileLock;
 
   // File watcher for auto-sync on file changes
   private watcher: FileWatcher | null = null;
-  private closed = false;
-  private reopenPromise: Promise<boolean> | null = null;
 
   private constructor(
     db: DatabaseConnection,
@@ -283,20 +280,18 @@ export class CodeGraph {
    * replaced file is still picked up — by that sync, or by the caller's retry.
    */
   reopenIfReplaced(): boolean {
-    if (this.closed) return false;
     if (this.indexMutex.isLocked()) return false;
     return this.reopenReplacedDatabase();
   }
 
   /** The body of {@link reopenIfReplaced}, without the in-flight-sync guard. */
   private reopenReplacedDatabase(): boolean {
-    if (this.closed) return false;
     if (!this.db.isReplacedOnDisk()) return false;
     const dbPath = this.db.getPath();
     // Open the live file FIRST — if that throws (e.g. mid-recreate), the old
     // handle stays in place and the caller retries on the next query, rather
     // than leaving this instance with no connection at all.
-    const fresh = DatabaseConnection.open(dbPath);
+    const fresh = DatabaseConnection.open(dbPath, { readOnly: this.db.readOnly });
     const stale = this.db;
     this.db = fresh;
     this.queries = new QueryBuilder(fresh.getDb());
@@ -308,56 +303,6 @@ export class CodeGraph {
     // pinning the unlinked inode (#925).
     try { stale.close(); } catch { /* the old inode is gone; closing just frees fds */ }
     return true;
-  }
-
-  /** Async counterpart used by long-lived servers so recovery stays off-loop. */
-  async reopenIfReplacedAsync(): Promise<boolean> {
-    if (this.closed) return false;
-    if (this.reopenPromise) return this.reopenPromise;
-    if (!this.db.isReplacedOnDisk()) return false;
-    const reopening = this.indexMutex.withLock(() => this.doReopenIfReplacedAsync());
-    this.reopenPromise = reopening;
-    try {
-      return await reopening;
-    } finally {
-      if (this.reopenPromise === reopening) this.reopenPromise = null;
-    }
-  }
-
-  /** Serialized implementation for {@link reopenIfReplacedAsync}. */
-  private async doReopenIfReplacedAsync(): Promise<boolean> {
-    if (this.closed) return false;
-    if (!this.db.isReplacedOnDisk()) return false;
-    const dbPath = this.db.getPath();
-    // As above, complete the new open before disturbing the still-usable stale
-    // handle. This path also keeps secondary-index recovery off the event loop.
-    const fresh = await DatabaseConnection.openAsync(dbPath);
-    if (this.closed) {
-      try { fresh.close(); } catch { /* close() won the lifecycle race */ }
-      return false;
-    }
-    const stale = this.db;
-    this.db = fresh;
-    this.queries = new QueryBuilder(fresh.getDb());
-    this.wireLayers();
-    try { stale.close(); } catch { /* the old inode is gone; closing just frees fds */ }
-    this.pendingFullReconcile = true;
-    return true;
-  }
-
-  /** Catch up a replaced index before MCP dispatch, including pool reads. */
-  async syncIfReplaced(wait = true): Promise<boolean> {
-    if (this.closed) return false;
-    if (this.replacementSync) return wait ? this.replacementSync : false;
-    if (!this.pendingFullReconcile && !this.db.isReplacedOnDisk()) return true;
-    if (!wait) return false;
-    const recovering = this.sync().then(result =>
-      !(result.filesChecked === 0 && result.durationMs === 0) &&
-      !this.pendingFullReconcile && !this.db.isReplacedOnDisk()
-    );
-    this.replacementSync = recovering;
-    try { return await recovering; }
-    finally { if (this.replacementSync === recovering) this.replacementSync = null; }
   }
 
   // ===========================================================================
@@ -446,14 +391,19 @@ export class CodeGraph {
 
     // Open database
     const dbPath = getDatabasePath(resolvedRoot);
-    const db = await DatabaseConnection.openAsync(dbPath);
+    const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly });
     const queries = new QueryBuilder(db.getDb());
 
     const instance = new CodeGraph(db, queries, resolvedRoot);
 
     // Sync if requested
-    if (options.sync) {
-      await instance.sync();
+    if (options.sync && !options.readOnly) {
+      try {
+        await instance.sync();
+      } catch (err) {
+        instance.destroy();
+        throw err;
+      }
     }
 
     return instance;
@@ -510,7 +460,7 @@ export class CodeGraph {
   /**
    * Open synchronously (without sync)
    */
-  static openSync(projectRoot: string): CodeGraph {
+  static openSync(projectRoot: string, options: Pick<OpenOptions, 'readOnly'> = {}): CodeGraph {
     const resolvedRoot = path.resolve(projectRoot);
 
     // Check if initialized
@@ -526,7 +476,7 @@ export class CodeGraph {
 
     // Open database
     const dbPath = getDatabasePath(resolvedRoot);
-    const db = DatabaseConnection.open(dbPath);
+    const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly });
     const queries = new QueryBuilder(db.getDb());
 
     return new CodeGraph(db, queries, resolvedRoot);
@@ -543,8 +493,6 @@ export class CodeGraph {
    * Close the CodeGraph instance and release resources
    */
   close(): void {
-    if (this.closed) return;
-    this.closed = true;
     this.unwatch();
     // Release file lock if held
     this.fileLock.release();
@@ -878,7 +826,8 @@ export class CodeGraph {
   }
 
   /**
-   * Sync with current file state (incremental update)
+   * Sync with current file state (incremental update).
+   * Throws LockUnavailableError if the cross-process write lock is unavailable.
    *
    * Uses a mutex to prevent concurrent indexing operations.
    */
@@ -887,16 +836,9 @@ export class CodeGraph {
       try {
         this.fileLock.acquire();
       } catch (err) {
-        // Contention is a live process named in the lock file. Anything else
-        // (an unreadable lock, a directory where the file should be) is not
-        // contention, and keeps the lock's own message and its unlock hint.
-        const lockHolderPid = this.fileLock.readLiveHolderPid();
-        return {
-          ...(lockHolderPid != null
-            ? { skippedReason: 'locked' as const, lockHolderPid }
-            : { skippedReason: 'lock-failed' as const, lockError: err instanceof Error ? err.message : String(err) }),
-          filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0,
-        };
+        throw new LockUnavailableError(
+          `Sync could not acquire the file lock; retry when the index is available. ${err instanceof Error ? err.message : String(err)}`
+        );
       }
       // A full rebuild in another process (`codegraph index` → recreate)
       // unlinks the database and creates a new file at the same path. A
@@ -905,26 +847,27 @@ export class CodeGraph {
       // to anyone (#1902). Follow the path before writing (one stat), and
       // widen a scoped sync to a full one: whatever the old handle absorbed
       // since the rebuild is gone, so the new file has to be reconciled whole.
-      // If the reopen fails (the rebuild is mid-way), report the lock-busy
-      // shape so the watcher keeps its pending files and retries.
+      // If the reopen fails (the rebuild is mid-way), report lock contention
+      // so the watcher keeps its pending files and retries.
       try {
-        await this.doReopenIfReplacedAsync();
-        if (this.closed) throw new Error('Project closed during index recovery');
-      } catch {
+        this.reopenReplacedDatabase();
+      } catch (err) {
         this.fileLock.release();
-        return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
+        throw new LockUnavailableError(
+          `Sync could not open the rebuilt index yet; retry when the rebuild finishes. ${err instanceof Error ? err.message : String(err)}`
+        );
       }
       if (this.pendingFullReconcile) {
         // `codegraph index` recreates the file, THEN takes the write lock in
         // indexAll. A sync landing in that gap would otherwise run a full
         // reconcile of the empty file and hold the lock the rebuild is about
         // to ask for. A fresh file with no index_state yet is that rebuild:
-        // step aside (lock-busy shape, the watcher retries) and reconcile in
+        // step aside (lock contention, the watcher retries) and reconcile in
         // full once it is done. Bounded, so a rebuild that died before
         // indexing does not park the watcher forever.
         if (this.getIndexState() === null && this.isFreshlyRecreated()) {
           this.fileLock.release();
-          return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
+          throw new LockUnavailableError('A rebuild of this index is in progress; retry when it finishes.');
         }
         // Cleared only once this run completes (below): a sync that throws
         // must leave the full catch-up for the next one.
@@ -973,7 +916,20 @@ export class CodeGraph {
         const fullReconcile = !options.paths || options.paths.length === 0;
         const gitState = this.orchestrator.beginGitIndexState(fullReconcile);
 
-        const result = await this.orchestrator.sync(options.onProgress, options.paths, backpressure);
+        // An interrupted index may have absorbed its changed files before
+        // resolution/synthesis. Detect those orphans BEFORE this sync adds refs.
+        let refreshSynthesis = this.queries.getMetadata('synthesis_pending') === '1' ||
+          this.queries.getUnresolvedReferencesCount() > 0;
+        if (refreshSynthesis) this.queries.setMetadata('synthesis_pending', '1');
+        const result = await this.orchestrator.sync(options.onProgress, options.paths, backpressure,
+          (filePath, content) => {
+            if (!refreshSynthesis && (this.queries.hasSynthesizedEdgesTouchingFile(filePath) ||
+              this.queries.wasSynthesisInput(filePath) ||
+              (content !== undefined && hasSynthesisPattern(filePath, content)))) {
+              refreshSynthesis = true;
+              this.queries.setMetadata('synthesis_pending', '1');
+            }
+          });
 
         // Fold the store phase's WAL BEFORE the post-store reads below
         // (resolution reads on the main thread) — same rationale as
@@ -1072,7 +1028,8 @@ export class CodeGraph {
                   total: totalPasses,
                 });
               },
-              backpressure
+              backpressure,
+              false
             );
           }
         }
@@ -1125,6 +1082,9 @@ export class CodeGraph {
         // Grind them down with the batched resolver; this also makes a bare
         // `codegraph sync` the recovery command for a wedged index. On a
         // healthy index this is one COUNT query.
+        result.pendingRefsProcessed = 0;
+        result.pendingRefsResolved = 0;
+        result.pendingRefsUnresolved = 0;
         const orphanCount = this.queries.getUnresolvedReferencesCount();
         if (orphanCount > 0) {
           options.onProgress?.({
@@ -1133,7 +1093,7 @@ export class CodeGraph {
             total: orphanCount,
           });
 
-          await this.resolveReferencesBatched(
+          const recovery = await this.resolveReferencesBatched(
             (current, total) => {
               options.onProgress?.({
                 phase: 'resolving',
@@ -1148,8 +1108,12 @@ export class CodeGraph {
                 total: totalPasses,
               });
             },
-            backpressure
+            backpressure,
+            false
           );
+          result.pendingRefsProcessed = recovery.stats.total;
+          result.pendingRefsResolved = recovery.stats.resolved;
+          result.pendingRefsUnresolved = recovery.stats.unresolved;
         }
 
         if (filesChanged || orphanCount > 0) {
@@ -1162,9 +1126,16 @@ export class CodeGraph {
           await this.resolver.resolveDeferredThisMemberRefs();
         }
 
+        if (refreshSynthesis) {
+          await this.resolver.refreshSynthesis(this.db.getPath(), (done, total) => {
+            options.onProgress?.({ phase: 'linking', current: done, total });
+          }, backpressure);
+          this.queries.setMetadata('synthesis_pending', '0');
+        }
+
         // Refresh planner stats + checkpoint the WAL after bulk writes.
         // Off-thread — see indexAll's call site.
-        if (filesChanged || result.filesRemoved > 0 || orphanCount > 0) {
+        if (filesChanged || result.filesRemoved > 0 || orphanCount > 0 || refreshSynthesis) {
           await this.db.runMaintenance();
         }
 
@@ -1190,9 +1161,7 @@ export class CodeGraph {
         this.orchestrator.commitHdlProfile();
         this.orchestrator.finishGitIndexState(gitState, fullReconcile, result.failedFilePaths);
 
-        if (fullReconcile && result.filesChecked > 0 && !result.failedFilePaths?.length) {
-          this.pendingFullReconcile = false;
-        }
+        if (fullReconcile && result.filesChecked > 0) this.pendingFullReconcile = false;
         return result;
       } finally {
         // Mirror indexAll's teardown: stop the valve, then restore the
@@ -1220,6 +1189,31 @@ export class CodeGraph {
   // ===========================================================================
 
   /**
+   * Whether an OS watcher event points at a file whose index metadata is still
+   * current. Used on Windows to discard NTFS last-access notifications, which
+   * libuv reports through fs.watch as ordinary change events (#1451).
+   */
+  private isIndexedFileStateCurrent(filePath: string): boolean {
+    const tracked = this.queries.getFileByPath(filePath);
+    if (!tracked) return false;
+
+    try {
+      const stat = fs.statSync(path.join(this.projectRoot, filePath));
+      return (
+        stat.isFile() &&
+        Number.isFinite(stat.mtimeMs) &&
+        Number.isFinite(tracked.modifiedAt) &&
+        stat.size === tracked.size &&
+        Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)
+      );
+    } catch {
+      // Missing/inaccessible files must still reach sync so removals and
+      // transient filesystem failures are reconciled rather than hidden.
+      return false;
+    }
+  }
+
+  /**
    * Start watching for file changes and auto-syncing.
    *
    * Uses native OS file events (FSEvents on macOS, inotify on Linux 19+,
@@ -1235,18 +1229,13 @@ export class CodeGraph {
       this.projectRoot,
       async (paths?: string[]) => {
         const result = await this.sync({ paths });
-        // sync() returns this exact zero-shape iff it failed to acquire the
-        // file lock (a real empty sync always has filesChecked > 0 because
-        // scanDirectory ran). Surface that to the watcher as a typed error
-        // so it keeps pendingFiles + reschedules instead of clearing them
-        // (#449).
-        if (result.filesChecked === 0 && result.durationMs === 0) {
-          throw new LockUnavailableError();
-        }
         const filesChanged = result.filesAdded + result.filesModified + result.filesRemoved;
         return { filesChanged, durationMs: result.durationMs };
       },
       options,
+      process.platform === 'win32'
+        ? (filePath) => this.isIndexedFileStateCurrent(filePath)
+        : undefined,
       () => this.getHdlDependencyPaths()
     );
 
@@ -1484,7 +1473,8 @@ export class CodeGraph {
     // resolution is timer-driven passive checkpoints, which the pool's
     // continuous reads keep perpetually partial — the WAL then accretes the
     // whole phase's write volume (22GB on a 4.6GB DB at kernel scale).
-    backpressure?: () => Promise<void> | null
+    backpressure?: () => Promise<void> | null,
+    synthesize: boolean = true
   ): Promise<ResolutionResult> {
     return this.resolver.resolveAndPersistBatched(onProgress, undefined, onSynthesisProgress, {
       dbPath: this.db.getPath(),
@@ -1502,7 +1492,7 @@ export class CodeGraph {
         end: () => this.db.endBulkRefLoad(),
       },
       backpressure,
-    });
+    }, synthesize);
   }
 
   /**
@@ -1835,6 +1825,11 @@ export class CodeGraph {
    */
   searchNodes(query: string, options?: SearchOptions): SearchResult[] {
     return this.queries.searchNodes(query, options);
+  }
+
+  /** Lexical evidence for an empty explore result; does not alter retrieval. */
+  getExploreMissDiagnostics(query: string) {
+    return this.queries.getExploreMissDiagnostics(query);
   }
 
   /**

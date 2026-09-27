@@ -2,9 +2,6 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
-import { CodeGraph } from '../src';
-import { DatabaseConnection, getDatabasePath } from '../src/db';
 import {
   parseWatchdogTimeoutMs,
   deriveCheckIntervalMs,
@@ -19,6 +16,13 @@ describe('config parsing', () => {
     expect(parseWatchdogTimeoutMs('0')).toBe(DEFAULT_WATCHDOG_TIMEOUT_MS);
     expect(parseWatchdogTimeoutMs('-5')).toBe(DEFAULT_WATCHDOG_TIMEOUT_MS);
     expect(parseWatchdogTimeoutMs('1500')).toBe(1500);
+  });
+
+  it('parseWatchdogTimeoutMs caps at the largest delay a timer can hold (#1966)', () => {
+    // Node runs a setTimeout delay above 2^31-1 ms after 1 ms instead.
+    expect(parseWatchdogTimeoutMs('2147483647')).toBe(2147483647);
+    expect(parseWatchdogTimeoutMs('2147483648')).toBe(2147483647);
+    expect(parseWatchdogTimeoutMs('3000000000')).toBe(2147483647);
   });
 
   it('deriveCheckIntervalMs stays within [50, 2000] and scales with the timeout', () => {
@@ -61,35 +65,25 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
     env: Record<string, string>,
     body: string,
     hardTimeoutMs: number,
-    progressPaths?: string[],
-    prelude = ''
-  ): Promise<{ code: number | null; signal: NodeJS.Signals | 'TIMEOUT' | null; stderr: string }> {
+    progressPaths?: string[]
+  ): Promise<{ code: number | null; signal: NodeJS.Signals | 'TIMEOUT' | null }> {
     const src = `
-      (async () => {
-        ${prelude}
-        const { installMainThreadWatchdog } = require(${JSON.stringify(MODULE)});
-        installMainThreadWatchdog(${progressPaths ? JSON.stringify({ progressPaths }) : ''});
-        ${body}
-      })().catch((error) => {
-        console.error(error);
-        process.exit(23);
-      });
+      const { installMainThreadWatchdog } = require(${JSON.stringify(MODULE)});
+      installMainThreadWatchdog(${progressPaths ? JSON.stringify({ progressPaths }) : ''});
+      ${body}
     `;
     const child = spawn(process.execPath, ['-e', src], {
       env: { ...process.env, ...env },
-      stdio: ['ignore', 'ignore', 'pipe'],
+      stdio: ['ignore', 'ignore', 'ignore'],
     });
-    let stderr = '';
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk: string) => { stderr += chunk; });
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         child.kill('SIGKILL');
-        resolve({ code: null, signal: 'TIMEOUT', stderr });
+        resolve({ code: null, signal: 'TIMEOUT' });
       }, hardTimeoutMs);
       child.on('exit', (code, signal) => {
         clearTimeout(timer);
-        resolve({ code, signal, stderr });
+        resolve({ code, signal });
       });
     });
   }
@@ -102,6 +96,15 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
   function expectKilled(r: { code: number | null; signal: NodeJS.Signals | 'TIMEOUT' | null }): void {
     expect(r.signal === 'SIGKILL' || (r.signal === null && r.code !== 0 && r.code !== null)).toBe(true);
   }
+
+  it('leaves a healthy process alone when the timeout is set past what a timer can hold (#1966)', async () => {
+    const r = await runChild(
+      { CODEGRAPH_WATCHDOG_TIMEOUT_MS: '3000000000' },
+      'setTimeout(() => process.exit(0), 1000);',
+      8000
+    );
+    expect(r).toEqual({ code: 0, signal: null });
+  }, 12000);
 
   it('SIGKILLs a process whose main thread wedges in a sync loop', async () => {
     const r = await runChild(
@@ -207,69 +210,6 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
     ]);
     expectKilled(r);
   }, 20000);
-
-  it('keeps interrupted secondary-index recovery off the watched event loop (#1887)', async () => {
-    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-index-recovery-'));
-    try {
-      const project = CodeGraph.initSync(projectRoot);
-      project.close();
-
-      const dbPath = getDatabasePath(projectRoot);
-      const seed = DatabaseConnection.open(dbPath);
-      const expectedIndexes = (seed.getDb()
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
-        .all() as Array<{ name: string }>).map((row) => row.name);
-
-      seed.beginBulkNodeLoad();
-      seed.beginBulkParseLoad();
-      const insert = seed.getDb().prepare(
-        `INSERT INTO nodes (
-          id, kind, name, qualified_name, file_path, language,
-          start_line, end_line, start_column, end_column, updated_at
-        ) VALUES (?, 'function', ?, ?, ?, 'typescript', 1, 1, 0, 1, ?)`
-      );
-      seed.getDb().exec('BEGIN');
-      try {
-        for (let i = 0; i < 600_000; i++) {
-          const name = `symbol_${i}`;
-          insert.run(`node_${i}`, name, name, `src/file_${i % 1000}.ts`, Date.now());
-        }
-        seed.getDb().exec('COMMIT');
-      } catch (error) {
-        seed.getDb().exec('ROLLBACK');
-        throw error;
-      }
-      seed.endBulkNodeLoad();
-      seed.close();
-
-      const DIST_INDEX = path.resolve(__dirname, '../dist/index.js');
-      const prelude = `
-        const { CodeGraph, initGrammars } = require(${JSON.stringify(DIST_INDEX)});
-        await initGrammars();
-      `;
-      const body = `
-        CodeGraph.open(${JSON.stringify(projectRoot)}).then((cg) => {
-          const names = cg.db.getDb()
-            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
-            .all().map((row) => row.name);
-          cg.close();
-          process.exit(JSON.stringify(names) === ${JSON.stringify(JSON.stringify(expectedIndexes))} ? 0 : 21);
-        }).catch(() => process.exit(22));
-      `;
-      const r = await runChild(
-        { CODEGRAPH_WATCHDOG_TIMEOUT_MS: '100' },
-        body,
-        20_000,
-        [dbPath, `${dbPath}-wal`],
-        prelude
-      );
-
-      expect(r.signal).toBeNull();
-      expect(r.code, r.stderr).toBe(0);
-    } finally {
-      fs.rmSync(projectRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-    }
-  }, 30000);
 
   it('does NOT kill a wedged process when CODEGRAPH_NO_WATCHDOG=1', async () => {
     const { code, signal } = await runChild(
