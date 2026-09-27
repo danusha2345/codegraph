@@ -165,7 +165,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
-- An MPEG transport stream video that happens to be named `.ts` (golden fixtures under `testdata/`, e2e clips) is now recognised from its first bytes and skipped as non-source instead of being fed to the TypeScript parser — a 900 KB clip used to cost about 28 seconds of CPU per file for no symbols, and a folder of them minutes. Real TypeScript is never affected. (#1910)
+- An MPEG transport stream video that happens to be named `.ts` (golden fixtures under `testdata/`, e2e clips) is now recognised from its first bytes and skipped instead of being fed to the TypeScript parser, which spent a long time on each clip for no symbols. Real TypeScript files are still indexed. (#1910)
 - File watching no longer drops the full re-scan a removed directory asks for when that sync fails, so the deleted files leave the index instead of lingering. (#1964)
 - Daemon startup and cleanup now preserve live legacy PID-only locks while still reclaiming dead or identity-disproved records, preventing two writers from serving the same project.
 - Incremental sync now keeps edge rebinding crash-safe: replacing a resolved edge with its recovery reference commits atomically, so an interruption cannot permanently remove the relationship.
