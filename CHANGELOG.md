@@ -210,6 +210,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Tag-based ColdFusion (CFML) files no longer leak parser memory during indexing. (#1583)
 - A file over the size limit is no longer read before it is skipped. Large committed video and blob fixtures used to be loaded into memory in full, once per indexing pass, only to be discarded; indexing, change detection and the viewer now go by the file's size instead. (#1910)
 - An MPEG transport stream video that happens to be named `.ts` (golden fixtures under `testdata/`, e2e clips) is now recognised from its first bytes and skipped instead of being fed to the TypeScript parser, which spent a long time on each clip for no symbols. Real TypeScript files are still indexed. (#1910)
+- On Windows, the shared MCP daemon now waits longer for another program — an antivirus scan, an indexer, or another session reading its lock file — to let go of that file, so it starts instead of leaving the session to fall back to a slower in-process server. (#1773)
 - File watching no longer drops the full re-scan a removed directory asks for when that sync fails, so the deleted files leave the index instead of lingering. (#1964)
 - Running `codegraph index` while the MCP server is running no longer leaves live auto-sync writing into the old, replaced index: the server now switches to the rebuilt index before its next update and catches up on everything it would otherwise have missed. (#1902)
 - Daemon startup and cleanup now preserve live legacy PID-only locks while still reclaiming dead or identity-disproved records, preventing two writers from serving the same project.
@@ -281,6 +282,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - On Windows, simply reading a file no longer shows up as a pending edit: watcher events whose file still has the indexed size and modification time (NTFS access-time notifications) are ignored. Thanks @radeilic for the report and @JJordan0C. (#1451)
 - The Windows bundle now includes an extensionless `codegraph` launcher, so Git Bash — and the Claude Code prompt hook that runs through it — can find `codegraph` instead of failing with exit code 127. Thanks @Dj-Khalle. (#1278)
 - Running `install.sh` from Git Bash, MSYS or Cygwin on Windows now prints the PowerShell install command instead of failing with "unsupported OS". Thanks @Dnllns. (#1294)
+- Indexing no longer hangs at full CPU when a database write fails partway through; it now stops and reports the error. (#1773)
 
 #### Screens, links and navigation
 
