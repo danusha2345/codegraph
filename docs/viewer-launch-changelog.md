@@ -161,6 +161,10 @@ These describe `codegraph ui` and its screens. They were taken out of `## [Unrel
 
 ## Fixes — Symbols, tests and the viewer
 
+- **Saved trails stay inside the indexed project even when a directory or trail file is a symlink.** The viewer refuses paths whose nearest existing directory resolves outside the project, opens trail files without following links and without blocking on a named pipe left in the trails directory, and creates its atomic temporary file exclusively so a pre-planted link cannot capture a read or write.
+
+- **Saved-trail authors are now resolved per project.** An embedded host serving several projects in one process no longer reuses the first repository's Git user name for every later trail.
+
 - In `codegraph ui`, routes whose handlers live in more than 60 different files are all linked to their handler, instead of the later ones showing "not in the index". (#1975)
 
 - The viewer continues to count module-level initializer calls as top-level file activity in entry points and file screens.
