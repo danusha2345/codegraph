@@ -720,22 +720,23 @@ export function matchFunctionRef(
 const NO_NESTED_FUNCTIONS = new Set<string>(['c', 'cpp']);
 
 /**
- * A function nested inside another FUNCTION is only callable from within its
- * container — Python, JS/TS, and every closure language scope it lexically.
+ * A function nested inside another function, or an anonymous-class method
+ * inside a function, is only callable from within that container.
  * Resolving a bare name from elsewhere to a nested local fabricates an edge
  * scope already rules out: `join(...)` in one function must never bind to a
  * `join` defined inside a DIFFERENT function (#1230). A candidate whose
  * qualifiedName parent is a same-file function/method is kept only when the
- * ref originates inside that parent's line range. Class members are
- * unaffected (their parent resolves to a class-like node), as are top-level
- * symbols and C++ namespace-prefixed names (the prefix has no node).
+ * ref originates inside that parent's line range. Ordinary class members and
+ * top-level symbols have no enclosing function; C++ namespace prefixes have
+ * no function node.
  */
 function isLexicallyReachable(
   candidate: Node,
   ref: UnresolvedRef,
   context: ResolutionContext
 ): boolean {
-  if (candidate.kind !== 'function') return true;
+  if (candidate.kind !== 'function' && candidate.kind !== 'method') return true;
+  if (candidate.kind === 'method' && !candidate.qualifiedName.includes('$anon@')) return true;
   // C and C++ have no nested named functions, so a function the graph shows
   // inside another is an extraction artifact, not a scope: tree-sitter-c
   // cannot parse a macro call whose arguments are designated initializers
@@ -746,21 +747,22 @@ function isLexicallyReachable(
   if (NO_NESTED_FUNCTIONS.has(candidate.language)) return true;
   const qn = candidate.qualifiedName;
   if (!qn || !qn.includes('::')) return true;
-  const parentQn = qn.slice(0, qn.lastIndexOf('::'));
-  const containers = context
-    .getNodesByQualifiedName(parentQn)
-    .filter(
-      (p) =>
-        p.filePath === candidate.filePath &&
-        (p.kind === 'function' || p.kind === 'method') &&
-        p.startLine <= candidate.startLine &&
-        p.endLine >= candidate.endLine
+  let parentQn = qn.slice(0, qn.lastIndexOf('::'));
+  while (parentQn) {
+    const containers = context.getNodesByQualifiedName(parentQn).filter((p) =>
+      p.filePath === candidate.filePath &&
+      (p.kind === 'function' || p.kind === 'method') &&
+      p.startLine <= candidate.startLine && p.endLine >= candidate.endLine
     );
-  if (containers.length === 0) return true;
-  return (
-    ref.filePath === candidate.filePath &&
-    containers.some((p) => ref.line >= p.startLine && ref.line <= p.endLine)
-  );
+    if (containers.length > 0) {
+      return ref.filePath === candidate.filePath &&
+        containers.some((p) => ref.line >= p.startLine && ref.line <= p.endLine);
+    }
+    const separator = parentQn.lastIndexOf('::');
+    if (separator < 0) break;
+    parentQn = parentQn.slice(0, separator);
+  }
+  return true;
 }
 
 /** Languages whose module boundary is `import`/`export` (or CommonJS). */
@@ -1715,6 +1717,26 @@ export function matchByExactName(
 }
 
 /**
+ * Whether `qualifiedName` ends with `suffix` at a real `::` scope boundary —
+ * NOT a plain `String.endsWith`, which false-matches across an identifier
+ * boundary purely by character coincidence: `"Aaa::operator+"` ends with the
+ * literal substring `"a::operator+"` only because `Aaa` itself happens to
+ * end in the letter `a`, even though `"a"` there was never meant as a scope
+ * qualifier at all — it was a C++ receiver *variable* named `a` in a
+ * `a.operator+(b)` call, decoy-matching the unrelated `Aaa::operator+`
+ * method instead of leaving receiver-type inference (`matchMethodCall`) to
+ * find the real `V::operator+`. A match only counts when the
+ * suffix is the WHOLE qualifiedName, or the two characters immediately
+ * preceding it are a real `::` separator.
+ */
+function endsWithQualifiedSegment(qualifiedName: string, suffix: string): boolean {
+  if (qualifiedName === suffix) return true;
+  if (!qualifiedName.endsWith(suffix)) return false;
+  const boundary = qualifiedName.length - suffix.length;
+  return boundary >= 2 && qualifiedName[boundary - 1] === ':' && qualifiedName[boundary - 2] === ':';
+}
+
+/**
  * Try to resolve by qualified name
  */
 export function matchByQualifiedName(
@@ -1733,14 +1755,31 @@ export function matchByQualifiedName(
   // must never resolve to a yaml/properties config node — that's a wrong edge
   // AND it hides the real callee. Drop those from both the exact and the partial
   // candidate sets so resolution falls through to method resolution below (#1180).
-  const keepForRef = (nodes: Node[]): Node[] =>
-    ref.referenceKind === 'calls'
-      ? nodes.filter(
-          (n) => !(n.kind === 'constant' && (n.language === 'yaml' || n.language === 'properties')),
-        )
-      : nodes;
+  const keepForRef = (nodes: Node[]): Node[] => {
+    let kept = nodes;
+    if (ref.referenceKind === 'calls') {
+      kept = kept.filter(
+        (n) => !(n.kind === 'constant' && (n.language === 'yaml' || n.language === 'properties')),
+      );
+    }
+    return isInheritanceRef(ref) ? kept.filter(isSupertypeTarget) : kept;
+  };
 
-  const candidates = keepForRef(context.getNodesByQualifiedName(ref.referenceName));
+  // The GENERIC class-hierarchy walker's qualifiedName always joins scope
+  // with `::` (buildQualifiedName in tree-sitter.ts) regardless of source
+  // language, but an extends/implements clause's own text is recorded
+  // verbatim from the language's own syntax — so a Java/C# dotted supertype
+  // (`Outer.Inner`, `IFoo.Stub`) never matched a real indexed type's
+  // `::`-joined qualifiedName without normalizing the separator first.
+  // Scoped to ONLY inheritance references: several non-generic extractors
+  // (MyBatis XML statements, for one) deliberately build a MIXED
+  // qualifiedName that keeps literal dots from an already-dotted Java
+  // package/namespace string and adds `::` only at one specific boundary —
+  // blanket-normalizing every reference's dots to `::` mangled those.
+  const normalizedQualifiedRef = isInheritanceRef(ref)
+    ? ref.referenceName.replace(/\./g, '::')
+    : ref.referenceName;
+  const candidates = keepForRef(context.getNodesByQualifiedName(normalizedQualifiedRef));
 
   if (candidates.length === 1) {
     return {
@@ -1801,9 +1840,28 @@ export function matchByQualifiedName(
   const parts = ref.referenceName.split(/[:.]/);
   const lastName = parts[parts.length - 1];
   if (lastName) {
+    // The strict `::`-boundary check only matters where normalization
+    // actually ran (inheritance refs) — every other reference kind keeps
+    // the original, deliberately loose `endsWith` (e.g. Expo's JS call site
+    // binds a shortened alias like `Haptics` that only matches the END of
+    // the native module's `...::ExpoHaptics.method` qualifiedName by design,
+    // with no `::` immediately before it).
     const partialCandidates = keepForRef(context.getNodesByName(lastName))
-      .filter((candidate) => candidate.qualifiedName.endsWith(ref.referenceName));
-    const chosen = preferCallSiteFile(partialCandidates, ref.filePath)[0];
+      .filter((candidate) =>
+        isInheritanceRef(ref)
+          ? endsWithQualifiedSegment(candidate.qualifiedName, normalizedQualifiedRef)
+          : candidate.qualifiedName.endsWith(normalizedQualifiedRef)
+      );
+    // `RecyclerView.LayoutManager` can exist in both AndroidX and the
+    // framework. For inheritance, pick the uniquely closest source tree;
+    // an equal-distance tie has no safe target.
+    const closest = isInheritanceRef(ref) && partialCandidates.length > 1
+      ? partialCandidates.map((node) => ({ node, distance: computePathProximity(ref.filePath, node.filePath) }))
+          .sort((a, b) => b.distance - a.distance)
+      : null;
+    const chosen = closest
+      ? (closest[0]!.distance > closest[1]!.distance ? closest[0]!.node : null)
+      : preferCallSiteFile(partialCandidates, ref.filePath)[0];
     if (chosen) {
       return {
         original: ref,
@@ -2093,6 +2151,10 @@ export function resolveMethodOnType(
   /** Recursion guard for the supertype/conformance walk. */
   depth = 0,
 ): ResolvedRef | null {
+  // Only calls and captured method values have a callable receiver. Inheritance
+  // references such as `class Foo extends IBar.Stub` must not reach this helper.
+  if (ref.referenceKind !== 'calls' && ref.referenceKind !== 'function_ref') return null;
+
   // Look up methods by name and match by qualifiedName ending in
   // `<typeName>::<methodName>`. This works whether the method is defined
   // in-class (`class Foo { int bar() { ... } }`) or out-of-line in a separate
@@ -2441,6 +2503,7 @@ export function matchCppCallChain(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): ResolvedRef | null {
+  if (ref.referenceKind !== 'calls') return null;
   const m = ref.referenceName.match(/^(.+)\(\)\.(\w+)$/);
   if (!m || !m[1] || !m[2]) return null;
   const cls = resolveCppCallResultType(m[1], ref, context);
@@ -2463,6 +2526,7 @@ export function matchScopedCallChain(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): ResolvedRef | null {
+  if (ref.referenceKind !== 'calls') return null;
   const m = ref.referenceName.match(/^(.+)\(\)\.(\w+)$/);
   if (!m || !m[1] || !m[2]) return null;
   const inner = m[1];
@@ -2502,6 +2566,7 @@ export function matchDottedCallChain(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): ResolvedRef | null {
+  if (ref.referenceKind !== 'calls') return null;
   const m = ref.referenceName.match(/^(.+)\(\)\.(\w+)$/);
   if (!m || !m[1] || !m[2]) return null;
   const inner = m[1]; // `Foo.getInstance`
@@ -4237,6 +4302,12 @@ export function matchMethodCall(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  // A dotted/scoped name is not necessarily an invocation: Java inheritance
+  // refs such as `IBar.Stub` have the same surface shape. Let type-reference
+  // strategies handle non-call refs rather than falling through to the
+  // same-named-method heuristics below.
+  if (ref.referenceKind !== 'calls') return null;
+
   // Parse method call patterns like "obj.method" or "Class::method". The method
   // part allows trailing `:` keywords so Objective-C selectors resolve
   // (`SDImageCache.storeImage:`, `obj.setX:y:`); colons never appear in other
@@ -4827,7 +4898,7 @@ export function matchMethodCall(
       return null;
     }
     const methods = methodCandidates.filter(
-      (n) => n.kind === 'method' && n.name === methodName
+      (n) => n.kind === 'method' && n.name === methodName && isLexicallyReachable(n, ref, context)
     );
 
     // Filter to same-language candidates first
@@ -6169,11 +6240,14 @@ export function matchFuzzy(
   // Use pre-built lowercase index for O(1) lookup instead of scanning all nodes
   const candidates = context.getNodesByLowerName(lowerName);
 
-  // Filter to callable kinds only (function, method, class)
-  const callableKinds = new Set(['function', 'method', 'class']);
-  const callableCandidates = candidates.filter((n) => callableKinds.has(n.kind))
-    .filter((n) => (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
-      sameLanguageFamily(n.language, ref.language));
+  // Calls use callable kinds; inheritance is a type reference and must never
+  // fall through to a same-named method/function (HIGH-1).
+  const eligibleCandidates = isInheritanceRef(ref)
+    ? candidates.filter(isSupertypeTarget)
+    : candidates.filter((n) => n.kind === 'function' || n.kind === 'method' || n.kind === 'class');
+  const callableCandidates = eligibleCandidates.filter((n) =>
+    (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
+    sameLanguageFamily(n.language, ref.language));
 
   // Prefer same-language matches
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);

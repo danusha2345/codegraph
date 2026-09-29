@@ -93,6 +93,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Indexing a project that vendors tree-sitter grammars is faster: the C function-pointer pass now skips generated C files, and a tree-sitter `parser.c` counts as generated even when it carries no banner (releases before 0.25 print none).
 - Linking callbacks and events is faster on files with many registrations: line numbers come from a newline index instead of re-splitting the file for every match.
 - In TypeScript, `this.field.method()` on a type declared in two equally near apps now picks the same target on every machine. The tie used to be broken by locale-dependent string comparison, so indexes built with different system locales could disagree.
+- Java and Kotlin inheritance now resolves nested types more precisely, and anonymous implementations retain their members after re-indexing.
 
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
