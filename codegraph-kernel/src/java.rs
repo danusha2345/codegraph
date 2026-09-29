@@ -429,6 +429,7 @@ impl<'t> Walker<'t> {
     }
 
     fn is_static(&self, node: Node) -> bool {
+        if node.kind() == "constant_declaration" { return true; }
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
                 if child.kind() == "modifiers" && self.text(child).contains("static") {
@@ -441,6 +442,7 @@ impl<'t> Walker<'t> {
 
     /// javaExtractor.isConst: `static final` field → constant.
     fn is_const(&self, node: Node) -> bool {
+        if node.kind() == "constant_declaration" { return true; }
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
                 if child.kind() == "modifiers" {
@@ -510,7 +512,7 @@ impl<'t> Walker<'t> {
         } else if kind == "enum_declaration" {
             self.extract_enum(node);
             skip_children = true;
-        } else if kind == "field_declaration" && self.inside_class_like() {
+        } else if matches!(kind, "field_declaration" | "constant_declaration") && self.inside_class_like() {
             self.extract_field(node);
             self.scan_fn_ref_subtree(node, 0);
             skip_children = true;
@@ -937,13 +939,27 @@ impl<'t> Walker<'t> {
             .or_else(|| node.child_by_field_name("type"))
             .or_else(|| node.child_by_field_name("name"))
             .or_else(|| node.named_child(0));
-        let mut type_name = type_node.map(|t| self.text(t).to_string()).unwrap_or_else(|| "Object".to_string());
-        type_name = strip_generic_and_qualifier(&type_name);
-        if type_name.is_empty() {
-            type_name = "Object".to_string();
+        let raw_type_name = type_node.map(|t| self.text(t).to_string()).unwrap_or_else(|| "Object".to_string());
+        // The `extends` reference must carry the FULL dotted name (generics
+        // stripped, qualifier kept) so nested-type resolution can find it.
+        // Only the anon class's own cosmetic name is truncated to
+        // the bare last segment, matching the portable extractor.
+        let full_type_name = {
+            let mut n = raw_type_name.clone();
+            if let Some(lt) = n.find('<') {
+                if lt > 0 {
+                    n.truncate(lt);
+                }
+            }
+            let trimmed = n.trim().to_string();
+            if trimmed.is_empty() { "Object".to_string() } else { trimmed }
+        };
+        let mut short_type_name = strip_generic_and_qualifier(&raw_type_name);
+        if short_type_name.is_empty() {
+            short_type_name = "Object".to_string();
         }
 
-        let anon_name = format!("<{type_name}$anon@{}>", node.start_position().row + 1);
+        let anon_name = format!("<{short_type_name}$anon@{}>", node.start_position().row + 1);
         let Some(row) = self.create_node("class", &anon_name, node, Extra::default()) else {
             return;
         };
@@ -953,7 +969,7 @@ impl<'t> Walker<'t> {
             Some(t) => (t.start_position().row as u32, self.col_of(t)),
             None => (node.start_position().row as u32, self.col_of(node)),
         };
-        self.push_ref(row, &type_name, edge_kind_index("extends").unwrap(), line, column);
+        self.push_ref(row, &full_type_name, edge_kind_index("extends").unwrap(), line, column);
 
         self.stack.push(Scope { row, kind: "class", name: anon_name });
         for i in 0..body.named_child_count() {

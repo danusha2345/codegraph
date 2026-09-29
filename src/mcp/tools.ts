@@ -275,7 +275,7 @@ export interface ExploreOutputBudget {
   includeRelationships: boolean;
   /** Include the "Additional relevant files (not shown)" trailing list. */
   includeAdditionalFiles: boolean;
-  /** Include the "Complete source code is included above…" reminder. */
+  /** Include the "… source for N files is included above" reminder. */
   includeCompletenessSignal: boolean;
   /**
    * Include the advisory exploration-guidance note at the end. Purely
@@ -1730,12 +1730,11 @@ export const tools: ToolDefinition[] = [
       properties: {
         query: {
           type: 'string',
-          description: 'Symbol names, file names, or short code terms to explore (e.g., "AuthService loginUser session-manager", "GraphTraverser BFS impact traversal.ts"). For a flow question, name the symbols spanning the flow (e.g. "mutateElement renderScene"). A natural-language question works too — no prior codegraph_search needed.',
+          description: 'Symbol names, file names, or short code terms to explore (e.g., "AuthService loginUser session-manager", "GraphTraverser BFS impact traversal.ts"). For a flow question, name the symbols spanning the flow (e.g. "mutateElement renderScene"). A natural-language question works too.',
         },
         maxFiles: {
           type: 'number',
-          description: 'Maximum number of files to include source code from (default: 12)',
-          default: 12,
+          description: 'Maximum number of files to return source from, 1–20. Omit it to use a default sized to the project (4 files below 150 indexed files, 5 below 500, 8 otherwise). Total output is also capped by characters (about 13K–24K by project size), so a higher maxFiles spreads that budget over more files rather than returning more text.',
         },
         hdlAccess: {
           type: 'string',
@@ -1875,6 +1874,23 @@ function canonicalPath(p: string): string {
 export const MAX_CACHED_PROJECTS = 8;
 
 /**
+ * How long an explicit-`projectPath` project may go unused before the handler
+ * releases it (#2087). Releasing frees its SQLite handle, its watcher and the
+ * writer lock the engine may hold on that project — which otherwise stays held
+ * for the whole life of this daemon, locking the project's own daemon and
+ * `codegraph index` out. The next call reopens it and catches up.
+ * `CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS` overrides it; `0` never releases.
+ */
+const DEFAULT_PROJECT_IDLE_TIMEOUT_MS = 600_000;
+function resolveProjectIdleTimeoutMs(): number {
+  const raw = process.env.CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS;
+  if (raw === undefined || raw === '') return DEFAULT_PROJECT_IDLE_TIMEOUT_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_PROJECT_IDLE_TIMEOUT_MS;
+  return Math.floor(n);
+}
+
+/**
  * Engine-side lifecycle for a project the ToolHandler opened for an explicit
  * `projectPath` (#1835). `activate` gives it the same treatment the default
  * project gets — a file watcher while it stays open and a catch-up sync — and
@@ -1899,6 +1915,10 @@ export class ToolHandler {
   // CANONICAL (realpath) index root. Map insertion order doubles as LRU order:
   // a hit re-inserts, and `MAX_CACHED_PROJECTS` bounds the size (#1835).
   private projectCache: Map<string, CodeGraph> = new Map();
+  // When each cached root was last handed to a call, and the one timer that
+  // releases the oldest once it has been idle long enough (#2087).
+  private projectUsedAt: Map<string, number> = new Map();
+  private idleReleaseTimer: NodeJS.Timeout | null = null;
   // Engine hook that watches + catches up an explicit project (null for the
   // CLI and worker-thread handlers, which never own a watcher).
   private projectLifecycle: ProjectLifecycle | null = null;
@@ -2267,6 +2287,7 @@ export class ToolHandler {
       // Refresh LRU position.
       this.projectCache.delete(canonicalRoot);
       this.projectCache.set(canonicalRoot, cached);
+      this.projectUsedAt.set(canonicalRoot, Date.now());
       return this.freshen(cached);
     }
 
@@ -2276,6 +2297,7 @@ export class ToolHandler {
       if (isSameIndexRoot(root, resolvedRoot)) {
         this.projectCache.delete(root);
         this.projectCache.set(root, open);
+        this.projectUsedAt.set(root, Date.now());
         return this.freshen(open);
       }
     }
@@ -2283,6 +2305,7 @@ export class ToolHandler {
     const open = () => loadCodeGraph().openSync(canonicalRoot);
     const cg = this.projectLifecycle?.open(canonicalRoot, open) ?? open();
     this.projectCache.set(canonicalRoot, cg);
+    this.projectUsedAt.set(canonicalRoot, Date.now());
     this.trimProjects();
     return cg;
   }
@@ -2302,13 +2325,21 @@ export class ToolHandler {
     await this.awaitCatchUpGate(gate);
   }
 
-  /** Never evict a graph while a tool call or its timed-out reconcile uses it. */
+  /**
+   * Never evict a graph while a tool call or its timed-out reconcile uses it.
+   * Evicts over the LRU bound, on close, and once idle past the timeout
+   * (#2087). The cache is in last-use order, so idle entries lead it.
+   */
   private trimProjects(): void {
     if (this.activeCalls > 0) return;
+    const idleMs = resolveProjectIdleTimeoutMs();
+    const now = Date.now();
     for (const [root, cg] of this.projectCache) {
-      if (!this.closing && this.projectCache.size <= MAX_CACHED_PROJECTS) break;
+      const idle = idleMs > 0 && now - (this.projectUsedAt.get(root) ?? now) >= idleMs;
+      if (!this.closing && this.projectCache.size <= MAX_CACHED_PROJECTS && !idle) break;
       if (this.projectGates.has(cg)) continue;
       this.projectCache.delete(root);
+      this.projectUsedAt.delete(root);
       if (this.projectLifecycle) {
         this.pendingCloses++;
         void Promise.resolve(this.projectLifecycle.release(cg)).finally(() => {
@@ -2319,6 +2350,26 @@ export class ToolHandler {
     }
     if (this.closing && this.projectCache.size === 0 && this.pendingCloses === 0) {
       for (const resolve of this.closeWaiters.splice(0)) resolve();
+    }
+    this.scheduleIdleRelease(idleMs);
+  }
+
+  /**
+   * Arm one unref'd timer for the oldest project a trim could release. A
+   * project whose catch-up is still running is trimmed when that settles; the
+   * 1s floor keeps a project a trim must skip from re-arming in a tight loop.
+   */
+  private scheduleIdleRelease(idleMs: number): void {
+    if (this.idleReleaseTimer || this.closing || idleMs <= 0) return;
+    for (const [root, cg] of this.projectCache) {
+      if (this.projectGates.has(cg)) continue;
+      const due = (this.projectUsedAt.get(root) ?? Date.now()) + idleMs - Date.now();
+      this.idleReleaseTimer = setTimeout(() => {
+        this.idleReleaseTimer = null;
+        this.trimProjects();
+      }, Math.min(Math.max(due, 1000), 0x7fffffff)); // setTimeout's 32-bit cap
+      this.idleReleaseTimer.unref();
+      return;
     }
   }
 
@@ -2354,6 +2405,8 @@ export class ToolHandler {
   closeAll(): Promise<void> {
     this.closing = true;
     this.worktreeMismatchCache.clear();
+    if (this.idleReleaseTimer) clearTimeout(this.idleReleaseTimer);
+    this.idleReleaseTimer = null;
     this.trimProjects();
     if (this.projectCache.size === 0 && this.activeCalls === 0 && this.pendingCloses === 0) return Promise.resolve();
     return new Promise((resolve) => this.closeWaiters.push(resolve));
@@ -3329,6 +3382,13 @@ export class ToolHandler {
         registeredAt,
       };
     }
+    if (m?.synthesizedBy === 'python-override') {
+      return {
+        label: `base-method dispatch — runs the subclass override (dynamic dispatch)`,
+        compact: `dynamic: base → override${at}`,
+        registeredAt,
+      };
+    }
     if (m?.synthesizedBy === 'closure-collection') {
       const field = m.field ? `\`${String(m.field)}\`` : 'a collection';
       return {
@@ -3616,7 +3676,7 @@ export class ToolHandler {
       '',
       ...notes,
       '',
-      '> These sites choose their call target at runtime (registry / bus / reflection) — the site shown IS where the flow continues. To follow it, run codegraph_explore or codegraph_node on a candidate; source for the sites above is included below.',
+      '> These sites choose their call target at runtime (registry / bus / reflection) — the site shown IS where the flow continues. To follow it, run codegraph_explore on a candidate; source for the sites above is included below.',
       '',
     ].join('\n');
   }
@@ -7309,7 +7369,7 @@ export class ToolHandler {
       ? exploreCompletenessNotes(filesIncluded, trimmedShown, [...renderedFilePaths, ...fileGroups.keys()])
         .map((note) => ['', '---', note])
       : anyFileTrimmed || trimmedShown.length > 0
-        ? [['', `> Some file sections were trimmed for size. Elided symbols are named inside gap markers as \`name (file:line)\` and preferred in the file header — run another \`codegraph_explore\` (or \`codegraph_node\`) with those exact names for their source.`]]
+        ? [['', `> Some file sections were trimmed for size. Elided symbols are named inside gap markers as \`name (file:line)\` and preferred in the file header — run another \`codegraph_explore\` with those exact names for their source.`]]
         : [];
     /** Whether a trimmed section survives in `text` — picks a fallback note's wording after a cut. */
     const trimmedIn = (text: string): boolean =>

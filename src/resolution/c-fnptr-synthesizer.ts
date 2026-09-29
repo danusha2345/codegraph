@@ -457,13 +457,19 @@ interface FileFacts {
 const NO_INCLUDES: string[] = [];
 
 export async function cFnPointerDispatchEdges(
-  _queries: QueryBuilder,
+  queries: QueryBuilder,
   ctx: ResolutionContext,
   onYield: MaybeYield,
   onFraction?: (fraction: number) => void
 ): Promise<Edge[]> {
   let scannedFiles = 0;
-  const files = ctx.getAllFiles().filter((f) => C_CPP_EXT.test(f));
+  const cFiles = ctx.getAllFiles().filter((f) => C_CPP_EXT.test(f));
+  // Generated C (parser tables, protobuf-c, bison output) holds data tables,
+  // not the hand-written registrations and dispatch sites this pass links,
+  // and it can dwarf the real code: 248 MB of tree-sitter parsers in one
+  // repository, for no edges.
+  const generated = queries.generatedPredicateFor(cFiles);
+  const files = cFiles.filter((f) => !generated(f));
   if (files.length === 0) return [];
 
   // CODEGRAPH_SYNTH_TIMINGS sub-attribution: this pass is 86% of kernel-scale
@@ -918,7 +924,9 @@ export async function cFnPointerDispatchEdges(
 
   // ---- function-name → node resolution (prefer a function in the same file) ----
   const resolveFn = (name: string, preferFile?: string): Node | null => {
-    const cands = ctx.getNodesByName(name).filter((n) => FN_KINDS.has(n.kind));
+    // C and C++ functions only: a same-named Python or Rust function is never
+    // what a C table registers, and must not displace the C one.
+    const cands = ctx.getNodesByName(name).filter((n) => FN_KINDS.has(n.kind) && C_CPP_EXT.test(n.filePath));
     if (cands.length === 0) return null;
     if (cands.length === 1) return cands[0]!;
     if (preferFile) {

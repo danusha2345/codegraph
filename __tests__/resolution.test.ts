@@ -81,6 +81,237 @@ describe('Resolution Module', () => {
   });
 
   describe('Name Matcher', () => {
+    it('follows a Java static field to its anonymous method without guessing a different field', () => {
+      const makeNode = (id: string, kind: Node['kind'], name: string, qualifiedName: string,
+        filePath: string): Node => ({ id, kind, name, qualifiedName, filePath,
+          language: 'java', startLine: 1, endLine: 10, startColumn: 0, endColumn: 0, updatedAt: 0 });
+      const field = makeNode('field', 'constant', 'CREATOR', 'pkg::SelectGesture::CREATOR', 'SelectGesture.java');
+      field.signature = 'Creator<SelectGesture> CREATOR';
+      const anon = makeNode('anon', 'class', '<Creator$anon@2>',
+        'pkg::SelectGesture::CREATOR::<Creator$anon@2>', 'SelectGesture.java');
+      const correct = makeNode('correct', 'method', 'createFromParcel',
+        `${anon.qualifiedName}::createFromParcel`, 'SelectGesture.java');
+      const wrong = makeNode('wrong', 'method', 'createFromParcel',
+        'pkg::Other::createFromParcel', 'Other.java');
+      const entry = makeNode('entry', 'enum_member', 'KEYGUARD', 'pkg::ScrimState::KEYGUARD', 'ScrimState.java');
+      const enumMethod = makeNode('enum-method', 'method', 'getBehindTint',
+        'pkg::ScrimState::getBehindTint', 'ScrimState.java');
+      const object = { ...makeNode('object', 'class', 'ComposeInitializer',
+        'pkg::ComposeInitializer', 'ComposeInitializer.kt'), language: 'kotlin' as const };
+      const objectMethod = { ...makeNode('object-method', 'method', 'onDetachedFromWindow',
+        'pkg::ComposeInitializer::onDetachedFromWindow', 'ComposeInitializer.kt'), language: 'kotlin' as const };
+      const nodes = [field, anon, correct, wrong, entry, enumMethod, object, objectMethod];
+      const context = {
+        getNodesByName: (name: string) => nodes.filter(n => n.name === name),
+        getNodesByLowerName: (name: string) => nodes.filter(n => n.name.toLowerCase() === name),
+        getNodesByQualifiedName: (name: string) => nodes.filter(n => n.qualifiedName === name),
+        getNodesInFile: (filePath: string) => nodes.filter(n => n.filePath === filePath),
+        getNodesByKind: (kind: Node['kind']) => nodes.filter(n => n.kind === kind),
+        getNodeById: (id: string) => nodes.find(n => n.id === id) ?? null,
+        getImportMappings: () => [], getAllFiles: () => ['SelectGesture.java', 'Other.java'],
+        fileExists: () => true, readFile: (path: string) => path === 'ComposeInitializer.kt'
+          ? 'object ComposeInitializer {\n    fun onDetachedFromWindow() {}\n}' : null,
+        getProjectRoot: () => tempDir,
+      } as ResolutionContext;
+      const ref: UnresolvedRef = { fromNodeId: 'reader', referenceName: 'SelectGesture.CREATOR.createFromParcel',
+        referenceKind: 'calls', filePath: 'Reader.java', language: 'java', line: 5, column: 0 };
+      expect(matchReference(ref, context)?.targetNodeId).toBe(correct.id);
+      expect(matchReference({ ...ref, referenceName: 'TextUtils.CHAR_SEQUENCE_CREATOR.createFromParcel' }, context)).toBeNull();
+      expect(matchReference({ ...ref, referenceName: 'ScrimState.KEYGUARD.getBehindTint' }, context)?.targetNodeId).toBe(enumMethod.id);
+      expect(matchReference({ ...ref, referenceName: 'ComposeInitializer.INSTANCE.onDetachedFromWindow' }, context)?.targetNodeId).toBe(objectMethod.id);
+    });
+
+    it('resolves Java field calls through imports and declared types in an indexed project', async () => {
+      for (const [file, source] of Object.entries({
+        'p/Selected.java': `package p;
+public class Selected {
+    public static final Creator CREATOR = new Creator() { public int createFromParcel() { return 1; } };
+    public interface Creator { int createFromParcel(); }
+}`,
+        'q/Selected.java': `package q;
+public class Selected {
+    public static final Creator CREATOR = new Creator() { public int createFromParcel() { return 2; } };
+    public interface Creator { int createFromParcel(); }
+}`,
+        'r/A.java': `package r;
+class A { static final Companion INSTANCE = new Companion(); static class Companion { void m() {} } }`,
+        'r/B.java': `package r;
+class B { static final Companion INSTANCE = new Companion(); static class Companion { void m() {} } }`,
+        'r/Interpolators.java': `package r;
+import android.view.animation.Interpolator;
+import android.view.animation.PathInterpolator;
+class Interpolators {
+    static final Interpolator ALPHA_OUT = new PathInterpolator(0, 0, 1, 1);
+    static final Interpolator DIRECT = new android.view.animation.PathInterpolator(0, 0, 1, 1);
+}`,
+        'r/WildcardInterpolators.java': `package r;
+import android.view.animation.*;
+class WildcardInterpolators { static final Interpolator ALPHA_OUT = new PathInterpolator(0, 0, 1, 1); }`,
+        'q/PathInterpolatorBuilder.java': `package q;
+class PathInterpolatorBuilder {
+    private static class PathInterpolator { float getInterpolation(float t) { return t; } }
+}`,
+        'p/ProjectInterpolator.java': `package p;
+public class ProjectInterpolator { public float getInterpolation(float t) { return t; } }`,
+        'r/ProjectInterpolators.java': `package r;
+import p.ProjectInterpolator;
+class ProjectInterpolators { static final ProjectInterpolator LOCAL = new ProjectInterpolator(); }`,
+        'r/WildcardProjectInterpolators.java': `package r;
+import p.*;
+class WildcardProjectInterpolators { static final ProjectInterpolator LOCAL = new ProjectInterpolator(); }`,
+        'com/app/W.java': `package com.app;
+import android.view.animation.*;
+public class W { public static final Interpolator DECEL = new DecelerateInterpolator(); }`,
+        'com/third/DecelerateInterpolator.java': `package com.third;
+public class DecelerateInterpolator { public float getInterpolation(float t) { return t; } }`,
+        'com/app/ExternalConsts.java': `package com.app;
+public interface ExternalConsts { ExternalHelper HELPER = new ExternalHelper(); }`,
+        'com/app/ExternalHelper.java': `package com.app;
+public class ExternalHelper { public void go() {} }`,
+        'com/lib/ProjectInterpolator.java': `package com.lib;
+public class ProjectInterpolator { public float getInterpolation(float t) { return t; } }`,
+        'com/app/WildcardProject.java': `package com.app;
+import com.lib.*;
+public class WildcardProject { public static final ProjectInterpolator LOCAL = new ProjectInterpolator(); }`,
+        'p/Outer.java': `package p;
+public class Outer {
+    public static class Sibling { public int getId() { return 1; } }
+    public static class Inner {
+        public static final Inner A = new Inner();
+        public static final Sibling B = new Sibling();
+        public int getId() { return 0; }
+    }
+}`,
+        'r/Consumer.java': `package r;
+import p.Selected;
+import p.Outer;
+import com.app.W;
+import com.app.ExternalConsts;
+import com.app.WildcardProject;
+import java.util.Map;
+interface Runner { void run(); }
+interface Consts { Helper HELPER = new Helper(); }
+class Helper { void go() {} }
+class Parent { static final Helper H = new Helper(); }
+class Child extends Parent {}
+class Util { static class IO { static void read() {} } }
+class Impl implements Runner {
+    static final Runner INSTANCE = new Impl();
+    public void run() {}
+}
+class Conditional { static final Runner INSTANCE = true ? new Impl() : new Impl(); }
+enum Mode { ON; int label() { return 1; } }
+class Holder { static final Map<String, String> LOOKUP = null; }
+class Decoy { String get(String key) { return key; } boolean equals(Object value) { return false; } }
+public class Consumer {
+    int select() { return Selected.CREATOR.createFromParcel(); }
+    String miss() { return Holder.LOOKUP.get("x"); }
+    int enumCall() { return Mode.ON.label(); }
+    boolean enumEquals() { return Mode.ON.equals(null); }
+    void interfaceCall() { Impl.INSTANCE.run(); }
+    void conditionalCall() { Conditional.INSTANCE.run(); }
+    void nestedType() { B.INSTANCE.m(); }
+    void interfaceField() { Consts.HELPER.go(); }
+    void inheritedField() { Child.H.go(); }
+    void capsType() { Util.IO.read(); }
+    float frameworkCall() { return Interpolators.ALPHA_OUT.getInterpolation(1); }
+    float qualifiedFrameworkCall() { return Interpolators.DIRECT.getInterpolation(1); }
+    float wildcardFrameworkCall() { return WildcardInterpolators.ALPHA_OUT.getInterpolation(1); }
+    float projectCall() { return ProjectInterpolators.LOCAL.getInterpolation(1); }
+    float wildcardProjectCall() { return WildcardProjectInterpolators.LOCAL.getInterpolation(1); }
+    float unrelatedWildcardCall() { return W.DECEL.getInterpolation(1); }
+    void dottedPackageInterfaceCall() { ExternalConsts.HELPER.go(); }
+    float dottedWildcardCall() { return WildcardProject.LOCAL.getInterpolation(1); }
+    int nestedOwnerFieldCall() { return Outer.Inner.A.getId(); }
+    int enclosingTypeFieldCall() { return Outer.Inner.B.getId(); }
+}`,
+      })) {
+        const target = path.join(tempDir, file);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, source);
+      }
+      cg = CodeGraph.initSync(tempDir, { config: { include: ['**/*.java'], exclude: [] } });
+      await cg.indexAll();
+      const targets = (method: string) => {
+        const caller = cg.searchNodes(method).map(r => r.node)
+          .find(n => n.qualifiedName === `r::Consumer::${method}`)!;
+        return cg.getCallees(caller.id).filter(c => c.edge.kind === 'calls')
+          .map(c => c.node.qualifiedName);
+      };
+      expect(targets('select')).toEqual([expect.stringMatching(/^p::Selected::CREATOR::<.*>::createFromParcel$/)]);
+      expect(targets('miss')).toEqual([]);
+      expect(targets('enumCall')).toEqual(['r::Mode::label']);
+      expect(targets('enumEquals')).toEqual([]);
+      expect(targets('interfaceCall')).toEqual(['r::Impl::run']);
+      expect(targets('conditionalCall')).toEqual(['r::Runner::run']);
+      expect(targets('nestedType')).toEqual(['r::B::Companion::m']);
+      expect(targets('interfaceField')).toEqual(['r::Helper::go']);
+      expect(targets('inheritedField')).toEqual(['r::Helper::go']);
+      expect(targets('capsType')).toEqual(['r::Util::IO::read']);
+      expect(targets('frameworkCall')).toEqual([]);
+      expect(targets('qualifiedFrameworkCall')).toEqual([]);
+      expect(targets('wildcardFrameworkCall')).toEqual([]);
+      expect(targets('projectCall')).toEqual(['p::ProjectInterpolator::getInterpolation']);
+      expect(targets('wildcardProjectCall')).toEqual(['p::ProjectInterpolator::getInterpolation']);
+      expect(targets('unrelatedWildcardCall')).toEqual([]);
+      expect(targets('dottedPackageInterfaceCall')).toEqual(['com.app::ExternalHelper::go']);
+      expect(targets('dottedWildcardCall')).toEqual(['com.lib::ProjectInterpolator::getInterpolation']);
+      expect(targets('nestedOwnerFieldCall')).toEqual(['p::Outer::Inner::getId']);
+      expect(targets('enclosingTypeFieldCall')).toEqual(['p::Outer::Sibling::getId']);
+      const declaration = cg.searchNodes('run').map(r => r.node)
+        .find(n => n.qualifiedName === 'r::Runner::run')!;
+      expect(cg.getCallees(declaration.id).some(c =>
+        c.node.qualifiedName === 'r::Impl::run' && c.edge.metadata?.synthesizedBy === 'interface-impl')).toBe(true);
+    });
+
+    it('does not match a Kotlin local anonymous-object method from a sibling function', () => {
+      const node = (id: string, kind: Node['kind'], name: string, qualifiedName: string, filePath: string, startLine: number, endLine: number): Node => ({
+        id, kind, name, qualifiedName, filePath, language: 'kotlin',
+        startLine, endLine, startColumn: 0, endColumn: 0, updatedAt: 0,
+      });
+      const outer = node('outer', 'method', 'otherTest', 'ProbeTest::otherTest', 'ProbeTest.kt', 10, 20);
+      const anon = node('anon', 'class', '<Probe$anon@12:8>', 'ProbeTest::otherTest::<Probe$anon@12:8>', 'ProbeTest.kt', 12, 18);
+      const localMethod = node('local', 'method', 'probe', `${anon.qualifiedName}::probe`, 'ProbeTest.kt', 13, 17);
+      const interfaceMethod = node('interface', 'method', 'probe', 'Probe::probe', 'Probe.kt', 1, 2);
+      const nodes = [outer, anon, localMethod, interfaceMethod];
+      const context = {
+        getNodesByName: (name: string) => nodes.filter((n) => n.name === name),
+        getNodesByQualifiedName: (name: string) => nodes.filter((n) => n.qualifiedName === name),
+        getNodesInFile: (filePath: string) => nodes.filter((n) => n.filePath === filePath),
+        getNodesByKind: (kind: Node['kind']) => nodes.filter((n) => n.kind === kind),
+        fileExists: () => true, readFile: () => null,
+        getProjectRoot: () => tempDir, getAllFiles: () => ['ProbeTest.kt', 'Probe.kt'],
+      } as ResolutionContext;
+      const ref: UnresolvedRef = {
+        fromNodeId: 'testA', referenceName: 'probe.probe', referenceKind: 'calls',
+        filePath: 'ProbeTest.kt', language: 'kotlin', line: 5, column: 0,
+      };
+
+      expect(matchMethodCall(ref, context)?.targetNodeId).toBe(interfaceMethod.id);
+      expect(matchMethodCall({ ...ref, fromNodeId: outer.id, line: 15 }, context)?.targetNodeId).toBe(localMethod.id);
+    });
+
+    it('accepts every supported supertype kind in exact-name inheritance matching', () => {
+      for (const kind of ['component', 'namespace'] as const) {
+        const target: Node = {
+          id: `${kind}:base`, kind, name: 'Base', qualifiedName: 'Base',
+          filePath: 'model.ts', language: 'typescript', startLine: 1, endLine: 1,
+          startColumn: 0, endColumn: 0, updatedAt: 0,
+        };
+        const context = {
+          getNodesByName: () => [target], getNodesInFile: () => [target],
+          getNodesByQualifiedName: () => [], getNodesByKind: () => [],
+          fileExists: () => true, readFile: () => null,
+          getProjectRoot: () => tempDir, getAllFiles: () => ['model.ts'],
+        } as ResolutionContext;
+        const ref: UnresolvedRef = {
+          fromNodeId: 'class:derived', referenceName: 'Base', referenceKind: 'extends',
+          filePath: 'model.ts', language: 'typescript', line: 2, column: 0,
+        };
+        expect(matchByExactName(ref, context)?.targetNodeId).toBe(target.id);
+      }
+    });
+
     it('should match exact name references', () => {
       // Create a mock context
       const mockNodes: Node[] = [
@@ -648,6 +879,28 @@ from ..services import auth_service
       expect(mappings.some((m) => m.localName === 'helper')).toBe(true);
       expect(mappings.some((m) => m.localName === 'User')).toBe(true);
     });
+
+    it('should extract parenthesized Python from-imports', () => {
+      const content = `
+from store.base import (
+    Base,
+    helper as h,  # a comment, with a comma and a call()
+)
+"""
+from docstring import NotAnImport
+"""
+from store.rows import (Row, Col)
+`;
+
+      const mappings = extractImportMappings('src/main.py', content, 'python');
+
+      expect(mappings.map((m) => [m.localName, m.exportedName, m.source])).toEqual([
+        ['Base', 'Base', 'store.base'],
+        ['h', 'helper', 'store.base'],
+        ['Row', 'Row', 'store.rows'],
+        ['Col', 'Col', 'store.rows'],
+      ]);
+    });
   });
 
   describe('JVM FQN Import Resolution', () => {
@@ -1161,6 +1414,156 @@ impl Describe for Ctl { fn describe(&self) -> String { "ctl".into() } }
       expect(
         (unionEdge!.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy
       ).toBe('interface-impl');
+    });
+
+    it('bridges a Python base method to every override, through bases that do not redeclare it (python-override)', async () => {
+      // A call bound to `Base.fetch` (a base-typed receiver, or a module global
+      // holding one of several backends) dispatches at runtime to the subclass
+      // override. `Mid` does not redeclare `fetch`, so `Leaf.fetch` overrides
+      // `Base.fetch` directly. Constructors do not dispatch: `Base()` never runs
+      // `Leaf.__init__`. An unrelated class with the same method name is not a
+      // subclass and gets nothing.
+      fs.writeFileSync(
+        path.join(tempDir, 'base.py'),
+        `class Base:
+    def __init__(self):
+        self.ready = True
+
+    def fetch(self, ids):
+        raise NotImplementedError("backend")
+
+    def close(self):
+        return None
+
+    @staticmethod
+    def make(ids):
+        return ids
+
+    @classmethod
+    def load(cls, ids):
+        return cls()
+
+    @classmethod
+    # a comment between the decorator and the def
+    def build(cls):
+        return cls()
+
+    @property
+    def label(self):
+        return "base"
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'backends.py'),
+        `from base import Base
+
+class Mid(Base):
+    def helper(self):
+        return 1
+
+class Leaf(Mid):
+    def __init__(self):
+        super().__init__()
+
+    def fetch(self, ids):
+        return ids
+
+    @staticmethod
+    def make(ids):
+        return list(ids)
+
+    @classmethod
+    def load(cls, ids):
+        return cls()
+
+    def build(self):
+        return self
+
+    @property
+    def label(self):
+        return "leaf"
+
+class Direct(Base):
+    def fetch(self, ids):
+        return list(ids)
+
+class Refined(Direct):
+    def fetch(self, ids):
+        return sorted(ids)
+
+class Unrelated:
+    def fetch(self, ids):
+        return []
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'consumer.py'),
+        `from base import Base
+
+def gc(store: Base, ids):
+    return store.fetch(ids)
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const methods = cg.getNodesByKind('method');
+      const find = (q: string) => methods.find((n) => n.qualifiedName === q);
+      const baseFetch = find('Base::fetch')!;
+      const leafFetch = find('Leaf::fetch')!;
+      const directFetch = find('Direct::fetch')!;
+      const unrelatedFetch = find('Unrelated::fetch')!;
+      const baseInit = find('Base::__init__')!;
+      for (const [name, node] of Object.entries({ baseFetch, leafFetch, directFetch, unrelatedFetch, baseInit })) {
+        expect(node, `${name} should be in the graph`).toBeDefined();
+      }
+
+      const synth = cg.getOutgoingEdges(baseFetch.id)
+        .filter((e) => e.kind === 'calls' && e.provenance === 'heuristic');
+      expect(new Set(synth.map((e) => e.target))).toEqual(new Set([leafFetch.id, directFetch.id]));
+      expect(new Set(synth.map((e) => (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy)))
+        .toEqual(new Set(['python-override']));
+      // Constructors, static/class methods and properties do not dispatch to the override.
+      for (const q of ['Base::__init__', 'Base::make', 'Base::load', 'Base::build', 'Base::label']) {
+        expect(find(q), `${q} should be in the graph`).toBeDefined();
+        expect(cg.getOutgoingEdges(find(q)!.id).filter((e) => e.provenance === 'heuristic'), q).toHaveLength(0);
+      }
+      // Refined overrides Direct's override: only the nearest declaration links to it.
+      const refinedFetch = find('Refined::fetch')!;
+      expect(cg.getOutgoingEdges(directFetch.id).filter((e) => e.provenance === 'heuristic').map((e) => e.target))
+        .toEqual([refinedFetch.id]);
+      expect(cg.getCallers(refinedFetch.id, 3).map((c) => c.node.name)).toContain('gc');
+
+      // The reported question: who reaches the override? The base-typed call site does.
+      const reach = cg.getCallers(leafFetch.id, 2).map((c) => c.node.name);
+      expect(reach).toContain('gc');
+      expect(cg.getCallers(unrelatedFetch.id, 2).map((c) => c.node.name)).not.toContain('gc');
+    });
+
+    it('does not link a Python override through a supertype guessed by bare name (python-override)', async () => {
+      // `Base` exists in two files. `child.py` / `src/app/deep.py` import
+      // neither, so their extends edges are name guesses — whatever confidence
+      // proximity gives them — and must not carry dispatch. An import, or a
+      // base in the same file, is not a guess.
+      fs.writeFileSync(path.join(tempDir, 'a.py'),
+        'class Base:\n    def fetch(self):\n        return 1\n\nclass Local(Base):\n    def fetch(self):\n        return 5\n');
+      fs.writeFileSync(path.join(tempDir, 'b.py'), 'class Base:\n    def fetch(self):\n        return 2\n');
+      fs.writeFileSync(path.join(tempDir, 'child.py'), 'class Child(Base):\n    def fetch(self):\n        return 3\n');
+      fs.mkdirSync(path.join(tempDir, 'src', 'app'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'src', 'app', 'a.py'), 'class Base:\n    def fetch(self):\n        return 6\n');
+      fs.writeFileSync(path.join(tempDir, 'src', 'app', 'deep.py'), 'class Deep(Base):\n    def fetch(self):\n        return 7\n');
+      fs.writeFileSync(path.join(tempDir, 'imported.py'),
+        'from a import Base\n\nclass Known(Base):\n    def fetch(self):\n        return 4\n');
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const methods = cg.getNodesByKind('method').filter((n) => n.name === 'fetch');
+      const into = (q: string) => cg.getIncomingEdges(methods.find((n) => n.qualifiedName === q)!.id)
+        .filter((e) => (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy === 'python-override');
+      expect(into('Child::fetch')).toHaveLength(0);
+      expect(into('Deep::fetch')).toHaveLength(0);
+      expect(into('Known::fetch')).toHaveLength(1);
+      expect(into('Local::fetch')).toHaveLength(1);
     });
 
     it('qualifies a generic impl by its type, so trait dispatch reaches it and no edge is invented from its body (#1588)', async () => {
@@ -6164,6 +6567,54 @@ in
     });
   });
 
+  describe('A dotted qualified extends/implements reference resolves to a real nested type', () => {
+    it('resolves `extends Outer.Inner` (named class) and `new Outer.Inner() { ... }` (anonymous class) to the SAME real, indexed nested type', async () => {
+      // Every qualifiedName the engine builds joins scope with `::`
+      // (buildQualifiedName), but a Java/C# extends clause or anonymous-class
+      // constructor type is recorded verbatim with a dot (`Outer.Inner`). A
+      // real in-project nested type must still resolve — this is not an
+      // AOSP-specific concern (an absent AIDL Stub staying unresolved is
+      // correct there), it's the general case where the target genuinely
+      // exists in the index.
+      fs.writeFileSync(
+        path.join(tempDir, 'Host.java'),
+        `package p;
+class Outer { static class Inner { public void run() {} } }
+class Named extends Outer.Inner {}
+class Host {
+    Object field = new Outer.Inner() { public void run() {} };
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+      const innerId = db
+        .getDb()
+        .prepare("select id from nodes where kind = 'class' and name = 'Inner'")
+        .get() as { id: string } | undefined;
+      expect(innerId, 'the real Outer.Inner class should be indexed').toBeDefined();
+
+      const extendsTargets = db
+        .getDb()
+        .prepare(
+          `select src.name as sourceName, dst.id as targetId
+             from edges e
+             join nodes src on src.id = e.source
+             join nodes dst on dst.id = e.target
+            where e.kind = 'extends' and dst.id = ?`
+        )
+        .all(innerId!.id) as Array<{ sourceName: string; targetId: string }>;
+
+      const sourceNames = extendsTargets.map((r) => r.sourceName).sort();
+      // `Named` (a real named class) and the anonymous class inside `Host`
+      // (named `<Inner$anon@...>`) must BOTH resolve their extends edge to
+      // the real `Inner` node — neither should stay in unresolved_refs.
+      expect(sourceNames.some((n) => n === 'Named')).toBe(true);
+      expect(sourceNames.some((n) => /Inner\$anon@/.test(n))).toBe(true);
+    });
+  });
+
   describe('Bindings in a module that exports nothing (#1719)', () => {
     it('does not treat documentation headings as package imports', () => {
       // Inject the planned Markdown node shape without depending on its extractor.
@@ -6505,5 +6956,114 @@ func (r *relayClient) sendBatchAttempt(retry bool) error {
       expect(selfLoops(cg, 'Tree.java').sort()).toEqual(['depth', 'size']);
       expect(selfLoops(cg, 'relay.go')).toEqual(['sendBatchAttempt']);
     }, 30000);
+  });
+
+  describe('Inheritance references never use method-call resolution', () => {
+    it('does not resolve bare extends/implements names to same-named methods', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Hierarchy.java'),
+        `class Child extends Missing {}
+class Implementer implements Missing {}
+class Other {
+  void Missing() {}
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+      const rows = db
+        .getDb()
+        .prepare(
+          `select src.name as sourceName, dst.kind as targetKind
+             from edges e
+             join nodes src on src.id = e.source
+             join nodes dst on dst.id = e.target
+            where e.kind in ('extends', 'implements')
+              and src.name in ('Child', 'Implementer')`
+        )
+        .all() as Array<{ sourceName: string; targetKind: string }>;
+
+      expect(rows.filter((row) => row.targetKind === 'method')).toEqual([]);
+    });
+
+    it('does not resolve Java extends IBar.Stub to an unrelated Stub constructor', async () => {
+      // IBar intentionally has no in-project declaration: this mirrors generated
+      // AIDL Stub bases that are absent from a sparse source checkout. An explicit
+      // constructor is required because implicit Java constructors are not nodes.
+      fs.writeFileSync(
+        path.join(tempDir, 'AService.java'),
+        `package com.example;
+class AService {
+  final class BinderService extends IBar.Stub {}
+}
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'UiModeManagerService.java'),
+        `package com.example;
+class UiModeManagerService {
+  class Stub { Stub() {} }
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+      const rows = db
+        .getDb()
+        .prepare(
+          `select dst.kind as targetKind, dst.qualified_name as targetQualifiedName,
+                  e.metadata as metadata
+             from edges e
+             join nodes src on src.id = e.source
+             join nodes dst on dst.id = e.target
+            where e.kind = 'extends' and src.name = 'BinderService'`
+        )
+        .all() as Array<{ targetKind: string; targetQualifiedName: string; metadata: string }>;
+
+      // An inheritance reference is a type reference, never a receiver.method()
+      // call. In particular, an absent IBar must not make `Stub` fall through to
+      // the sole same-named constructor elsewhere in the project.
+      expect(rows.filter((row) => row.targetKind === 'method')).toEqual([]);
+    });
+
+    it('resolves a nested Java supertype to the closest source tree', async () => {
+      for (const tree of ['framework', 'androidx']) {
+        const dir = path.join(tempDir, tree);
+        fs.mkdirSync(dir);
+        fs.writeFileSync(path.join(dir, 'RecyclerView.java'),
+          `package ${tree}; class RecyclerView { static class LayoutManager {} }`);
+      }
+      fs.writeFileSync(path.join(tempDir, 'androidx', 'LinearLayoutManager.java'),
+        'package androidx; class LinearLayoutManager extends RecyclerView.LayoutManager {}');
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+      const rows = db.getDb().prepare(
+        `select dst.file_path as targetPath from edges e
+         join nodes src on src.id = e.source
+         join nodes dst on dst.id = e.target
+         where e.kind = 'extends' and src.name = 'LinearLayoutManager'`
+      ).all() as Array<{ targetPath: string }>;
+      expect(rows.map((row) => row.targetPath)).toEqual(['androidx/RecyclerView.java']);
+    });
+
+    it('does not let Spring naming conventions invent an inheritance edge', async () => {
+      fs.writeFileSync(path.join(tempDir, 'Service.java'),
+        '@Service class Service {} class Child implements View.OnClickListener {}');
+      fs.writeFileSync(path.join(tempDir, 'OnClickListener.java'),
+        'package unrelated; class OnClickListener {}');
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+      const rows = db.getDb().prepare(
+        `select dst.qualified_name as target from edges e
+         join nodes src on src.id = e.source
+         join nodes dst on dst.id = e.target
+         where e.kind = 'implements' and src.name = 'Child'`
+      ).all() as Array<{ target: string }>;
+      expect(rows).toEqual([]);
+    });
   });
 });

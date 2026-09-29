@@ -11,6 +11,7 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport 
 import { applyAliases } from './path-aliases';
 import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport } from './workspace-packages';
+import { stripCommentsForRegex } from './strip-comments';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
@@ -76,8 +77,15 @@ const exportedSymbolMemos = new WeakMap<ResolutionContext, Map<string, Node | un
  * `getNodesInFile` arrays (a barrel-heavy repo scans its biggest files once
  * per referencing symbol otherwise). First-wins insertion preserves exactly
  * the array-order semantics of the `.find` calls it replaces.
+ *
+ * Built from the file's exported rows alone: every worker of the resolver
+ * pool builds its own index for each file an import reaches, and decoding
+ * whole files there cost more than resolving through them. The two answers
+ * that need more — the default-export binding and names a local export
+ * clause introduces — read the source and name-targeted rows on first use.
  */
 interface FileExportIndex {
+  /** Exported declarations by name. Read through {@link exportedByName}. */
   byName: Map<string, Node>;
   defaultComponent: Node | undefined;
   defaultFnClass: Node | undefined;
@@ -87,9 +95,16 @@ interface FileExportIndex {
    * guess. `const Home = () => …; export default Home` and the namespace
    * object `const UploadApi = { uploadARCapture }; export default UploadApi`
    * are both invisible to the `isExported` index above: neither declaration
-   * has an `export_statement` ancestor.
+   * has an `export_statement` ancestor. `undefined` until first read through
+   * {@link defaultExportBindingNode}; `null` when there is none.
    */
-  defaultBinding: Node | undefined;
+  defaultBinding?: Node | null;
+  /**
+   * Names a local export clause (`export { impl as alias }`) binds to a
+   * declaration the extractor never flagged isExported, for names not in
+   * `byName`. `undefined` until first read through {@link exportedByName}.
+   */
+  clauseAliases?: Map<string, Node>;
 }
 
 const DEFAULT_BINDING_KINDS = new Set<string>(['function', 'class', 'component', 'constant', 'variable']);
@@ -113,38 +128,57 @@ function getFileExportIndex(filePath: string, context: ResolutionContext): FileE
   }
   let idx = perFile.get(filePath);
   if (!idx) {
-    idx = { byName: new Map(), defaultComponent: undefined, defaultFnClass: undefined, defaultBinding: undefined };
-    const nodesInFile = context.getNodesInFile(filePath);
-    // Every declaration, exported or not: a local `export { impl as alias }`
-    // clause exports a declaration the extractor never flagged isExported.
-    const declared = new Map<string, Node>();
-    for (const n of nodesInFile) {
-      if (!declared.has(n.name)) declared.set(n.name, n);
-      if (!n.isExported) continue;
+    idx = { byName: new Map(), defaultComponent: undefined, defaultFnClass: undefined };
+    const exported = context.getExportedNodesInFile?.(filePath) ?? context.getNodesInFile(filePath).filter((n) => n.isExported);
+    for (const n of exported) {
       if (!idx.byName.has(n.name)) idx.byName.set(n.name, n);
       if (idx.defaultComponent === undefined && n.kind === 'component') idx.defaultComponent = n;
       if (idx.defaultFnClass === undefined && (n.kind === 'function' || n.kind === 'class')) idx.defaultFnClass = n;
     }
-    const bound = defaultExportBinding(filePath, context);
-    if (bound !== null) {
-      idx.defaultBinding = nodesInFile
-        .filter((n) => n.name === bound && DEFAULT_BINDING_KINDS.has(n.kind))
-        .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0];
-    }
-    // Bind names introduced by a local export clause to their declarations, so
-    // an importer asking for the renamed name gets the real symbol instead of
-    // falling through to the name-matcher (which cannot cross the rename).
-    const content = context.readFile(filePath);
-    if (content && content.includes('export')) {
-      for (const { exportedName, localName } of extractLocalExportAliases(content)) {
-        if (idx.byName.has(exportedName)) continue;
-        const decl = declared.get(localName);
-        if (decl) idx.byName.set(exportedName, decl);
-      }
-    }
     perFile.set(filePath, idx);
   }
   return idx;
+}
+
+/** The file's nodes named `name`, in `getNodesInFile` order. */
+function nodesInFileNamed(filePath: string, name: string, context: ResolutionContext): Node[] {
+  return context.getNodesInFileNamed?.(filePath, name) ?? context.getNodesInFile(filePath).filter((n) => n.name === name);
+}
+
+/** The declaration `export default NAME` names in this file (see FileExportIndex.defaultBinding). */
+function defaultExportBindingNode(filePath: string, idx: FileExportIndex, context: ResolutionContext): Node | undefined {
+  if (idx.defaultBinding === undefined) {
+    const bound = defaultExportBinding(filePath, context);
+    idx.defaultBinding =
+      bound === null
+        ? null
+        : (nodesInFileNamed(filePath, bound, context)
+            .filter((n) => DEFAULT_BINDING_KINDS.has(n.kind))
+            .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0] ?? null);
+  }
+  return idx.defaultBinding ?? undefined;
+}
+
+/** What this file exports as `name`: an exported declaration, else a local export clause's binding. */
+function exportedByName(filePath: string, idx: FileExportIndex, name: string, context: ResolutionContext): Node | undefined {
+  const direct = idx.byName.get(name);
+  if (direct) return direct;
+  if (idx.clauseAliases === undefined) {
+    // Bind names introduced by a local export clause to their declarations, so
+    // an importer asking for the renamed name gets the real symbol instead of
+    // falling through to the name-matcher (which cannot cross the rename).
+    // The declaration is the file's first node of that name, exported or not.
+    idx.clauseAliases = new Map();
+    const content = context.readFile(filePath);
+    if (content && content.includes('export')) {
+      for (const { exportedName, localName } of extractLocalExportAliases(content)) {
+        if (idx.byName.has(exportedName) || idx.clauseAliases.has(exportedName)) continue;
+        const decl = nodesInFileNamed(filePath, localName, context)[0];
+        if (decl) idx.clauseAliases.set(exportedName, decl);
+      }
+    }
+  }
+  return idx.clauseAliases.get(name);
 }
 
 /** Drop the per-context memo tables (see ReferenceResolver.clearCaches). */
@@ -154,6 +188,7 @@ export function clearImportResolverMemos(context: ResolutionContext): void {
   fileExportIndexes.delete(context);
   luaFileBasenameIndexes.delete(context);
   cobolCopybookIndexes.delete(context);
+  pythonModuleFileMemos.delete(context);
 }
 
 export function resolveImportPath(
@@ -879,7 +914,7 @@ export function extractImportMappings(
     // whole SFC (markup + styles included) is safe.
     mappings.push(...extractJSImports(content));
   } else if (language === 'python') {
-    mappings.push(...extractPythonImports(content));
+    mappings.push(...extractPythonImports(stripCommentsForRegex(content, 'python')));
   } else if (language === 'go') {
     mappings.push(...extractGoImports(content));
   } else if (language === 'java' || language === 'kotlin') {
@@ -893,6 +928,129 @@ export function extractImportMappings(
   }
 
   return mappings;
+}
+
+/** A JavaScript identifier — `$`, `_` and Unicode letters included. Use with the `u` flag. */
+const JS_IDENT = '[$_\\p{ID_Start}][$\\u200c\\u200d\\p{ID_Continue}]*';
+/** A quoted string, escapes included — an ES2022 string-named specifier. */
+const JS_STRING = `"(?:[^"\\\\\\n]|\\\\.)*"|'(?:[^'\\\\\\n]|\\\\.)*'`;
+/** A specifier's name: an identifier, or an ES2022 string name (`"my-fn"`). */
+const SPECIFIER_NAME = `(?:${JS_IDENT}|${JS_STRING})`;
+/** TypeScript's `type` modifier, or Flow's `typeof`. */
+const TYPE_MODIFIER = '(?:type(?:of)?\\s+)';
+const SPECIFIER_ALIAS = new RegExp(`^${TYPE_MODIFIER}?(${SPECIFIER_NAME})\\s+as\\s+(${SPECIFIER_NAME})$`, 'u');
+const SPECIFIER_PLAIN = new RegExp(`^${TYPE_MODIFIER}?(${SPECIFIER_NAME})$`, 'u');
+
+/**
+ * A `{ … }` specifier list: everything up to the closing `}`, with no length
+ * cap, so a barrel's thousand-name list still parses. A list never holds a
+ * brace, so the scan also stops at a `{`: an unclosed list ends at the next
+ * statement's brace instead of rescanning to the end of the file, which keeps
+ * a file of unclosed lists linear. (A brace inside a comment or string name in
+ * the list ends it early, as it always has; handling that needs a real
+ * scanner, not a regex.)
+ */
+const SPECIFIER_LIST = '[^{}]+';
+
+/**
+ * `import [type] [Default][, ]{ … }|* as ns from '…'`. Each run of whitespace
+ * belongs to exactly one quantifier — adjacent optional `\\s*`s backtrack
+ * polynomially on long blank runs. A modifier — TypeScript `type`, Flow
+ * `typeof`, or `defer` (`import defer * as ns`) — is followed directly by
+ * `{`/`*`, or by whitespace and a name that is not `from` — `import type from
+ * '…'` (any spacing) is a default import NAMED `type`.
+ */
+const ES_IMPORT_RE = new RegExp(
+  `(?<![$.\\p{ID_Continue}])import(?:\\s+|(?=[{*]))(?:(?:type(?:of)?|defer)(?:\\s*(?=[{*])|\\s+(?!from(?![$\\p{ID_Continue}]))(?=[$_\\p{ID_Start}])))?` +
+    `(?:(${JS_IDENT})\\s*(?:,\\s*)?)?` +
+    `(?:\\{(${SPECIFIER_LIST})\\}\\s*)?` +
+    `(?:(\\*)\\s*as\\s+(${JS_IDENT})\\s*)?` +
+    `from\\s*['"]([^'"]+)['"]`,
+  'gu'
+);
+
+/** `export [type] * [as ns] from '…'`. */
+const WILDCARD_REEXPORT_RE = new RegExp(
+  `(?<![$.\\p{ID_Continue}])export(?![$\\p{ID_Continue}])\\s*(?:type(?![$\\p{ID_Continue}])\\s*)?\\*(?:\\s*as(?:\\s+${JS_IDENT}|\\s*(?:${JS_STRING})))?\\s*from\\s*['"]([^'"]+)['"]`,
+  'gu'
+);
+
+/** `export [type] { … } from '…'`. */
+const NAMED_REEXPORT_RE = new RegExp(
+  `(?<![$.\\p{ID_Continue}])export(?![$\\p{ID_Continue}])\\s*(?:type(?![$\\p{ID_Continue}])\\s*)?\\{(${SPECIFIER_LIST})\\}\\s*from\\s*['"]([^'"]+)['"]`,
+  'gu'
+);
+
+/**
+ * Split a comment-free specifier list on the commas between specifiers — not
+ * those inside a string name (`"a,b" as c`).
+ */
+function splitSpecifierList(list: string): string[] {
+  const out: string[] = [];
+  let start = 0;
+  let quote: string | null = null;
+  for (let i = 0; i < list.length; i++) {
+    const ch = list[i]!;
+    if (quote !== null) {
+      if (ch === '\\') i++;
+      else if (ch === quote) quote = null;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === ',') {
+      out.push(list.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(list.slice(start));
+  return out;
+}
+
+const SIMPLE_ESCAPES: Record<string, string> = { n: '\n', t: '\t', r: '\r', b: '\b', f: '\f', v: '\v', '0': '\0' };
+
+/** A captured `{ … }` list with its comments stripped (only when it has a `/` — most don't). */
+function cleanSpecifierList(list: string): string {
+  return list.includes('/') ? stripJsComments(list) : list;
+}
+
+/** A multi-line JSDoc `@import { … }` list without its ` * ` line prefixes. */
+function withoutJsDocPrefixes(list: string): string {
+  return list.replace(/^[ \t]*\*(?!\/)/gm, '');
+}
+
+/** A string-named specifier's name without its quotes, escapes decoded. */
+function unquoteSpecifier(name: string): string {
+  if (!/^["']/.test(name)) return name;
+  return name.slice(1, -1).replace(
+    /\\(u\{[0-9a-fA-F]+\}|u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|[\s\S])/g,
+    (_, esc: string) => {
+      if (esc[0] === 'u' || esc[0] === 'x') {
+        const hex = esc[1] === '{' ? esc.slice(2, -1) : esc.slice(1);
+        const code = parseInt(hex, 16);
+        return code <= 0x10ffff ? String.fromCodePoint(code) : esc;
+      }
+      return SIMPLE_ESCAPES[esc] ?? esc;
+    }
+  );
+}
+
+/**
+ * One `{ … }` import/export specifier — `a`, `a as b`, `"a-b" as c`, and the
+ * same with TypeScript's inline `type` modifier (`type a`, `type a as b`) — as
+ * the name it takes from the module and the name it binds (Flow's `typeof`
+ * modifier likewise). `type` alone, or `type as t`, is a specifier NAMED
+ * `type`. Null for anything else. Expects one comment-free item of a list
+ * split by {@link splitSpecifierList}.
+ */
+function parseSpecifier(raw: string): { imported: string; local: string } | null {
+  const item = raw.trim();
+  const alias = SPECIFIER_ALIAS.exec(item);
+  if (alias) return { imported: unquoteSpecifier(alias[1]!), local: unquoteSpecifier(alias[2]!) };
+  const plain = SPECIFIER_PLAIN.exec(item);
+  if (plain) {
+    const name = unquoteSpecifier(plain[1]!);
+    return { imported: name, local: name };
+  }
+  return null;
 }
 
 /**
@@ -963,11 +1121,9 @@ function stripErlangLineComments(value: string): string {
 function extractJSImports(content: string): ImportMapping[] {
   const mappings: ImportMapping[] = [];
 
-  // ES6 imports
-  const importRegex = /import\s+(?:(\w+)\s*,?\s*)?(?:\{([^}]+)\})?\s*(?:(\*)\s+as\s+(\w+))?\s*from\s*['"]([^'"]+)['"]/g;
-
-  let match;
-  while ((match = importRegex.exec(content)) !== null) {
+  // ES6 imports (see ES_IMPORT_RE). matchAll iterates a copy, so the shared
+  // regex's lastIndex never leaks between calls.
+  for (const match of content.matchAll(ES_IMPORT_RE)) {
     const [, defaultImport, namedImports, star, namespaceAlias, source] = match;
 
     // Default import
@@ -983,21 +1139,17 @@ function extractJSImports(content: string): ImportMapping[] {
 
     // Named imports
     if (namedImports) {
-      const names = namedImports.split(',').map((s) => s.trim());
-      for (const name of names) {
-        const aliasMatch = name.match(/(\w+)\s+as\s+(\w+)/);
-        if (aliasMatch) {
+      // Comments inside the list are stripped first so a `,` in one can't split
+      // it. (Only the list: this regex also runs over whole SFCs, where a
+      // file-wide comment scan would desync on markup like `Don't`.)
+      // A JSDoc `@import` tag's list carries ` * ` line prefixes when it wraps.
+      const list = content[match.index! - 1] === '@' ? withoutJsDocPrefixes(namedImports) : namedImports;
+      for (const name of splitSpecifierList(cleanSpecifierList(list))) {
+        const specifier = parseSpecifier(name);
+        if (specifier) {
           mappings.push({
-            localName: aliasMatch[2]!,
-            exportedName: aliasMatch[1]!,
-            source: source!,
-            isDefault: false,
-            isNamespace: false,
-          });
-        } else if (name) {
-          mappings.push({
-            localName: name,
-            exportedName: name,
+            localName: specifier.local,
+            exportedName: specifier.imported,
             source: source!,
             isDefault: false,
             isNamespace: false,
@@ -1019,6 +1171,7 @@ function extractJSImports(content: string): ImportMapping[] {
   }
 
   // Require statements
+  let match: RegExpExecArray | null;
   const requireRegex = /(?:const|let|var)\s+(?:(\w+)|{([^}]+)})\s*=\s*require\(['"]([^'"]+)['"]\)/g;
   while ((match = requireRegex.exec(content)) !== null) {
     const [, defaultName, destructured, source] = match;
@@ -1067,13 +1220,14 @@ function extractJSImports(content: string): ImportMapping[] {
 function extractPythonImports(content: string): ImportMapping[] {
   const mappings: ImportMapping[] = [];
 
-  // from X import Y
-  const fromImportRegex = /from\s+([\w.]+)\s+import\s+([^#\n]+)/g;
+  // from X import Y, and the parenthesized form `from X import (\n Y,\n Z,\n)`
+  const fromImportRegex = /from\s+([\w.]+)\s+import\s+(\([^)]*\)|[^#\n]+)/g;
   let match;
 
   while ((match = fromImportRegex.exec(content)) !== null) {
     const [, source, imports] = match;
-    const names = imports!.split(',').map((s) => s.trim());
+    const names = imports!.trim().replace(/^\(|\)$/g, '')
+      .split(',').map((s) => s.trim());
 
     for (const name of names) {
       const aliasMatch = name.match(/(\w+)\s+as\s+(\w+)/);
@@ -1272,15 +1426,18 @@ export function clearImportMappingCache(): void {
 
 /**
  * Strip JS line + block comments from `content` while preserving
- * string literals (so `"//"` inside a string stays intact). Used by
- * {@link extractReExports} so commented-out export-from statements
- * don't generate phantom re-export edges.
+ * string literals (so `"//"` inside a string stays intact). A block
+ * comment becomes one space, so the tokens either side stay apart. Used by
+ * {@link extractReExports} over a whole file, so commented-out export-from
+ * statements don't generate phantom re-export edges, and by
+ * {@link extractJSImports} over just an import's `{ … }` list (which can come
+ * from an SFC — never run it over SFC markup: `Don't` would open a string).
  *
  * Scanner is deliberately small: it only tracks the three contexts
  * relevant for JS/TS — single-quote string, double-quote string, and
  * template literal. Comment recognition is the JS spec subset, no
  * regex-literal awareness (which is fine for our use case: we don't
- * apply this to function bodies, only to top-level files).
+ * apply this to function bodies, only to top-level files and import lists).
  */
 function stripJsComments(content: string): string {
   let out = '';
@@ -1313,6 +1470,8 @@ function stripJsComments(content: string): string {
       i += 2;
       while (i < content.length && !(content[i] === '*' && content[i + 1] === '/')) i++;
       i += 2;
+      // A space, not nothing: `A/**/as B` must stay two words.
+      out += ' ';
       continue;
     }
     out += ch;
@@ -1330,6 +1489,8 @@ function stripJsComments(content: string): string {
  *   export * from './a';
  *   export * as ns from './a';   (treated as wildcard for chasing)
  *   export { default as Foo } from './a';
+ *   and TypeScript's `type` forms of each: `export type { foo } from`,
+ *   `export { type foo } from`, `export type * from`.
  *
  * The walker intentionally stays regex-based — the import-resolver
  * elsewhere in this file already chooses regex over a fresh
@@ -1355,37 +1516,29 @@ export function extractReExports(content: string, language: Language): ReExport[
   // out of scope.)
   const cleaned = stripJsComments(content);
 
-  // Wildcard: `export * from '...'` or `export * as ns from '...'`
-  const wildcardRe = /export\s*\*(?:\s+as\s+\w+)?\s*from\s*['"]([^'"]+)['"]/g;
-  let m: RegExpExecArray | null;
-  while ((m = wildcardRe.exec(cleaned)) !== null) {
+  // Wildcard: `export * from '...'` or `export * as ns from '...'`, optionally `export type *`
+  for (const m of cleaned.matchAll(WILDCARD_REEXPORT_RE)) {
     out.push({ kind: 'wildcard', source: m[1]! });
   }
 
-  // Named: `export { a, b as c } from '...'`
-  const namedRe = /export\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]/g;
-  while ((m = namedRe.exec(cleaned)) !== null) {
+  // Named: `export { a, b as c } from '...'`, with TypeScript's `type`
+  // modifier on the list (`export type { … } from`) or an item (`{ type a }`).
+  // `[^{}]`, not `[^}]`: a specifier list never holds a brace, so an unclosed
+  // `{` stops at the next one instead of rescanning to the end of the file.
+  for (const m of cleaned.matchAll(NAMED_REEXPORT_RE)) {
     const inner = m[1]!;
     const source = m[2]!;
-    for (const raw of inner.split(',')) {
-      const item = raw.trim();
-      if (!item) continue;
-      const aliasMatch = item.match(/^(\w+)\s+as\s+(\w+)$/);
-      if (aliasMatch) {
-        out.push({
-          kind: 'named',
-          exportedName: aliasMatch[2]!,
-          originalName: aliasMatch[1]!,
-          source,
-        });
-      } else if (/^\w+$/.test(item)) {
-        out.push({
-          kind: 'named',
-          exportedName: item,
-          originalName: item,
-          source,
-        });
-      }
+    // Stripped again here: the file-wide pass above can lose its place (a JSX
+    // `Don't`, a regex literal holding a quote) and leave a comment in the list.
+    for (const raw of splitSpecifierList(cleanSpecifierList(inner))) {
+      const specifier = parseSpecifier(raw);
+      if (!specifier) continue;
+      out.push({
+        kind: 'named',
+        exportedName: specifier.local,
+        originalName: specifier.imported,
+        source,
+      });
     }
   }
 
@@ -2066,23 +2219,48 @@ function resolveModuleImportToFile(
  * no edge. Shared by absolute `import a.b.c` and absolute `from a.b import c`
  * (where `c` is a submodule) resolution.
  */
+/**
+ * Per-context memo for findPythonModuleFile: module path → the `<mod>.py` and
+ * `<mod>/__init__.py` file nodes whose path ends with it, in name-lookup
+ * order. Only the importing file's own path is excluded per call, so taking
+ * the first survivor returns the node the unmemoized scan found. Without it,
+ * every ref naming a module outside the project (`from unittest import mock`)
+ * rescanned every `__init__.py` in the tree. Same stable window as the name
+ * caches; dropped by clearImportResolverMemos.
+ */
+const pythonModuleFileMemos = new WeakMap<ResolutionContext, Map<string, { module: Node[]; pkg: Node[] }>>();
+
 function findPythonModuleFile(
   mod: string,
   context: ResolutionContext,
   excludeFilePath: string
 ): Node | null {
   if (!mod || mod.startsWith('.')) return null; // relative imports handled elsewhere
-  const rel = mod.replace(/\./g, '/');
-  const lastSeg = mod.split('.').pop()!;
-  const endsWith = (p: string, want: string): boolean => p === want || p.endsWith('/' + want);
-  const moduleFile = context
-    .getNodesByName(`${lastSeg}.py`)
-    .find((n) => n.kind === 'file' && n.filePath !== excludeFilePath && endsWith(n.filePath, `${rel}.py`));
-  if (moduleFile) return moduleFile;
-  const pkgFile = context
-    .getNodesByName('__init__.py')
-    .find((n) => n.kind === 'file' && n.filePath !== excludeFilePath && endsWith(n.filePath, `${rel}/__init__.py`));
-  return pkgFile ?? null;
+  let memo = pythonModuleFileMemos.get(context);
+  if (!memo) {
+    memo = new Map();
+    pythonModuleFileMemos.set(context, memo);
+  }
+  let files = memo.get(mod);
+  if (!files) {
+    const rel = mod.replace(/\./g, '/');
+    const lastSeg = mod.split('.').pop()!;
+    const endsWith = (p: string, want: string): boolean => p === want || p.endsWith('/' + want);
+    files = {
+      module: context
+        .getNodesByName(`${lastSeg}.py`)
+        .filter((n) => n.kind === 'file' && endsWith(n.filePath, `${rel}.py`)),
+      pkg: context
+        .getNodesByName('__init__.py')
+        .filter((n) => n.kind === 'file' && endsWith(n.filePath, `${rel}/__init__.py`)),
+    };
+    memo.set(mod, files);
+  }
+  return (
+    files.module.find((n) => n.filePath !== excludeFilePath) ??
+    files.pkg.find((n) => n.filePath !== excludeFilePath) ??
+    null
+  );
 }
 
 /**
@@ -2442,13 +2620,14 @@ function findExportedSymbolWalk(
     // resolves and the component shows a false 0 callers (#629).
     // A component file IS its default export; otherwise the statement that
     // names the binding beats the first-exported-function guess.
-    const direct = exportIndex.defaultComponent ?? exportIndex.defaultBinding ?? exportIndex.defaultFnClass;
+    const direct =
+      exportIndex.defaultComponent ?? defaultExportBindingNode(filePath, exportIndex, context) ?? exportIndex.defaultFnClass;
     if (direct) return direct;
   } else if (want.isNamespace && want.memberName) {
-    const direct = exportIndex.byName.get(want.memberName);
+    const direct = exportedByName(filePath, exportIndex, want.memberName, context);
     if (direct) return direct;
   } else {
-    const direct = exportIndex.byName.get(want.exportedName);
+    const direct = exportedByName(filePath, exportIndex, want.exportedName, context);
     if (direct) return direct;
   }
 
