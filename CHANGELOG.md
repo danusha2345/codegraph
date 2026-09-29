@@ -29,6 +29,19 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A C `#if` group whose branches are not whole statements no longer produces phantom functions.** An `else if (…) { … }` arm kept behind `#ifdef`, an `if (…)` header whose body sits after the `#endif` (the ST HAL's per-device latency tables), or a function signature that differs per configuration all read to the C grammar as a function *named* `if` — and every real function after it in the file was then filed underneath it, or dropped. Such a group is now collapsed to its first live branch before parsing, offsets kept, and block macros written in capitals (`ATOMIC_BLOCK(…) { … }`) are recognized like their lowercase cousins. On a betaflight tree 265 phantom nested functions became 5, and whole functions that had been missing (`spiInternalStartDMA`, `processSmartPortTelemetry`, the CMSIS matrix routines) are back with their callers at exact-match confidence. Re-index after upgrading.
 - **Play projects no longer send `Class.method` calls to another class's method in the same file.** In a Play app, a route handler or a call like `MediaType.parse(...)` went to the first method with that name anywhere in the class's file — often a nested or sibling class's — and now goes only to a method of the class it names.
 - **A Scala `Outer.Inner(...)` call now reaches the Scala case class it builds, not a Java constructor.** A companion `apply` such as `RemoteNode.Obfuscated("x")` was linked to an unrelated Java class's constructor that merely shared the words in its name; it now links to the Scala type of that name, and a Java constructor is never guessed that way.
+### New Features
+
+- **Verilog and SystemVerilog are indexed.** Modules, packages, interfaces and modports, named instances, ports and signals, always/assign blocks and generate scopes are searchable, and `codegraph_explore` surfaces the instantiation path from a top module down to a nested one; based on the extractor contributed in #402 by @FHYQ-Dong. Re-index projects that contain Verilog files.
+
+- **A derived parameter depends on the parameters it is computed from.** `localparam K = (N + 1) * 2;` links `K` to `N`, so impact on a width or depth parameter follows the whole chain of `localparam`s built on it, inside its own module. Suggested by @FHYQ-Dong.
+
+- **HDL port bindings resolve to their formal ports.** Named, positional and wildcard (`.*`) connections link an instance's local signals to the instantiated module's ports, and bit or part selects keep their base signal.
+
+- **Signal readers and writers on request.** `codegraph_explore` with `hdlAccess` (CLI: `codegraph explore --hdl-access`) lists where a signal is read, written, used as a control condition or as a clock/reset event, including the direction of arguments passed to known functions and tasks.
+
+- **HDL build profiles.** An optional `hdl` section in `codegraph.json` selects source files or filelists, include directories and defines; conditional-compilation branches are indexed under the active profile, `codegraph status` reports the configured versus the indexed profile, and the file watcher follows filelists and included headers.
+
+- **Computed parameters and port widths.** `codegraph hdl-semantic` runs an installed slang (or pyslang through `--python`) on the active profile and returns evaluated parameters, port widths and macro origins as a separate answer, without touching the indexed graph.
 
 
 ## [1.6.1] - 2026-09-29
