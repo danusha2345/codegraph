@@ -5,11 +5,13 @@
  */
 
 import * as path from 'path';
+import { builtinModules } from 'module';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, isSupertypeTarget, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { LIBRARY_METHOD_NAMES, JAVA_STD_CLASSES } from './library-methods';
+import { resolveWorkspaceImport } from './workspace-packages';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -1053,6 +1055,8 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   // rejection here cannot fall through to a promoted runner-up.
   return isCrossFileReachable(candidate, ref, context);
 }
+const NODE_BUILTIN_SPECIFIERS = new Set(builtinModules);
+const ROOT_IMPORT_PATHS = new WeakMap<ResolutionContext, Map<string, boolean>>();
 
 const JS_FAMILY = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx']);
 
@@ -1281,6 +1285,88 @@ function bindsAtSites(source: string, name: string, sites: LocalBindingSites): b
 }
 
 /**
+ * Whether the call site's own name is bound by an import of a BARE specifier —
+ * a Node builtin or an npm package. Such a binding names a symbol that is not
+ * in the graph at all, so no project node is the right target for it, however
+ * few candidates are left standing. That is the trap the name-based strategies
+ * fall into: filtering narrows a crowd of same-named symbols but says nothing
+ * about whether the true target was ever in the crowd, so when one survives it
+ * inherits the call. `import { resolve } from 'node:path'` is the case that
+ * matters — a common name, many project definitions, and the real target
+ * external.
+ *
+ * Relative, alias, and workspace imports are deliberately not treated this way:
+ * those point at project files, so a name match is a reasonable recovery when
+ * the import resolver could not follow the path.
+ *
+ * Only the JS/TS family is checked. There, a project-internal import is
+ * distinguishable by shape — it is relative, aliased, or a workspace member —
+ * so "bare" really does mean external. In Java, Kotlin, Go and Python a
+ * project's own modules are imported by absolute name too, and the same test
+ * would reject the internal case along with the external one.
+ */
+export function isBoundToBareImport(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (
+    ref.language !== 'typescript' &&
+    ref.language !== 'javascript' &&
+    ref.language !== 'tsx' &&
+    ref.language !== 'jsx' &&
+    ref.language !== 'arkts'
+  ) {
+    return false;
+  }
+  // Optional-called: a minimal context (tests, embedders) may not carry
+  // import mappings, and without them nothing is known to be bare.
+  const source = context
+    .getImportMappings?.(ref.filePath, ref.language)
+    ?.find((i) => i.localName === ref.referenceName)?.source;
+  if (source === undefined) return false;
+  if (source.startsWith('.') || source.startsWith('/')) return false;
+  // `~`, `#` and `$` cannot begin an npm package name, so the prefix alone
+  // proves a local binding and no resolver lookup is needed: `~utils` (a
+  // tsconfig `paths` entry, which a nested tsconfig the alias loader never
+  // reads still declares), `#types/hmrPayload` (a package.json `imports`
+  // subpath), `$lib/...` (SvelteKit). Matching only `~/` classed the slashless
+  // spellings as bare and sent real project edges out with the wrong ones.
+  if (source.startsWith('~') || source.startsWith('#') || source.startsWith('$')) return false;
+  if (source.startsWith('@/') || source.startsWith('src/')) return false;
+  const aliases = context.getProjectAliases?.();
+  if (aliases?.patterns.some((p) => source.startsWith(p.prefix))) return false;
+  const workspaces = context.getWorkspacePackages?.();
+  if (workspaces && resolveWorkspaceImport(source, workspaces)) return false;
+  // A `link:` / `file:` dependency is a directory in the project that no
+  // workspace glob need cover, so the workspace map above cannot see it:
+  // vitest imports `@vitest/bundled-lib` from `test/browser/bundled-lib`,
+  // which its `test/*` globs stop short of. The name is local even though it
+  // is spelled exactly like a scoped registry package.
+  if (workspaces?.localLinkNames?.has(packageNameOf(source))) return false;
+  // A nested tsconfig may define baseUrl while the project-root alias map
+  // knows nothing about it. A root path such as lib/utils is still local.
+  // Builtins keep their meaning even when a same-named directory exists.
+  if (!source.startsWith('node:') && !NODE_BUILTIN_SPECIFIERS.has(source)) {
+    const head = packageNameOf(source);
+    let memo = ROOT_IMPORT_PATHS.get(context);
+    if (!memo) { memo = new Map(); ROOT_IMPORT_PATHS.set(context, memo); }
+    let local = memo.get(head);
+    if (local === undefined) {
+      local = context.fileExists(head);
+      memo.set(head, local);
+    }
+    if (local) return false;
+  }
+  return true;
+}
+
+/**
+ * The package a specifier names, without its subpath: `@scope/pkg/sub` →
+ * `@scope/pkg`, `pkg/sub` → `pkg`. Scoped names keep two segments.
+ */
+function packageNameOf(source: string): string {
+  const parts = source.split('/');
+  return source.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0]!;
+}
+
+/**
  * Try to resolve a reference by exact name match
  */
 export function matchByExactName(
@@ -1317,7 +1403,7 @@ export function matchByExactName(
   // upstream's language gate on the chosen result.
   const cMacroCall = ref.referenceKind === 'calls' && (ref.language === 'c' || ref.language === 'cpp') &&
     sameName.some((n) => n.kind === 'constant' && CPP_DEFINE_SIGNATURE.test(n.signature ?? ''));
-  const candidates = sameName.filter((n) =>
+  let candidates = sameName.filter((n) =>
     !(cMacroCall && n.kind !== 'function' && n.kind !== 'method') &&
     // Type/value references retain same-family eligibility: a native namesake
     // must not hide the actual web type. Calls still gate only the winner.
@@ -1346,6 +1432,17 @@ export function matchByExactName(
     // file's symbol of that name, so a bare call has no cross-file candidate.
     !(bareJs && n.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context))
   );
+
+  // A name bound to a bare import (`import { test } from 'vitest'`) has its
+  // target outside the graph: no other file's `test` is it, however unique.
+  // A same-file definition stays eligible — a local declaration shadows the
+  // file-level import, and that is what the reference then means.
+  if (
+    candidates.some((n) => n.filePath !== ref.filePath) &&
+    isBoundToBareImport(ref, context)
+  ) {
+    candidates = candidates.filter((n) => n.filePath === ref.filePath);
+  }
 
   if (candidates.length === 0) {
     return null;
@@ -3240,6 +3337,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   TS_FIELD_DECL_MEMO.delete(context);
   TS_CLASS_LINES.delete(context);
   TARGET_LANGUAGE.delete(context);
+  ROOT_IMPORT_PATHS.delete(context);
 }
 
 function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {
@@ -5607,6 +5705,7 @@ export function matchFuzzy(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  if (isBoundToBareImport(ref, context)) return null;
   const lowerName = ref.referenceName.toLowerCase();
 
   // Use pre-built lowercase index for O(1) lookup instead of scanning all nodes
