@@ -59,6 +59,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Java calls on a value of unknown type, such as `map.put(...)`, `s.toString()`, `KEY.equals(...)` on a constant, or `Objects.hash(...)` and `Collections.emptyMap()` under a wildcard `java.util.*` import, no longer link to a project method that merely shares the name.
 - In TypeScript and JavaScript, a method called on a freshly constructed object, such as `new RegExp(p).exec(s)` or `new URL(u).toString()`, now links only to that class's own (or inherited) method and no longer to an unrelated project method of the same name.
+- A call to a function defined in the same file is no longer marked as an uncertain match when the file sits near the top of the project, and it now wins over a weaker same-named guess in another file.
 
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)
 
