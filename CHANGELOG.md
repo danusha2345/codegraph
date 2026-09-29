@@ -20,6 +20,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A name imported from a package no longer exact-matches a project symbol either.** `import { test } from 'vitest'` used to link every `test(...)` in a spec to whichever project file defined a function called `test` — on vite, a fixture, 1,747 times — and `import { resolve } from 'node:path'` to a plugin container's `resolve` method. The exact-name strategy now applies the same rule as the fuzzy one: a name bound to a builtin or an npm package binds to no other file's symbol. A definition in the same file still wins, as a local declaration shadows the import; and a name imported through an alias the resolver cannot see (`~utils`, `#types/x`, `$lib`) still reaches its local target by name, as before. Re-index after upgrading.
 - Local JavaScript and TypeScript calls stay connected through linked packages and imports configured by a nested `baseUrl` (#1715).
 - A method calling another method of its own class — `render()` in Java, Kotlin, C#, Scala, Swift, C++, Dart or Ruby, or `this.render()` / `self.render()` / `$this->render()` — now links to that class's method (or the one it inherits or is nested in) instead of a same-named method of another class declared nearer in the file.
+- Indexing and sync on large projects, especially C and C++ codebases with huge generated headers, now keep cached source text and preprocessor data within a fixed memory budget, so the final resolution pass no longer runs out of memory. (#1583)
+- `codegraph_impact` on a heavily referenced symbol now stops at a safety limit and says the answer was truncated, instead of exhausting the MCP server's memory; narrow it with `file` or a smaller `depth`. (#1583)
+- The MCP server now recycles its query workers after they sit idle, releasing the memory a burst of large queries left behind while keeping one worker warm for the next call. (#1583)
+- Path search between two symbols no longer slows down sharply or grows its memory use on densely connected graphs. (#1583)
+- Tag-based ColdFusion (CFML) files no longer leak parser memory during indexing. (#1583)
 
 ## [1.6.1] - 2026-09-29
 
