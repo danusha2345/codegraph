@@ -50,6 +50,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The Claude Code prompt hook no longer runs on the task-notification messages Claude Code injects when a background agent finishes, removing a multi-second stall on every such turn. (#1832)
 
 - Java `record` declarations are now indexed as classes, with their methods, constructors, components and implicit accessors, so calls on a record-typed value like `info.remoteAddress()` resolve and records show up in callers, impact and implementations; re-index Java projects after upgrading.
+- Java calls on a variable, parameter or field whose declared type is a library class (such as `Parcel`, `Context`, `List` or `Handler`), and static calls on an imported library class such as `Log.d(...)`, no longer link to an unrelated project method with the same name. Calls through `this.field`, `Outer.this.field`, a field read inside an anonymous or inner class, a chain of fields such as `owner.repo.save()`, and a variable declared with type arguments (`Map<String, Foo> byName`) now resolve on the declared type, and a type written with its package or outer class (`Map.Entry`, `play.api.mvc.BodyParser`) or imported as a nested class is no longer mistaken for a same-named type elsewhere in the project. Re-index Java projects to pick this up.
 
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
