@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Newer MCP clients such as Antigravity 2.5 connect again: the server now answers their `server/discover` probe right away with "method not found", so they go straight on to the regular handshake instead of waiting on a reply that could take seconds or never come. (#2084)
+
 
 ## [1.6.1] - 2026-09-29
 
