@@ -151,6 +151,9 @@ describe('git index currency across commits and restores (#1829)', () => {
 
   it('keeps a committed path pending when sync cannot read it', async () => {
     write('new.ts', 'newSymbol'); commit();
+    // Sync reads a source file through a bounded reader that opens a
+    // descriptor (#1910), so the failure is injected at openSync as well as
+    // readFileSync: it must reach whichever one the read goes through.
     let injected = 0;
     const failNewTs = (real: (...args: any[]) => unknown, file: any, ...args: any[]) => {
       if (String(file) === path.join(root, 'new.ts')) { injected++; throw new Error('Injected transient read error'); }
