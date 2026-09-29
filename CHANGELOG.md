@@ -43,6 +43,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Computed parameters and port widths.** `codegraph hdl-semantic` runs an installed slang (or pyslang through `--python`) on the active profile and returns evaluated parameters, port widths and macro origins as a separate answer, without touching the indexed graph.
 
+- A CodeGraph session that queried another project through `projectPath` no longer keeps that project locked for as long as it runs: after 10 minutes without a query it lets the project go, so the project's own session and `codegraph index` can take over again (tune with `CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS`, `0` keeps it open). (#2087)
 
 ## [1.6.1] - 2026-09-29
 
