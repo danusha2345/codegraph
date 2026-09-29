@@ -95,6 +95,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In TypeScript, `this.field.method()` on a type declared in two equally near apps now picks the same target on every machine. The tie used to be broken by locale-dependent string comparison, so indexes built with different system locales could disagree.
 - Java and Kotlin inheritance now resolves nested types more precisely, and anonymous implementations retain their members after re-indexing.
 
+- A call like `Logger.log()` now links to `Logger`'s own method instead of the same-named method of a class whose name merely contains it, such as `FileLogger`.
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
 - Go method calls now resolve through the receiver's declared type — an unexported or package-qualified parameter, a constructor's result, or a variable named like a standard-library package (`ring`, `token`) — and a receiver typed outside the project (`net.Conn`, `*bytes.Buffer`, `error`) no longer links to an unrelated project method of the same name; re-index to pick this up.

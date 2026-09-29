@@ -5300,13 +5300,7 @@ export function matchMethodCall(
       // Skip cross-language class matches
       if (classNode.language !== ref.language) continue;
 
-      const nodesInFile = context.getNodesInFile(classNode.filePath);
-      const methodNode = nodesInFile.find(
-        (n) =>
-          n.kind === 'method' &&
-          n.name === methodName &&
-          n.qualifiedName.includes(classNode.name)
-      );
+      const methodNode = findOwnMethod(context.getNodesInFile(classNode.filePath), classNode, methodName!);
 
       if (methodNode) {
         return {
@@ -5342,13 +5336,7 @@ export function matchMethodCall(
         // Skip cross-language class matches
         if (classNode.language !== ref.language) continue;
 
-        const nodesInFile = context.getNodesInFile(classNode.filePath);
-        const methodNode = nodesInFile.find(
-          (n) =>
-            n.kind === 'method' &&
-            n.name === methodName &&
-            n.qualifiedName.includes(classNode.name)
-        );
+        const methodNode = findOwnMethod(context.getNodesInFile(classNode.filePath), classNode, methodName!);
 
         if (methodNode) {
           return {
@@ -6216,6 +6204,29 @@ function matchTsThisFieldCall(
     return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method');
   }
   return null;
+}
+
+/**
+ * The `method` named `methodName` declared on `classNode`, among the nodes of
+ * the class's file: the class's exact qualified name first, then the
+ * owner-by-name form the resolver uses elsewhere (`Logger::log`,
+ * `ns::Logger::log`). Never a substring test: `FileLogger::log` contains
+ * `Logger`.
+ *
+ * Known limitation — same-named NESTED classes: the owner-by-name form also
+ * matches `Outer::Logger::log`, and every same-named class is a candidate in
+ * the caller's loop, so a nested `Outer::Logger` can take a top-level
+ * `Logger.log()` (declared first, or the only one with the method). Choosing
+ * among them needs each language's scope rules.
+ */
+function findOwnMethod(nodesInFile: Node[], classNode: Node, methodName: string): Node | undefined {
+  const methods = nodesInFile.filter((n) => n.kind === 'method' && n.name === methodName);
+  const exact = `${classNode.qualifiedName}::${methodName}`;
+  const byName = `${classNode.name}::${methodName}`;
+  return (
+    methods.find((n) => n.qualifiedName === exact) ??
+    methods.find((n) => n.qualifiedName === byName || n.qualifiedName.endsWith(`::${byName}`))
+  );
 }
 
 /**
