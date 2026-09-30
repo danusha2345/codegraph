@@ -169,6 +169,10 @@ These describe `codegraph ui` and its screens. They were taken out of `## [Unrel
 
 ## Fixes — Symbols, tests and the viewer
 
+- **Saved trails stay inside the indexed project even when a directory or trail file is a symlink.** The viewer refuses paths whose nearest existing directory resolves outside the project, opens trail files without following links and without blocking on a named pipe left in the trails directory, and creates its atomic temporary file exclusively so a pre-planted link cannot capture a read or write.
+
+- **Saved-trail authors are now resolved per project.** An embedded host serving several projects in one process no longer reuses the first repository's Git user name for every later trail.
+
 - **Entry points' most-depended-on list shows your code, not a vendored bundle's.** A minified library or bundled docs script (`n`, `t`, `Buffer` with thousands of callers, all from inside the bundle) could top the list. Symbols in generated files are now left out of it, like test files.
 
 - **Stopping `codegraph ui` stops the server.** Killing the command by its process id, as a process manager, an editor task or `kill` does, left the server running on its port with no way to reach it, until the machine restarted. The server now notices it has been left behind and shuts down, closing the index first. Ctrl+C was never affected.
