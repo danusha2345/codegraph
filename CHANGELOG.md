@@ -113,6 +113,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Kotlin `fun interface` declarations are indexed, and no longer hide the declaration that follows them.
 - **A Kotlin `private val` / `private var` no longer captures calls from other files.** Properties were indexed without their visibility modifier, so the file-local rule that already declines a `private fun` read every property as public: an Android app's `token(...)` validator resolved onto another class's `@Volatile private var token`, and JavaScript, Go and Python callers landed on Kotlin test fixtures' private fields. Both the WebAssembly and the native path now record `private` / `internal` / `protected` on properties. Re-index after upgrading. (#1731)
 - A method calling another method of its own class — `render()` in Java, Scala or C++, or `this.render()` / `self.render()` in TypeScript, JavaScript or Python — now links to that class's method (or the one it inherits or is nested in) instead of a same-named method of another class declared nearer in the file.
+- A call to a function defined in the same file is no longer marked as an uncertain match when the file sits near the top of the project, and it now wins over a weaker same-named guess in another file.
 
 ## [1.6.1] - 2026-09-29
 
