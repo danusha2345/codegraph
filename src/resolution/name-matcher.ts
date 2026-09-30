@@ -4,18 +4,17 @@
  * Handles symbol name matching for reference resolution.
  */
 
+import * as fs from 'fs';
 import * as path from 'path';
-import { builtinModules } from 'module';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, isSupertypeTarget, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
-import { LIBRARY_METHOD_NAMES, JAVA_STD_CLASSES } from './library-methods';
-import { resolveWorkspaceImport } from './workspace-packages';
+import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
+import { isTestPath } from '../search/query-utils';
 import { isVerilogMemberRef, matchVerilogMember } from './verilog-members';
 import { isVerilogPortRef, matchVerilogPort } from './verilog-ports';
 import { isVerilogWildcardRef, matchVerilogWildcard } from './verilog-wildcard';
-import { isTestPath } from '../search/query-utils';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -944,115 +943,6 @@ function pythonFieldType(receiver: string, owner: Node, ref: UnresolvedRef, cont
   return types.size === 1 ? [...types][0]! : types.size > 1 ? '<ambiguous>' : null;
 }
 
-/** A receiver that is the calling type itself, or its base. */
-const OWN_TYPE_RECEIVER = /^(?:self|this|super|base|cls)$/;
-
-/** Kinds that live inside a type — owned by that type, not by their module. */
-const MEMBER_KINDS = new Set(['method', 'property', 'field', 'enum_member']);
-
-/** Lower-cased words of an identifier or path: camel, snake and digit-camel boundaries. */
-function nameWords(s: string): string[] {
-  return s
-    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
-    .split(/[^A-Za-z0-9]+/)
-    .filter((w) => w.length > 1)
-    .map((w) => w.toLowerCase());
-}
-
-/**
- * The name a receiver expression ends in — the object the method is called
- * on: `state.log` → `log`, `data.iter()` → `iter`, `myForm.field("x")` →
- * `field`, `x?` / `x!!` → `x`. Trailing argument, index, generic and lambda
- * groups are peeled; '' when the receiver ends in something else (a literal).
- */
-function receiverTailName(receiver: string): string {
-  let s = receiver;
-  for (let guard = 0; guard < 50; guard++) {
-    s = s.replace(/[\s?!]+$/, '');
-    const close = s[s.length - 1];
-    const open = close === ')' ? '(' : close === ']' ? '[' : close === '}' ? '{' : close === '>' ? '<' : null;
-    if (!open) break;
-    let depth = 0;
-    let i = s.length - 1;
-    for (; i >= 0; i--) {
-      if (s[i] === close) depth++;
-      else if (s[i] === open && --depth === 0) break;
-    }
-    if (i <= 0) return '';
-    s = s.slice(0, i);
-  }
-  return /([A-Za-z_]\w*)$/.exec(s)?.[1] ?? '';
-}
-
-/**
- * Whether a member call on a receiver of unknown type would bind a
- * standard-library method name (`len`, `iter`, `isEmpty`, `setdefault`,
- * `map`…) to a project symbol with nothing but the name to go on. The call
- * is almost always the library's own method on a library value
- * (`name.len()`, `v.iter().all()`, `d.setdefault(k, [])`), and the one
- * project `len`/`all`/`setdefault` collected every such call — on a Rust
- * GUI, ~500 edges into a log buffer's `len`. The candidate is kept when the
- * receiver's name says it is that type (`self.state.log.clear()` →
- * `AppLog::clear`, `cache.set(...)` → `AsyncCacheApi::set`); typed receivers
- * resolve before any name-only strategy and never reach this check.
- */
-function isUnevidencedLibraryCall(candidates: Node[], receiver: string, methodName: string, ref: UnresolvedRef): boolean {
-  if (ref.referenceKind !== 'calls') return false;
-  const java = ref.language === 'java';
-  // Java: any static call on a java.lang / java.util class (`Objects.hash(…)`).
-  const stdClass = java && JAVA_STD_CLASSES.has(/^(?:java\.[\w.]*\.)?([A-Z]\w*)$/.exec(receiver)?.[1] ?? '');
-  if (!stdClass && !LIBRARY_METHOD_NAMES[ref.language]?.has(methodName)) return false;
-  // The enclosing type's own method (`base.Dispose()` in C#) is not a guess.
-  if (OWN_TYPE_RECEIVER.test(receiver)) return false;
-  const tail = receiverTailName(receiver);
-  // Java: a constant (`Keys.ACTION_CLEAR.equals(s)`, `Integer.TYPE.equals(c)`)
-  // is named for its value, not its type, and its class is not its type
-  // either — no evidence, except a singleton's `INSTANCE`.
-  if (java && /^[A-Z][A-Z0-9_]+$/.test(tail) && tail !== 'INSTANCE') return true;
-  // The receiver's own name, plus a capitalized chain root — a type or
-  // companion whose members return it (`GpsMode.ON.next()`,
-  // `Lock.tryBegin(1)!!.close()`).
-  const root = /^[A-Z]\w*/.exec(receiver)?.[0] ?? '';
-  const receiverWords = nameWords(`${tail} ${root}`);
-  if (receiverWords.length === 0) return true;
-  return !candidates.some((c) => {
-    const owner = c.qualifiedName.split('::').slice(0, -1).filter((seg) => !seg.includes('.'));
-    // A free function's "owner" is its module: `flask.json.dumps` → flask/json.
-    const words = MEMBER_KINDS.has(c.kind) ? nameWords(owner.join(' ')) : nameWords(`${owner.join(' ')} ${c.filePath.replace(/\.\w+$/, '')}`);
-    return words.some((w) => receiverWords.includes(w));
-  });
-}
-
-/**
- * The receiver a bare-named call ref was written on, read from the call site:
- * `data.iter().all(...)` reaches the resolver as the bare `all` (the chain has
- * no static type), and so does `self.m()` in Python and an implicit-this call
- * in Kotlin. Returns the receiver text when the source shows a receiver other
- * than the calling type itself (`self`, `this`, `super`, `base`, `cls`), else
- * null (a plain `all(...)` call, or a site the text doesn't match).
- */
-function writtenCallReceiver(ref: UnresolvedRef, context: ResolutionContext): string | null {
-  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split('\n');
-  const first = lines?.[ref.line - 1];
-  if (!lines || first === undefined) return null;
-  let text = first.slice(ref.column);
-  for (let i = ref.line; i < lines.length && i < ref.line + 20 && text.length < 4000; i++) text += '\n' + lines[i];
-  const name = ref.referenceName;
-  if (new RegExp(`^${name}(?!\\w)`).test(text)) return null;
-  const member = new RegExp(`(?:\\.|->)\\s*${name}(?!\\w)`).exec(text);
-  if (!member) return null;
-  const receiver = text.slice(0, member.index).trim();
-  return OWN_TYPE_RECEIVER.test(receiver) ? null : receiver;
-}
-
-/** {@link isUnevidencedLibraryCall} for a bare-named ref, whose receiver only the call site shows. */
-function isUnevidencedBareLibraryCall(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
-  if (ref.referenceKind !== 'calls' || !LIBRARY_METHOD_NAMES[ref.language]?.has(ref.referenceName)) return false;
-  const receiver = writtenCallReceiver(ref, context);
-  return receiver !== null && isUnevidencedLibraryCall([candidate], receiver, ref.referenceName, ref);
-}
-
 /**
  * Resolve a function-as-value reference (#756) — a function name used as a
  * callback/function-pointer value (`register(handler)`, `o->cb = handler`,
@@ -1215,25 +1105,28 @@ export function matchFunctionRef(
 
 /** Languages with no nested named functions: nesting in the graph is never a scope. */
 const NO_NESTED_FUNCTIONS = new Set<string>(['c', 'cpp']);
+/** Types a function body can declare for itself. */
+const LOCAL_TYPE_KINDS = new Set<string>(['class', 'struct', 'enum', 'interface', 'trait', 'type_alias']);
 
 /**
- * A function nested inside another function, or an anonymous-class method
- * inside a function, is only callable from within that container.
+ * A function nested inside another FUNCTION is only callable from within its
+ * container — Python, JS/TS, and every closure language scope it lexically.
  * Resolving a bare name from elsewhere to a nested local fabricates an edge
  * scope already rules out: `join(...)` in one function must never bind to a
  * `join` defined inside a DIFFERENT function (#1230). A candidate whose
  * qualifiedName parent is a same-file function/method is kept only when the
- * ref originates inside that parent's line range. Ordinary class members and
- * top-level symbols have no enclosing function; C++ namespace prefixes have
- * no function node.
+ * ref originates inside that parent's line range. Class members are
+ * unaffected (their parent resolves to a class-like node), as are top-level
+ * symbols and C++ namespace-prefixed names (the prefix has no node).
  */
 function isLexicallyReachable(
   candidate: Node,
   ref: UnresolvedRef,
   context: ResolutionContext
 ): boolean {
-  if (candidate.kind !== 'function' && candidate.kind !== 'method') return true;
-  if (candidate.kind === 'method' && !candidate.qualifiedName.includes('$anon@')) return true;
+  // A function — or a type (`case class B()` in a test method), or a method
+  // of such a type — declared inside a function is only in scope in there.
+  if (candidate.kind !== 'function' && candidate.kind !== 'method' && !LOCAL_TYPE_KINDS.has(candidate.kind)) return true;
   // C and C++ have no nested named functions, so a function the graph shows
   // inside another is an extraction artifact, not a scope: tree-sitter-c
   // cannot parse a macro call whose arguments are designated initializers
@@ -1242,24 +1135,50 @@ function isLexicallyReachable(
   // the file, nesting every function after it. Trusting that nesting rejected
   // 117 real calls into pid.c on that tree; the functions are reachable.
   if (NO_NESTED_FUNCTIONS.has(candidate.language)) return true;
-  const qn = candidate.qualifiedName;
-  if (!qn || !qn.includes('::')) return true;
-  let parentQn = qn.slice(0, qn.lastIndexOf('::'));
-  while (parentQn) {
-    const containers = context.getNodesByQualifiedName(parentQn).filter((p) =>
-      p.filePath === candidate.filePath &&
-      (p.kind === 'function' || p.kind === 'method') &&
-      p.startLine <= candidate.startLine && p.endLine >= candidate.endLine
-    );
-    if (containers.length > 0) {
-      return ref.filePath === candidate.filePath &&
-        containers.some((p) => ref.line >= p.startLine && ref.line <= p.endLine);
-    }
-    const separator = parentQn.lastIndexOf('::');
-    if (separator < 0) break;
-    parentQn = parentQn.slice(0, separator);
+  const scope = lexicalScopeOf(candidate, context);
+  return scope === null || (ref.filePath === candidate.filePath && ref.line >= scope.start && ref.line <= scope.end);
+}
+
+/** Per context: a candidate's scoping function body, or null when nothing scopes it. */
+const LEXICAL_SCOPE_MEMO = new WeakMap<ResolutionContext, Map<string, { start: number; end: number } | null>>();
+
+/**
+ * The innermost function or method BODY that scopes a declaration, walking out
+ * through its qualified name (`test_x::Request::User::has_perm` → `test_x`).
+ * A method directly on a class is reachable through its instances, and an
+ * object-literal method a function returns through the object — neither is
+ * scoped by the function it sits in.
+ */
+function lexicalScopeOf(candidate: Node, context: ResolutionContext): { start: number; end: number } | null {
+  let memo = LEXICAL_SCOPE_MEMO.get(context);
+  if (!memo) {
+    memo = new Map();
+    LEXICAL_SCOPE_MEMO.set(context, memo);
   }
-  return true;
+  const hit = memo.get(candidate.id);
+  if (hit !== undefined) return hit;
+  let scope: { start: number; end: number } | null = null;
+  const own = candidate.qualifiedName ?? '';
+  const parentQn = own.includes('::') ? own.slice(0, own.lastIndexOf('::')) : '';
+  let qn = own;
+  while (qn.includes('::')) {
+    qn = qn.slice(0, qn.lastIndexOf('::'));
+    const container = context
+      .getNodesByQualifiedName(qn)
+      .find(
+        (p) =>
+          p.filePath === candidate.filePath &&
+          (p.kind === 'function' || p.kind === 'method') &&
+          p.startLine <= candidate.startLine &&
+          p.endLine >= candidate.endLine
+      );
+    if (!container) continue;
+    if (candidate.kind === 'method' && qn === parentQn) break;
+    scope = { start: container.startLine, end: container.endLine };
+    break;
+  }
+  memo.set(candidate.id, scope);
+  return scope;
 }
 
 /** Languages whose module boundary is `import`/`export` (or CommonJS). */
@@ -1369,8 +1288,242 @@ function isCrossFileReachable(
   return (
     candidate.filePath === ref.filePath ||
     !ESM_FAMILY.has(candidate.language) ||
-    !isSealedModule(candidate.filePath, context)
+    (!isSealedModule(candidate.filePath, context) && !isUnexportedModuleBinding(candidate, context))
   );
+}
+
+const ESM_BINDING_KINDS: ReadonlySet<string> = new Set(['function', 'variable', 'constant', 'class', 'interface', 'type_alias', 'enum', 'component']);
+const ESM_EXPORT_LISTS = new WeakMap<ResolutionContext, Map<string, { module: boolean; names: Set<string> }>>();
+
+/**
+ * Whether `candidate` is a top-level binding of an ES module that the module
+ * doesn't export — declared without `export` and absent from its `export { … }`
+ * / `export default x` lists. No other file can name it. The sealed-module
+ * rule above covers files that export nothing; this is the same boundary per
+ * symbol: sveltekit's `generate_manifest.js` keeps an unexported `resolve`
+ * that twenty other files' `resolve(…)` calls went to. Classic scripts,
+ * CommonJS, `declare global` and `.d.ts` files, members of a class or
+ * namespace (qualified names), names a default-exported or returned object
+ * literal lists,
+ * and anything not declared by a statement of its own (an object literal's
+ * member, `proto.x = function x() {}`) are exempt.
+ */
+function isUnexportedModuleBinding(candidate: Node, context: ResolutionContext): boolean {
+  if (candidate.isExported || !ESM_BINDING_KINDS.has(candidate.kind)) return false;
+  if (candidate.qualifiedName.includes('::') || /\.d\.[cm]?ts$/.test(candidate.filePath)) return false;
+  let memo = ESM_EXPORT_LISTS.get(context);
+  if (!memo) ESM_EXPORT_LISTS.set(context, (memo = new Map()));
+  let info = memo.get(candidate.filePath);
+  if (!info) {
+    const source = context.readFile(candidate.filePath) ?? '';
+    const code = blankStringContents(stripCommentsForRegex(source, 'typescript'));
+    const module = (HAS_IMPORT_STATEMENT.test(code) || HAS_ESM_EXPORT.test(code)) &&
+      !HAS_CJS_EXPORT.test(source) && !/\bdeclare\s+global\b/.test(code);
+    const names = new Set<string>();
+    if (module) {
+      for (const m of source.matchAll(/^[ \t]*export\s+(?:type\s+)?\{([^}]*)\}/gm)) {
+        for (const item of m[1]!.split(',')) {
+          const local = item.trim().replace(/^type\s+/, '').split(/\s+as\s+/)[0]!.trim();
+          if (local) names.add(local);
+        }
+      }
+      for (const m of source.matchAll(/^[ \t]*export\s+(?:default|=)\s+([A-Za-z_$][\w$]*)\s*;?\s*$/gm)) names.add(m[1]!);
+      // `export default { getAdapter, adapters: known }` exposes its shorthand and
+      // value names; so does a `return { getDefaultActivityRoute, … }` (a
+      // composable hands the function out through its result).
+      for (const m of code.matchAll(/^[ \t]*export\s+default\s+\{([^}]*)\}|\breturn\s*\{([^{}]*)\}/gm)) {
+        for (const item of (m[1] ?? m[2])!.split(',')) {
+          const value = item.includes(':') ? item.split(':').pop()! : item;
+          const id = /^\s*([A-Za-z_$][\w$]*)\s*$/.exec(value)?.[1];
+          if (id) names.add(id);
+        }
+      }
+    }
+    info = { module, names };
+    memo.set(candidate.filePath, info);
+  }
+  if (!info.module || info.names.has(candidate.name)) return false;
+  const line = (context.getFileLines?.(candidate.filePath) ?? context.readFile(candidate.filePath)?.split('\n'))?.[candidate.startLine - 1] ?? '';
+  // Its own line says `export` (a node's flag can miss a form), or it is
+  // `prototype.toString = function toString() {…}`, reached through instances.
+  if (/^\s*export\b/.test(line)) return false;
+  // Only a declaration statement is a module binding: an object literal's
+  // member (a zustand store action `setZipUri: (v) => set(…)`) is reached
+  // through the object, and so is `proto.x = function x() {}`.
+  return /^\s*(?:declare\s+)?(?:async\s+)?(?:function\*?|const|let|var|(?:abstract\s+)?class|interface|type|enum)\s/.test(line);
+}
+
+const LUA_LOCALS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/** Whether a Lua variable or function is declared `local` (`local x = …`, `local function f`, `local a, x = …`). */
+function isLuaLocal(candidate: Node, context: ResolutionContext): boolean {
+  if (candidate.kind !== 'variable' && candidate.kind !== 'constant' && candidate.kind !== 'function') return false;
+  let memo = LUA_LOCALS.get(context);
+  if (!memo) LUA_LOCALS.set(context, (memo = new Map()));
+  const hit = memo.get(candidate.id);
+  if (hit !== undefined) return hit;
+  const line = (context.getFileLines?.(candidate.filePath) ?? context.readFile(candidate.filePath)?.split(/\r?\n/))?.[candidate.startLine - 1] ?? '';
+  const local = /^\s*local\b/.test(line);
+  memo.set(candidate.id, local);
+  return local;
+}
+
+/** Lua's global functions, and the test runner's: `local type = type` is the standard library's `type`. */
+const LUA_GLOBAL_FUNCTIONS: ReadonlySet<string> = new Set([
+  'assert', 'error', 'ipairs', 'pairs', 'next', 'type', 'tostring', 'tonumber', 'setmetatable', 'getmetatable',
+  'rawget', 'rawset', 'rawequal', 'rawlen', 'select', 'pcall', 'xpcall', 'unpack', 'print', 'load', 'loadstring',
+  'loadfile', 'dofile', 'collectgarbage', 'require', 'setfenv', 'getfenv', 'newproxy', 'typeof', 'warn', 'tick', 'wait',
+  'describe', 'it', 'before_each', 'after_each', 'setup', 'teardown', 'lazy_setup', 'lazy_teardown', 'pending', 'finally',
+  'insulate', 'expose',
+]);
+
+/** `require "m"` (or a loader named for it — kong's `reload_module("spec.internal.misc")`), then any `.member`s. */
+const LUA_REQUIRE_ALIAS = /^(?:require|[A-Za-z_]\w*(?:[Rr]equire|_module|[Ii]mport))\s*\(?\s*(["'])([^"']+)\1\s*\)?((?:\s*\.\s*[A-Za-z_]\w*)*)\s*$/;
+const LUA_NAME_ALIAS = /^([A-Za-z_]\w*)((?:\s*\.\s*[A-Za-z_]\w*)*)\s*$/;
+
+/**
+ * A bare Lua call through a `local` alias, followed to what the alias names:
+ *
+ *   local splitn = require("kong.tools.string").splitn   → the module's `splitn`
+ *   local select_listener = utils.select_listener        → through `local utils = require …`
+ *   local fmt = string.format / local type = type        → the standard library's: no edge
+ *
+ * Kong localizes every global and module function it uses this way, so its
+ * calls stopped at a same-file variable — 8,000 of them, most for the
+ * standard library. `undefined` when the call is not through such an alias
+ * (it resolves as before), null when the alias names nothing in the project.
+ */
+function luaAliasTarget(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const decl = luaLocalDecl(ref.referenceName, ref.filePath, ref.line, context);
+  if (!decl) return undefined;
+  const target = luaAliasOf(decl, context, 0);
+  if (target === undefined) return undefined;
+  if (target === null) return null;
+  return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
+}
+
+/** The `local name = …` in scope at `line` of `file`: the nearest one above it that no other function holds. */
+function luaLocalDecl(name: string, file: string, line: number, context: ResolutionContext): Node | null {
+  const nodes = context.getNodesInFile(file);
+  const fns = nodes.filter((n) => n.kind === 'function' || n.kind === 'method');
+  let best: Node | null = null;
+  for (const n of nodes) {
+    if (n.name !== name || n.kind !== 'variable' || n.startLine > line || !n.signature) continue;
+    if (fns.some((f) => f.startLine <= n.startLine && n.startLine <= f.endLine && !(f.startLine <= line && line <= f.endLine))) continue;
+    if (!isLuaLocal(n, context)) continue;
+    if (!best || n.startLine > best.startLine) best = n;
+  }
+  return best;
+}
+
+/** Where a Lua alias is written: its file, line and name, and a node there to resolve `require`s from. */
+interface LuaSite { file: string; line: number; name: string; node: Node }
+
+/**
+ * What a Lua alias variable names: a project function (or the module's own
+ * global), null for the standard library or an outside module, `undefined`
+ * for an initializer that is not an alias.
+ */
+function luaAliasOf(decl: Node, context: ResolutionContext, depth: number): Node | null | undefined {
+  const rhs = decl.signature!.replace(/^\s*=\s*/, '').trim();
+  return luaAliasExpr(rhs, { file: decl.filePath, line: decl.startLine, name: decl.name, node: decl }, context, depth);
+}
+
+const luaMembers = (chain: string): string[] => chain.split('.').map((s) => s.trim()).filter(Boolean);
+
+function luaAliasExpr(rhs: string, site: LuaSite, context: ResolutionContext, depth: number): Node | null | undefined {
+  const req = LUA_REQUIRE_ALIAS.exec(rhs);
+  if (req) return luaModuleMember(req[2]!, luaMembers(req[3]!), site.node, context, depth);
+  const named = LUA_NAME_ALIAS.exec(rhs);
+  if (!named) return undefined;
+  const root = named[1]!;
+  const path = luaMembers(named[2]!);
+  const rootDecl = root === site.name ? null : luaLocalDecl(root, site.file, site.line - 1, context);
+  if (rootDecl) {
+    const module = LUA_REQUIRE_ALIAS.exec(rootDecl.signature!.replace(/^\s*=\s*/, '').trim());
+    if (module && path.length > 0) return luaModuleMember(module[2]!, [...luaMembers(module[3]!), ...path], rootDecl, context, depth);
+    return undefined;
+  }
+  if (path.length === 0) return LUA_GLOBAL_FUNCTIONS.has(root) ? null : undefined;
+  if (!LUA_LIBRARY_TABLES.has(root) || path.length !== 1) return undefined;
+  // A library function the project patches itself (kong's `ngx.sleep`) is the project's —
+  // a test's stand-in (`function ngx.get_phase()` in a spec) only for that test.
+  const patched = context.getNodesByName(path[0]!).filter((n) =>
+    (n.kind === 'function' || n.kind === 'method') && n.qualifiedName.split(/::|\./)[0] === root &&
+    (n.filePath === site.file || !isTestPath(n.filePath)));
+  return patched.length === 1 ? patched[0]! : null;
+}
+
+/** Per-context memo: `file\0a.b` → what that module member is. */
+const LUA_MEMBERS = new WeakMap<ResolutionContext, Map<string, Node | null | undefined>>();
+
+/** `member` of the module `require(name)` returns, from `decl`'s file: its function of that name. */
+function luaModuleMember(name: string, path: string[], decl: Node, context: ResolutionContext, depth: number): Node | null | undefined {
+  const file = luaModuleFile(name, decl, context);
+  if (!file) return null;
+  // `require "kong.conf_loader"` called directly: the module's returned value.
+  if (path.length === 0) return undefined;
+  let memo = LUA_MEMBERS.get(context);
+  if (!memo) LUA_MEMBERS.set(context, (memo = new Map()));
+  const key = `${file}\0${path.join('.')}`;
+  if (memo.has(key)) return memo.get(key);
+  memo.set(key, null); // a cycle of re-exports names nothing
+  const found = luaMemberIn(file, path, context, depth);
+  memo.set(key, found);
+  return found;
+}
+
+function luaMemberIn(file: string, path: string[], context: ResolutionContext, depth: number): Node | null | undefined {
+  const member = path[path.length - 1]!;
+  const nodes = context.getNodesInFile(file);
+  const inFile = nodes.filter((n) => n.name === member);
+  const fns = inFile.filter((n) => n.kind === 'function' || n.kind === 'method');
+  if (fns.length > 0) {
+    const owner = path.length > 1 ? path[path.length - 2]! : null;
+    return fns.find((n) => owner !== null && n.qualifiedName.endsWith(`${owner}::${member}`)) ??
+      fns.find((n) => n.kind === 'method') ?? fns[0]!;
+  }
+  if (depth >= 3) return null;
+  // The module exports something under this name: `return { check = check_phase }`,
+  // `_M.check = check_phase`, `kong_exec = cmd.kong_exec,` (spec helpers' table).
+  const source = (context.readFile(file) ?? '')
+    .replace(/--\[(=*)\[[\s\S]*?\]\1\]/g, (c) => c.replace(/[^\n]/g, ''))
+    .replace(/--[^\n]*/g, '');
+  const exported = new RegExp(`(?:^|[\\s{,.])${member}\\s*=\\s*([A-Za-z_]\\w*(?:\\s*\\.\\s*[A-Za-z_]\\w*)*)\\s*(?:[,;}]|$)`, 'm').exec(source);
+  if (exported && exported[1] !== member) {
+    const rhs = exported[1]!;
+    const line = source.slice(0, exported.index).split('\n').length + 1;
+    if (/^[A-Za-z_]\w*$/.test(rhs)) {
+      const fn = nodes.find((n) => n.name === rhs && (n.kind === 'function' || n.kind === 'method'));
+      if (fn) return fn;
+    }
+    const at = nodes.find((n) => n.kind === 'file') ?? nodes[0];
+    const next = at ? luaAliasExpr(rhs, { file, line, name: member, node: at }, context, depth + 1) : undefined;
+    if (next !== undefined) return next;
+  }
+  // The module re-exports an alias of its own (`local splitn = require(…).splitn`).
+  const alias = inFile.find((n) => n.kind === 'variable' && n.signature && isLuaLocal(n, context));
+  if (alias) {
+    const next = luaAliasOf(alias, context, depth + 1);
+    if (next !== undefined) return next;
+  }
+  const global = inFile.find((n) => n.kind === 'variable' && !isLuaLocal(n, context));
+  return global ?? null;
+}
+
+/** The project file `require(name)` loads from `decl`'s file, or null for a module outside it. */
+function luaModuleFile(name: string, decl: Node, context: ResolutionContext): string | null {
+  const resolved = context.resolveImport?.({
+    fromNodeId: decl.id,
+    referenceName: name,
+    referenceKind: 'imports',
+    line: decl.startLine,
+    column: 0,
+    filePath: decl.filePath,
+    language: decl.language,
+  });
+  if (!resolved) return null;
+  return context.getNodeById?.(resolved.targetNodeId)?.filePath ?? null;
 }
 
 /**
@@ -1552,15 +1705,35 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   if (PRIVATE_IS_FILE_LOCAL.has(lang)) {
     return candidate.visibility !== 'private' && !isInsidePrivateType(candidate, context);
   }
+  // An R test file runs in an environment of its own (testthat): its top-level
+  // `c <- ggplot(…)` is not what the package's 2,843 `c(…)` calls mean. The
+  // `helper-*.R` / `setup-*.R` files are sourced for every test, so theirs are shared.
+  if (lang === 'r' && (candidate.kind === 'variable' || candidate.kind === 'constant') &&
+      /(?:^|\/)tests?\//.test(candidate.filePath) && !/(?:^|\/)(?:helper|setup)[^/]*\.[rR]$/.test(candidate.filePath)) return false;
+  // A Lua `local` belongs to its chunk: kong's spec helpers' `local it = it`
+  // took busted's `it(…)` in every other spec file, 4,166 times. Its module
+  // can still hand it out — `return { check = check_phase }` — to a file that
+  // names it through a `require` alias.
+  if ((lang === 'lua' || lang === 'luau') && isLuaLocal(candidate, context)) {
+    return ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName) &&
+      luaAliasTarget(ref, context)?.targetNodeId === candidate.id;
+  }
   // JS/TS/ArkTS sealed modules + markdown/JSON call-target guards (#1719).
   // Same predicate matchByExactName / matchFuzzy apply to their survivors so a
   // rejection here cannot fall through to a promoted runner-up.
   return isCrossFileReachable(candidate, ref, context);
 }
-const NODE_BUILTIN_SPECIFIERS = new Set(builtinModules);
-const ROOT_IMPORT_PATHS = new WeakMap<ResolutionContext, Map<string, boolean>>();
 
-const JS_FAMILY = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx']);
+/**
+ * Languages whose calls are JS/TS calls — Vue, Svelte and Astro components'
+ * scripts and template expressions included: a bare `t('key')` in a `.vue`
+ * file resolves lexically exactly as in a `.ts` one.
+ */
+const JS_FAMILY = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx', 'vue', 'svelte', 'astro']);
+const JS_TS = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx']);
+
+/** Languages whose identifiers resolve regardless of case. */
+export const CASE_INSENSITIVE_LANGUAGES = new Set<string>(['php', 'pascal', 'cfml', 'cfscript', 'cfquery', 'cobol', 'vbnet']);
 
 /**
  * Whether a JS/TS `calls` ref is a RECEIVER-LESS call — `serialize(x)`, not
@@ -1588,6 +1761,50 @@ function isBareJsCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
  */
 function isBareGoCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
   return ref.language === 'go' && isReceiverLessCall(ref, context);
+}
+
+/**
+ * Whether an R call is a plain function call — `range(x)`, `vars(a)` — not a
+ * ggproto / R6 method through `obj$m(…)` or `self$m(…)`. A method is only
+ * reached through its object: ggplot2's `range(data$x)` (base R's) went to a
+ * Coord's `range` method.
+ */
+function isBareRCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'r' || ref.referenceKind !== 'calls' || !/^[A-Za-z_.][\w.]*$/.test(ref.referenceName)) return false;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (!line) return false;
+  const m = new RegExp(`(?<![\\w.])${ref.referenceName.replace(/\./g, '\\.')}\\s*\\(`).exec(line);
+  return !!m && !/(?:\$|@|::)\s*$/.test(line.slice(0, m.index));
+}
+
+/**
+ * Whether a PHP `calls` ref is a bare function call — `redirect($url)`,
+ * `view('books.show')` — rather than `$this->redirect()` / `$obj->view()` /
+ * `Foo::view()`. PHP has no implicit `$this`: a call written without a
+ * receiver can only be a function, so a method, field or property that shares
+ * the name is never what it calls. Name-matching used to bind BookStack's
+ * every `return redirect(…)` to ApiDocsController::redirect and every
+ * `return view(…)` to a `$view` field.
+ *
+ * PHP refs record the column of the call EXPRESSION — `$this->setPageTitle(`
+ * sits at `$this` — so a bare call is the one whose text at its column is the
+ * name itself (a leading `\` for a fully qualified function is allowed).
+ */
+function isBarePhpCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'php' || ref.referenceKind !== 'calls') return false;
+  if (!/^\w+$/.test(ref.referenceName)) return false;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1]
+    ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return false;
+  const at = line[ref.column] === '\\' ? ref.column + 1 : ref.column;
+  if (!line.startsWith(ref.referenceName, at)) return false;
+  CALL_OPENER.lastIndex = at + ref.referenceName.length;
+  if (!CALL_OPENER.test(line)) return false;
+  let end = at;
+  while (end > 0 && WHITESPACE.test(line[end - 1]!)) end--;
+  // `$obj->name(` / `Foo::name(` / `$obj?->name(`, should a column ever land on
+  // the name — but not `'size' => filesize($zip)` or `$x ? a : name()`.
+  return !(end > 1 && ((line[end - 1] === '>' && line[end - 2] === '-') || (line[end - 1] === ':' && line[end - 2] === ':')));
 }
 
 function isReceiverLessCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
@@ -1621,6 +1838,2145 @@ const RECEIVER_TAIL_CHAR = /[.\w$\])]/;
 const BARE_CALL_KEYWORDS: ReadonlySet<string> = new Set([
   'return', 'await', 'yield', 'typeof', 'void', 'new', 'else', 'case', 'throw', 'in', 'of', 'instanceof', 'go', 'defer',
 ]);
+
+/**
+ * A C# / VB.NET reference whose site is a TYPE position: `Type sourceType`,
+ * `List<int>`, `new TypeMap()`, `Exception? e`, `Dictionary<string, Type>`,
+ * VB's `As Type` / `New List(Of T)`. Read from the source at the reference's
+ * column; anything else — a member read (`Builder.Services`), a method group
+ * (`MapGet("/x", GetItems)`), a route's handler — keeps every candidate.
+ */
+function isDotNetTypeRef(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'csharp' && ref.language !== 'vbnet') return false;
+  if (ref.referenceKind !== 'references' && ref.referenceKind !== 'instantiates' &&
+    ref.referenceKind !== 'type_of' && ref.referenceKind !== 'returns') return false;
+  const name = ref.referenceName;
+  if (!/^[A-Za-z_]\w*$/.test(name)) return false;
+  // `new TypeMap()` constructs a type; the reference's column is the `new`.
+  if (ref.referenceKind === 'instantiates') return true;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1]
+    ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined || !line.startsWith(name, ref.column)) return false;
+  const before = line.slice(0, ref.column);
+  const after = line.slice(ref.column + name.length);
+  if (ref.language === 'vbnet') return /\b(?:As|New|Of)\s+$/i.test(before);
+  if (/\bnew\s+$/.test(before)) return true;
+  // `Type name` — a declaration names its type first.
+  if (/^\s+@?[A-Za-z_]/.test(after)) return !/^\s+(?:is|as|and|or|not|when|in|switch|with)\b/.test(after);
+  // `List<int>`, `Type?`, `Type[]`, and the arguments of a generic.
+  if (/^<|^\?(?![.?\[])|^\[\s*[,\]]/.test(after)) return true;
+  return /^\s*[,>]/.test(after) && /<[^<>()]*$/.test(before);
+}
+
+/**
+ * Whether a candidate can be what a .NET type position names. A property, a
+ * method (a constructor is one) or an enum case shares the type's name, not
+ * its meaning: AutoMapper's `Type sourceType` bound to an attribute's `Type`
+ * property and `TypeMap typeMap` to a `TypeMap` property beside the `TypeMap`
+ * class. A field never names a type either.
+ */
+function canNameInTypePosition(n: Node): boolean {
+  return !(n.kind === 'property' || n.kind === 'method' || n.kind === 'enum_member' || n.kind === 'field');
+}
+
+/**
+ * The shape of a Python call that reaches the resolver as a bare name — the
+ * column is the call's start. `bare`: `get(1)`, which cannot mean a method
+ * (Python has no implicit self). `chained`: a receiver the extractor could not
+ * keep — `User.objects.get(…)`, `self.client.login(…)`, `request.POST.get(…)`
+ * arrive as `get` / `login`, and can only mean a member of what the chain
+ * names last (`POST`, `client`, `objects`). netbox bound 3,610 `.all()` calls
+ * to one `UserConfig.all`, healthchecks 880 `objects.get` to a test case's
+ * `get`. `self.x()` / `cls.x()`, and a chain split across lines, are null:
+ * today's behavior.
+ */
+type PythonCallShape = { kind: 'bare' } | { kind: 'chained'; owner: string };
+
+function pythonCallShape(ref: UnresolvedRef, context: ResolutionContext): PythonCallShape | null {
+  if (ref.language !== 'python' || ref.referenceKind !== 'calls') return null;
+  const name = ref.referenceName;
+  if (!/^[A-Za-z_]\w*$/.test(name)) return null;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return null;
+  const text = line.slice(ref.column);
+  if (text.startsWith(name) && /^\s*\(/.test(text.slice(name.length))) return { kind: 'bare' };
+  if (new RegExp(String.raw`^(?:self|cls)\s*\.\s*${name}\s*\(`).test(text)) return null;
+  // The call starts at its receiver, so everything up to `.name(` is the receiver chain.
+  const chain = new RegExp(String.raw`^(.*?)\.\s*${name}\s*\(`).exec(text);
+  if (!chain) return null;
+  const owner = /(\w+)\s*(?:\([^()]*\)|\[[^\[\]]*\])?\s*$/.exec(chain[1]!)?.[1];
+  return owner ? { kind: 'chained', owner } : null;
+}
+
+/** Can a Python call of this shape mean the candidate? */
+function fitsPythonCallShape(n: Node, shape: PythonCallShape, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (shape.kind === 'bare') {
+    if (n.kind === 'method') return false;
+    // `from django.shortcuts import render`: the call is the package's.
+    return !(n.filePath !== ref.filePath && isPythonNameImportedFromOutside(ref.referenceName, ref, context));
+  }
+  // A member of what the chain names: a method of a class of that name, or a
+  // function / class in a module of that name (`helpers.slugify()`).
+  if (n.kind === 'method') {
+    // `self.store.fetch()` on a `Store`, `self.user_service.find()` on a `UserService`.
+    const cut = n.qualifiedName.lastIndexOf('::');
+    const owner = cut >= 0 ? n.qualifiedName.slice(0, cut).split('::').pop()! : '';
+    const plain = (s: string): string => s.replace(/_/g, '').toLowerCase();
+    return owner !== '' && plain(owner) === plain(shape.owner);
+  }
+  const parts = n.filePath.split('/');
+  const stem = parts[parts.length - 1]!.replace(/\.pyi?$/, '');
+  return stem === shape.owner || (stem === '__init__' && parts[parts.length - 2] === shape.owner);
+}
+
+const PY_IMPORTS = new WeakMap<ResolutionContext, Map<string, Map<string, string>>>();
+const PY_MODULE_LOCAL = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/** `name` → the module a `from <module> import name` line takes it from, per file. */
+function pythonFromImports(filePath: string, context: ResolutionContext): Map<string, string> {
+  let memo = PY_IMPORTS.get(context);
+  if (!memo) {
+    memo = new Map();
+    PY_IMPORTS.set(context, memo);
+  }
+  const hit = memo.get(filePath);
+  if (hit) return hit;
+  const names = new Map<string, string>();
+  const text = context.readFile(filePath) ?? '';
+  for (const m of text.matchAll(/^\s*from\s+([\w.]+)\s+import\s+(\([^)]*\)|[^\n#]+)/gm)) {
+    const module = m[1]!;
+    for (const item of m[2]!.replace(/[()]/g, '').split(',')) {
+      const bound = /(\w+)\s*$/.exec(item.trim())?.[1];
+      if (bound && bound !== '*') names.set(bound, module);
+    }
+  }
+  memo.set(filePath, names);
+  return names;
+}
+
+function isPythonNameImportedFromOutside(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const module = pythonFromImports(ref.filePath, context).get(name);
+  if (!module || module.startsWith('.')) return false;
+  let memo = PY_MODULE_LOCAL.get(context);
+  if (!memo) {
+    memo = new Map();
+    PY_MODULE_LOCAL.set(context, memo);
+  }
+  let local = memo.get(module);
+  if (local === undefined) {
+    const rel = module.replace(/\./g, '/');
+    local = context.getAllFiles().some((f) =>
+      f === `${rel}.py` || f.endsWith(`/${rel}.py`) || f === `${rel}/__init__.py` || f.endsWith(`/${rel}/__init__.py`));
+    memo.set(module, local);
+  }
+  return !local;
+}
+
+const JAVA_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'enum', 'struct', 'record', 'trait']);
+const JAVA_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+const JAVA_STATIC_IMPORTS = new WeakMap<ResolutionContext, Map<string, { owners: Set<string>; members: Set<string> }>>();
+
+/**
+ * A bare Java call — `verify(mock)`, `helper()`, `this.x()`, `super.x()` —
+ * reaches a method of a class around it, of one of that class's supertypes, or
+ * one the file imports statically. Not some other class's method of that name:
+ * halo's tests' Mockito `verify(…)` and `eq(…)` bound 1,038 calls to an
+ * `EmailVerificationService.verify` and 845 to a builder's `eq`. Supertypes are
+ * read from the declarations — the resolved `extends` edges do not exist yet on
+ * the first pass.
+ */
+function isJavaMethodInScope(method: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const cut = method.qualifiedName.lastIndexOf('::');
+  if (cut < 0) return true;
+  const owner = method.qualifiedName.slice(0, cut).split('::').pop()!;
+  const imports = javaStaticImportsOf(ref.filePath, context);
+  if (imports.owners.has(owner) || imports.members.has(`${owner}.${ref.referenceName}`)) return true;
+  const around = context
+    .getNodesInFile(ref.filePath)
+    .filter((n) => JAVA_TYPE_KINDS.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line);
+  const seen = new Set<string>();
+  const queue = around.map((n) => n.name);
+  while (queue.length > 0 && seen.size < 40) {
+    const name = queue.shift()!;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    if (name === owner) return true;
+    queue.push(...javaSupertypesOf(name, context));
+  }
+  return false;
+}
+
+/** The simple names a Java type's declarations extend or implement. */
+function javaSupertypesOf(typeName: string, context: ResolutionContext): string[] {
+  let memo = JAVA_SUPERS.get(context);
+  if (!memo) {
+    memo = new Map();
+    JAVA_SUPERS.set(context, memo);
+  }
+  const hit = memo.get(typeName);
+  if (hit) return hit;
+  const names: string[] = [];
+  for (const decl of context.getNodesByName(typeName)) {
+    if (decl.language !== 'java' || !JAVA_TYPE_KINDS.has(decl.kind)) continue;
+    const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+    const head = lines.slice(decl.startLine - 1, decl.startLine + 5).join(' ');
+    const clause = /\b(?:extends|implements)\b([^{]*)\{/.exec(head)?.[1] ?? '';
+    const flat = clause.replace(/<[^<>]*(?:<[^<>]*>[^<>]*)*>/g, '');
+    for (const m of flat.matchAll(/([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)/g)) {
+      const simple = m[1]!.split('.').pop()!;
+      if (simple !== 'extends' && simple !== 'implements') names.push(simple);
+    }
+  }
+  memo.set(typeName, names);
+  return names;
+}
+
+/** A Java file's `import static a.b.Owner.member;` / `import static a.b.Owner.*;`. */
+function javaStaticImportsOf(filePath: string, context: ResolutionContext): { owners: Set<string>; members: Set<string> } {
+  let memo = JAVA_STATIC_IMPORTS.get(context);
+  if (!memo) {
+    memo = new Map();
+    JAVA_STATIC_IMPORTS.set(context, memo);
+  }
+  const hit = memo.get(filePath);
+  if (hit) return hit;
+  const found = { owners: new Set<string>(), members: new Set<string>() };
+  const text = context.readFile(filePath) ?? '';
+  for (const m of text.matchAll(/^\s*import\s+static\s+([\w.$]+)\s*\.\s*(\*|[\w$]+)\s*;/gm)) {
+    const owner = m[1]!.split('.').pop()!;
+    if (m[2] === '*') found.owners.add(owner);
+    else found.members.add(`${owner}.${m[2]}`);
+  }
+  memo.set(filePath, found);
+  return found;
+}
+
+const DART_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'enum', 'mixin', 'extension', 'struct', 'trait']);
+const DART_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+/**
+ * Whether a bare Dart call can reach `method`: only a method of the class it
+ * is written in, or of what that class extends, mixes in or implements (an
+ * extension's `on` type included). riverpod's tests' `test(…)` — package:test's
+ * function — went to `ProviderContainer.test` 2,360 times; shelf's `expect(…)`
+ * to a test handler's `expect` method. Outside any class (`main`), no method.
+ */
+function isDartMethodInScope(method: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return dartMemberDepth(method, ref, context) < Infinity;
+}
+
+/**
+ * How many supertype steps separate the class a Dart call is written in from
+ * `method`'s owner: 0 for its own member, Infinity when the owner is not in
+ * its hierarchy at all. An extension's member is in scope when the extension
+ * is `on` a type of that hierarchy — a bare `requireElement()` inside a
+ * notifier is `this.requireElement()`, the `on AnyNotifier` extension's — and
+ * ranks after every real member, as Dart resolves it.
+ */
+function dartMemberDepth(method: Node, ref: UnresolvedRef, context: ResolutionContext): number {
+  const cut = method.qualifiedName.lastIndexOf('::');
+  if (cut < 0) return 0;
+  const owner = method.qualifiedName.slice(0, cut).split('::').pop()!;
+  const hierarchy = dartHierarchyAt(ref, context);
+  const own = hierarchy.get(owner);
+  if (own !== undefined) return own;
+  const decl = context
+    .getNodesInFile(method.filePath)
+    .find((n) => n.name === owner && DART_TYPE_KINDS.has(n.kind) && n.startLine <= method.startLine && n.endLine >= method.endLine);
+  if (!decl) return Infinity;
+  const head = dartHeadOf(decl, context);
+  if (!head.extension) return Infinity;
+  const on = Math.min(...head.supers.map((t) => hierarchy.get(t) ?? Infinity));
+  return on === Infinity ? Infinity : DART_EXTENSION_RANK + on;
+}
+
+/** Past any real member's depth: an extension member only applies when no instance member does. */
+const DART_EXTENSION_RANK = 1000;
+const DART_HIERARCHIES = new WeakMap<ResolutionContext, WeakMap<UnresolvedRef, Map<string, number>>>();
+
+/** Every type the classes around a Dart call site are, by supertype distance (at most 40). */
+function dartHierarchyAt(ref: UnresolvedRef, context: ResolutionContext): Map<string, number> {
+  let memo = DART_HIERARCHIES.get(context);
+  if (!memo) {
+    memo = new WeakMap();
+    DART_HIERARCHIES.set(context, memo);
+  }
+  const hit = memo.get(ref);
+  if (hit) return hit;
+  const depths = new Map<string, number>();
+  const queue: Array<[string, number]> = context
+    .getNodesInFile(ref.filePath)
+    .filter((n) => DART_TYPE_KINDS.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line)
+    .map((n) => [n.name, 0]);
+  while (queue.length > 0 && depths.size < 40) {
+    const [name, depth] = queue.shift()!;
+    if (depths.has(name)) continue;
+    depths.set(name, depth);
+    for (const sup of dartSupertypesOf(name, context)) queue.push([sup, depth + 1]);
+  }
+  memo.set(ref, depths);
+  return depths;
+}
+
+/**
+ * Of the in-scope members a bare Dart call could mean, the nearest: a
+ * subclass's override, or the class that implements what an interface only
+ * declares. bloc's `emit(…)` in a `Cubit` is `BlocBase.emit`, not the
+ * `Emittable` interface's.
+ */
+function nearestDartMembers(candidates: Node[], ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  const members = candidates.filter(isDartMember);
+  if (members.length < 2) return candidates;
+  const depth = new Map(members.map((n) => [n.id, dartMemberDepth(n, ref, context)]));
+  const nearest = Math.min(...depth.values());
+  return candidates.filter((n) => !depth.has(n.id) || depth.get(n.id) === nearest);
+}
+
+/** A member of a Dart type — a method, or an abstract member written without a body (extracted as a `function` owned by the type). */
+function isDartMember(n: Node): boolean {
+  return n.kind === 'method' || (n.kind === 'function' && n.qualifiedName.includes('::'));
+}
+
+/**
+ * Whether a bare Dart reference really is receiver-less at its call site. The
+ * extractor keeps one receiver level, so the later links of a chain —
+ * `LoginState().withEmail(e).withPassword(p)` — arrive as bare names; their
+ * line shows `.withPassword(` all the same. (A Dart ref's column sits just
+ * past the name; the name's start is found either way.)
+ */
+function isReceiverLessDartCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return true;
+  const name = ref.referenceName;
+  let start = -1;
+  if (line.startsWith(name, ref.column)) start = ref.column;
+  else if (ref.column >= name.length && line.startsWith(name, ref.column - name.length)) start = ref.column - name.length;
+  else start = line.indexOf(name);
+  if (start < 0) return true;
+  return !/\.\s*$/.test(line.slice(0, start));
+}
+
+/** The simple names a Dart type's declarations extend, mix in, implement, or (an extension / mixin) sit `on`. */
+function dartSupertypesOf(typeName: string, context: ResolutionContext): string[] {
+  let memo = DART_SUPERS.get(context);
+  if (!memo) {
+    memo = new Map();
+    DART_SUPERS.set(context, memo);
+  }
+  const hit = memo.get(typeName);
+  if (hit) return hit;
+  const names: string[] = [];
+  for (const decl of context.getNodesByName(typeName)) {
+    if (decl.language !== 'dart' || !DART_TYPE_KINDS.has(decl.kind)) continue;
+    names.push(...dartHeadOf(decl, context).supers);
+  }
+  memo.set(typeName, names);
+  return names;
+}
+
+const DART_HEAD_WORDS: ReadonlySet<string> = new Set(['extends', 'with', 'implements', 'on']);
+
+/**
+ * A Dart type declaration's head, read from source up to its body: the
+ * supertypes it names, and whether it is an `extension` (whose one supertype
+ * is the type it extends). Comments and type arguments are dropped first, so
+ * riverpod's `class $NotifierProviderElement< // … NotifierT extends
+ * $Notifier<ValueT>, ValueT > extends $ClassProviderElement<…> with
+ * ElementWithFuture<…>` reads as `extends $ClassProviderElement with
+ * ElementWithFuture`, and `class A = B with C;` as its mixin application.
+ */
+function dartHeadOf(decl: Node, context: ResolutionContext): { supers: string[]; extension: boolean } {
+  const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+  const text = lines
+    .slice(decl.startLine - 1, Math.min(decl.endLine, decl.startLine + 40))
+    .join('\n')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/\/\/[^\n]*/g, ' ');
+  let depth = 0;
+  let flat = '';
+  for (const ch of text) {
+    if (ch === '<') depth++;
+    else if (ch === '>') depth = Math.max(0, depth - 1);
+    else if (depth === 0) {
+      if (ch === '{' || ch === ';') break;
+      flat += ch;
+    }
+  }
+  const keyword = /\b(class|mixin|extension|enum)\b/.exec(flat);
+  const head = keyword ? flat.slice(keyword.index) : flat;
+  const clause = /(?:\b(?:extends|with|implements|on)\b|=)([\s\S]*)$/.exec(head)?.[1] ?? '';
+  return {
+    supers: [...clause.matchAll(/[A-Za-z_$][\w$]*/g)].map((m) => m[0]).filter((w) => !DART_HEAD_WORDS.has(w)),
+    extension: keyword?.[1] === 'extension' && !/^extension\s+type\b/.test(head),
+  };
+}
+
+/**
+ * How a bare Rust or Go name is written at its call: `path` after `::` (left
+ * to the path strategies), `chained` after a `.` — with the receiver it is
+ * written on, call and type arguments dropped — or `bare`. The extractors
+ * keep one receiver level, so `sym.filename().map(From::from)` and
+ * `child.Flags().String("f", …)` arrive as bare `map` / `String`.
+ */
+function rustGoCallShape(ref: UnresolvedRef, context: ResolutionContext): { shape: 'path' } | { shape: 'bare' } | { shape: 'chained'; receiver: string } | null {
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split('\n');
+  let line = lines?.[ref.line - 1];
+  if (line === undefined) return null;
+  const name = ref.referenceName;
+  const at = new RegExp(`(?<![\\w$])${name}\\s*(?:\\(|::<|!)`);
+  let start = line.startsWith(name, ref.column) ? ref.column : -1;
+  if (start < 0) {
+    const m = at.exec(line);
+    start = m ? m.index : -1;
+  }
+  // A link further down a chain the call's line starts — `bat()\n  .arg(…)\n  .stdout(…)` —
+  // is recorded at the chain's first line.
+  for (let next = ref.line; start < 0 && lines && next < Math.min(lines.length, ref.line + 20); next++) {
+    const m = /^\s*\./.test(lines[next]!) ? at.exec(lines[next]!) : null;
+    if (m) {
+      // Named after the chain's head: `Command::new("true")` for its `.stdout(…)`.
+      if (/^\s*\.\s*$/.test(lines[next]!.slice(0, m.index))) {
+        return { shape: 'chained', receiver: rustGoReceiverName(line.trimEnd().replace(/[?;]+$/, '')) };
+      }
+      line = lines[next]!;
+      start = m.index;
+    }
+  }
+  if (start < 0) return null;
+  const before = line.slice(0, start);
+  if (/::\s*$/.test(before)) return { shape: 'path' };
+  if (!/\.\s*$/.test(before)) return { shape: 'bare' };
+  return { shape: 'chained', receiver: rustGoReceiverName(before.replace(/\?\s*\.\s*$/, '')) };
+}
+
+/**
+ * The receiver a Rust / Go `….name(` is written on, as its path and dotted
+ * identifiers with arguments dropped — `Command::new("x").short_flag('f')` →
+ * `Command::new.short_flag`, a macro `arg!(…)` → `arg`, a Go composite
+ * literal `(JSON{data})` → `JSON`. Read backwards to the expression's start.
+ */
+function rustGoReceiverName(text: string): string {
+  let out = '';
+  let i = text.replace(/\s*\.\s*$/, '').length - 1;
+  const src = text.replace(/\s*\.\s*$/, '');
+  while (i >= 0) {
+    const ch = src[i]!;
+    if (ch === ')' || ch === ']' || ch === '}') {
+      const open = ch === ')' ? '(' : ch === ']' ? '[' : '{';
+      let depth = 0;
+      let j = i;
+      for (; j >= 0; j--) {
+        if (src[j] === ch) depth++;
+        else if (src[j] === open && --depth === 0) break;
+      }
+      if (j < 0) return '';
+      // `(JSON{data})` — a parenthesized composite literal names its type.
+      if (ch === ')' && out === '') {
+        const literal = /^\(\s*&?\s*([A-Za-z_][\w.]*)\s*\{/.exec(src.slice(j, i + 1));
+        if (literal) return literal[1]!;
+      }
+      i = j - 1;
+    } else if (/[\w$.:!]/.test(ch)) {
+      if (ch !== '!') out = ch + out;
+      i--;
+    } else break;
+  }
+  return out.replace(/^[.:]+|[.:]+$/g, '');
+}
+
+/**
+ * Whether a Rust / Go call of that shape can mean `n`. A bare call never
+ * reaches a method (Rust needs `self.` / `Type::`, Go a receiver): axum's
+ * routing `get(handler)` went to a cookie jar's `get`. A chained call reaches
+ * a method of what its receiver is named after (or of `self`), never a free
+ * function: tokio's `sym.filename().map(…)` went to `MutexGuard::map` 156
+ * times, cobra's `c.Flags().String(…)` to a test type's `String`.
+ */
+function isRustGoCallTarget(n: Node, shape: ReturnType<typeof rustGoCallShape>): boolean {
+  if (!shape || shape.shape === 'path') return true;
+  const member = n.kind === 'method';
+  if (shape.shape === 'bare') return !member;
+  if (!member) return n.kind !== 'function';
+  // A name the standard library's own types all carry (`unwrap`, `clone`,
+  // `iter`, Go's `String` / `Get`) needs a receiver named after the owner; a
+  // project-specific one keeps its match — clap's `flag("n").short('n')` is
+  // `Arg::short`, cobra's `c.Root().Name()` `Command::Name`.
+  // Go's `w.Header().Get(…)` / `r.Header.Set(…)`: net/http's Header map.
+  if (n.language === 'go' && /(?:^|\.)Header$/.test(shape.receiver) && /^(?:Get|Set|Add|Del|Values|Clone|Write)$/.test(n.name)) return false;
+  const std = (n.language === 'go' ? GO_STD_METHODS : RUST_STD_METHODS).has(n.name);
+  return !std || /^(?:self|Self)$/.test(shape.receiver) || (shape.receiver !== '' && sharesReceiverWord(shape.receiver, n));
+}
+
+/**
+ * Kotlin's scope functions and standard collection / string / conversion
+ * methods: on an untyped chain link (`builder.apply { … }`, `list.map { … }`)
+ * they are the standard library's, never a project type's same-named member.
+ * Names project types commonly carry (`get`, `write`, `close`, `add`) are left
+ * out — okio's `sink.write(…)` is its own Buffer's.
+ */
+const KOTLIN_STD_METHODS: ReadonlySet<string> = new Set([
+  'apply', 'also', 'let', 'run', 'takeIf', 'takeUnless', 'toString', 'equals', 'hashCode', 'map', 'mapNotNull',
+  'mapIndexed', 'filter', 'filterNot', 'filterIsInstance', 'forEach', 'forEachIndexed', 'first', 'firstOrNull',
+  'last', 'lastOrNull', 'single', 'singleOrNull', 'isEmpty', 'isNotEmpty', 'isNullOrEmpty', 'isNullOrBlank',
+  'isBlank', 'isNotBlank', 'orEmpty', 'joinToString', 'toList', 'toMutableList', 'toSet', 'toMutableSet', 'toMap',
+  'toTypedArray', 'any', 'all', 'none', 'count', 'sumOf', 'maxOf', 'minOf', 'maxOrNull', 'minOrNull', 'sortedBy',
+  'sortedByDescending', 'sorted', 'sortedWith', 'reversed', 'drop', 'dropLast', 'take', 'takeLast', 'zip',
+  'flatMap', 'flatten', 'distinct', 'groupBy', 'associate', 'associateBy', 'associateWith', 'partition',
+  'contains', 'containsKey', 'getOrElse', 'getOrNull', 'getOrPut', 'getOrDefault', 'trim', 'trimEnd', 'trimStart',
+  'split', 'substring', 'startsWith', 'endsWith', 'replace', 'lowercase', 'uppercase', 'toInt', 'toLong',
+  'toDouble', 'toFloat', 'toIntOrNull', 'toLongOrNull', 'encodeToByteArray', 'decodeToString',
+  'copyOf', 'copyOfRange', 'indexOf', 'lastIndexOf', 'withIndex', 'asSequence', 'asList', 'ifEmpty', 'ifBlank',
+  'padStart', 'padEnd', 'repeat', 'lines', 'toCharArray', 'coerceAtLeast', 'coerceAtMost', 'coerceIn',
+]);
+
+/**
+ * Methods of .NET's base types, collections, streams, strings, LINQ and
+ * reflection — names a project type overrides or wraps, which a call through
+ * an untyped receiver means only when the receiver is named after the owner.
+ * Newtonsoft's `reader.Value.ToString()` went to its JValue's `ToString`,
+ * `table.Columns.Add(…)` to a name table's `Add`.
+ */
+const CSHARP_STD_METHODS: ReadonlySet<string> = new Set([
+  'ToString', 'Equals', 'GetHashCode', 'GetType', 'CompareTo', 'Add', 'AddRange', 'Remove', 'RemoveAt', 'RemoveAll',
+  'Contains', 'ContainsKey', 'ContainsValue', 'Clear', 'Insert', 'IndexOf', 'CopyTo', 'ToArray', 'ToList',
+  'ToDictionary', 'GetEnumerator', 'MoveNext', 'Reset', 'TryGetValue', 'GetValueOrDefault', 'TryAdd', 'Write',
+  'WriteLine', 'WriteAsync', 'WriteLineAsync', 'Read', 'ReadAsync', 'ReadLine', 'ReadToEnd', 'Flush', 'FlushAsync',
+  'Close', 'Dispose', 'DisposeAsync', 'Parse', 'TryParse', 'Format', 'Join', 'Split', 'Replace', 'Substring', 'Trim',
+  'TrimStart', 'TrimEnd', 'StartsWith', 'EndsWith', 'ToUpper', 'ToLower', 'ToUpperInvariant', 'ToLowerInvariant',
+  'Select', 'Where', 'First', 'FirstOrDefault', 'Single', 'SingleOrDefault', 'Last', 'LastOrDefault', 'Any', 'All',
+  'Count', 'Sum', 'Max', 'Min', 'OrderBy', 'OrderByDescending', 'GroupBy', 'Skip', 'Take', 'Distinct', 'Concat',
+  'Cast', 'OfType', 'Aggregate', 'Invoke', 'DynamicInvoke', 'GetMethod', 'GetProperty', 'GetField', 'GetConstructor',
+  'GetCustomAttributes', 'GetGenericArguments', 'MakeGenericType', 'IsAssignableFrom', 'ConfigureAwait', 'Wait',
+  'ContinueWith', 'Append', 'AppendLine', 'Peek', 'Push', 'Pop', 'Enqueue', 'Dequeue', 'HasFlag', 'Find', 'FindAll',
+  'ForEach', 'Sort', 'Reverse', 'Clone', 'Seek', 'SetLength',
+]);
+
+/**
+ * Python's dict / list / set / str / file / `re` methods. On an untyped
+ * receiver (`options.setdefault(…)`, `d.copy()`) they are the builtin
+ * type's, never a same-named project method the call happens to share a
+ * file with.
+ */
+const PYTHON_STD_METHODS: ReadonlySet<string> = new Set([
+  'get', 'setdefault', 'pop', 'popitem', 'update', 'items', 'keys', 'values', 'copy', 'clear',
+  'append', 'extend', 'insert', 'remove', 'index', 'count', 'sort', 'reverse', 'add', 'discard',
+  'union', 'intersection', 'difference', 'split', 'rsplit', 'join', 'strip', 'lstrip', 'rstrip',
+  'replace', 'startswith', 'endswith', 'lower', 'upper', 'format', 'encode', 'decode', 'find',
+  'rfind', 'splitlines', 'read', 'readline', 'readlines', 'write', 'writelines', 'close', 'seek',
+  'flush', 'group', 'groups', 'match', 'search', 'sub', 'findall', 'fullmatch',
+]);
+
+/**
+ * Scala's collection / Option / Future methods and the `java.*` calls Scala
+ * code makes. On Play, ~2,500 `map` / `get` / `foreach` calls on untyped
+ * values landed on unrelated project methods.
+ */
+const SCALA_STD_METHODS: ReadonlySet<string> = new Set([
+  'map', 'flatMap', 'filter', 'filterNot', 'foreach', 'fold', 'foldLeft', 'foldRight', 'reduce',
+  'collect', 'collectFirst', 'find', 'exists', 'forall', 'count', 'get', 'getOrElse', 'orElse',
+  'orNull', 'isEmpty', 'nonEmpty', 'isDefined', 'contains', 'headOption', 'head', 'tail', 'last',
+  'lastOption', 'take', 'drop', 'groupBy', 'sortBy', 'sorted', 'mkString', 'toList', 'toSeq',
+  'toSet', 'toMap', 'toVector', 'toArray', 'zip', 'zipWithIndex', 'size', 'length', 'update',
+  'updated', 'recover', 'recoverWith', 'transform', 'andThen', 'compose', 'onComplete', 'asScala',
+  'asJava', 'getOrElseUpdate', 'put', 'remove', 'add', 'append', 'replace', 'split', 'trim',
+  'startsWith', 'endsWith', 'format', 'equals', 'hashCode', 'toString', 'set', 'build', 'execute',
+  'of', 'encode', 'decode', 'max', 'min',
+]);
+
+/**
+ * `java.lang` / `java.util` / streams and the Android framework calls Java
+ * code makes on values whose type the resolver cannot see — a lambda
+ * parameter, a `var`, a call result, an inherited field. On Play ~1,100
+ * test-map `put` calls landed on a test class's `RejectingMap::put`. Names
+ * Java projects commonly declare themselves (`post`, `of`, `apply`, `run`,
+ * `start`, `getId`) stay out.
+ */
+const JAVA_STD_METHODS: ReadonlySet<string> = new Set([
+  'equals', 'hashCode', 'toString', 'getClass', 'compareTo',
+  'get', 'put', 'add', 'remove', 'contains', 'containsKey', 'containsValue', 'size', 'isEmpty',
+  'clear', 'iterator', 'hasNext', 'next', 'stream', 'forEach', 'keySet', 'values', 'entrySet',
+  'addAll', 'removeAll', 'putAll', 'putIfAbsent', 'getOrDefault', 'computeIfAbsent', 'indexOf',
+  'toArray', 'subList',
+  'length', 'charAt', 'substring', 'trim', 'split', 'startsWith', 'endsWith', 'equalsIgnoreCase',
+  'toLowerCase', 'toUpperCase', 'replace', 'format', 'valueOf',
+  'map', 'filter', 'orElse', 'orElseGet', 'orElseThrow', 'ifPresent', 'isPresent', 'collect',
+  'findFirst', 'anyMatch', 'allMatch',
+  'postDelayed', 'removeCallbacks', 'obtainMessage', 'getResources', 'getSystemService',
+  'findViewById', 'setVisibility', 'startActivity',
+]);
+
+/**
+ * A request handler the web framework dispatches to: a Django / DRF / Flask
+ * view's `get` / `post` / …, a controller's `index` / `store` / `update` /
+ * `destroy`. Nothing calls one through an instance by name, so a guess from
+ * a Django test's `client.post(…)` (allauth: 425 times on a
+ * ClientRegistrationView) or an Eloquent `$page->update(…)` is never one.
+ */
+const DISPATCHED_OWNER = /(?:View|ViewSet|APIView|Controller|Endpoint|ViewMixin)$/;
+const DISPATCHED_ACTIONS: ReadonlySet<string> = new Set([
+  'get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'index', 'show', 'store', 'update', 'destroy',
+  'create', 'edit', 'list', 'retrieve', 'partial_update',
+]);
+
+/** A test double's name: Fake…, Mock…, Stub…, Dummy…, Spy…, …Fake, …Mock, …Stub. */
+const TEST_DOUBLE_OWNER = /\b(?:fake|mock|mocked|stub|dummy|spy)\b/i;
+
+/**
+ * The link of a dotted receiver its value is named after: the last, or for a
+ * constant (`InitializationPhase.CONTROLLERS`, `Foo.INSTANCE`) the type it
+ * belongs to.
+ */
+function receiverLink(receiver: string): string {
+  const links = receiver.split('.');
+  const last = links[links.length - 1]!;
+  return links.length > 1 && /^[A-Z][A-Z0-9_]+$/.test(last) ? links[links.length - 2]! : last;
+}
+
+/** The standard-library method names of a language whose receiver-less guesses need the receiver to name the owner. */
+function stdMethodNames(language: string): ReadonlySet<string> | null {
+  switch (language) {
+    case 'go': return GO_STD_METHODS;
+    case 'rust': return RUST_STD_METHODS;
+    case 'kotlin': return KOTLIN_STD_METHODS;
+    case 'csharp': return CSHARP_STD_METHODS;
+    case 'python': return PYTHON_STD_METHODS;
+    case 'scala': return SCALA_STD_METHODS;
+    case 'java': return JAVA_STD_METHODS;
+    default: return null;
+  }
+}
+
+const CSHARP_ALIASES = new WeakMap<ResolutionContext, Map<string, Map<string, string>>>();
+
+/**
+ * The type a C# file's `using Name = Some.Namespace.Type;` (or `global using`)
+ * aliases `name` to, as its simple name — or null.
+ */
+function csharpUsingAlias(name: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  if (!/^[A-Za-z_]\w*$/.test(name)) return null;
+  let memo = CSHARP_ALIASES.get(context);
+  if (!memo) {
+    memo = new Map();
+    CSHARP_ALIASES.set(context, memo);
+  }
+  let aliases = memo.get(ref.filePath);
+  if (!aliases) {
+    aliases = new Map();
+    const source = context.readFile(ref.filePath) ?? '';
+    for (const m of source.matchAll(/^\s*(?:global\s+)?using\s+([A-Za-z_]\w*)\s*=\s*(?:global::)?([\w.]+)\s*(?:<[^;>]*>)?\s*;/gm)) {
+      aliases.set(m[1]!, m[2]!.split('.').pop()!);
+    }
+    memo.set(ref.filePath, aliases);
+  }
+  return aliases.get(name) ?? null;
+}
+
+/** The receiver a Kotlin chain link `….name(` / `?.name {` is written on, or null for a call with none. */
+function kotlinChainReceiver(ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return null;
+  const name = ref.referenceName;
+  let start = line.startsWith(name, ref.column) ? ref.column : -1;
+  if (start < 0) {
+    const m = new RegExp(`(?<![\\w$])${name}\\s*[({]`).exec(line);
+    start = m ? m.index : -1;
+  }
+  if (start < 0) {
+    // An infix call on an expression — `alias(libs.x) apply false` — whose
+    // receiver the extractor could not name.
+    const infix = new RegExp(`(?<=[\\w)\\]"'}]\\s+)${name}\\s+(?=[^\\s=])`).exec(line);
+    return infix ? rustGoReceiverName(line.slice(0, infix.index).trimEnd()) : null;
+  }
+  const before = line.slice(0, start);
+  if (!/\.\s*$/.test(before)) return null;
+  return rustGoReceiverName(before.replace(/\?\s*\.\s*$/, '').replace(/!!\s*$/, ''));
+}
+
+const KOTLIN_BITWISE_INFIX: ReadonlySet<string> = new Set(['and', 'or', 'xor', 'shl', 'shr', 'ushr', 'inv']);
+const KOTLIN_NUMBER_TYPES: ReadonlySet<string> = new Set(['Byte', 'Short', 'Int', 'Long', 'UByte', 'UShort', 'UInt', 'ULong', 'Char']);
+
+/**
+ * A project's bitwise extension on a number type — okio's `infix fun
+ * Byte.and(mask: Int)` — is indistinguishable, without the operand's type,
+ * from the standard library's own `Int.and` / `Long.shr` members every other
+ * `x and 0xff` / `h shr 8` calls; neither is a safe edge.
+ */
+function isKotlinNumberBitwise(n: Node, ref: UnresolvedRef): boolean {
+  if (ref.language !== 'kotlin' || !KOTLIN_BITWISE_INFIX.has(n.name)) return false;
+  const cut = n.qualifiedName.lastIndexOf('::');
+  return cut > 0 && KOTLIN_NUMBER_TYPES.has(n.qualifiedName.slice(0, cut).split(/::|\./).pop()!);
+}
+
+/** Whether a bare Kotlin name is written with no receiver at its call — not a later link of a chain (`….name(`). */
+function isReceiverLessKotlinCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return false;
+  const name = ref.referenceName;
+  let start = line.startsWith(name, ref.column) && !/[\w$]/.test(line[ref.column - 1] ?? '') ? ref.column : -1;
+  if (start < 0) {
+    const m = new RegExp(`(?<![\\w$])${name.replace(/\$/g, '\\$')}\\s*[({<]`).exec(line);
+    start = m ? m.index : -1;
+  }
+  return start >= 0 && !/[.:]\s*$/.test(line.slice(0, start));
+}
+
+/**
+ * Whether a bare `require(…)` / `check(…)` / `assert(…)` is Kotlin's
+ * precondition: its condition is a comparison or boolean expression, or a
+ * lazy message follows it.
+ */
+function isKotlinPreconditionCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!/^(?:require|check|assert)$/.test(ref.referenceName)) return false;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  const at = line ? new RegExp(`(?<![\\w.])${ref.referenceName}\\s*\\(`).exec(line) : null;
+  if (!line || !at) return false;
+  let depth = 0;
+  let args = '';
+  let rest = '';
+  for (let i = at.index + at[0].length; i < line.length; i++) {
+    const ch = line[i]!;
+    if (ch === '(') depth++;
+    else if (ch === ')' && depth-- === 0) {
+      rest = line.slice(i + 1);
+      break;
+    }
+    args += ch;
+  }
+  return /[<>=!]=|&&|\|\||(?:^|[\s(])!|\s[<>]\s|\bis\b|\bin\b|\btrue\b|\bfalse\b/.test(args) || /^\s*\{/.test(rest);
+}
+
+const KOTLIN_RECEIVER_TYPES = new WeakMap<ResolutionContext, Set<string>>();
+
+/**
+ * Every type a Kotlin function type in the project takes as its receiver —
+ * `Module` in `typealias ModuleDeclaration = Module.() -> Unit`, `Scope` in
+ * `Scope.(ParametersHolder) -> T`, `JdbcTransaction` in `statement:
+ * JdbcTransaction.(TestDB) -> Unit`. A lambda of such a type runs with that
+ * receiver, so a bare call inside one reaches its members.
+ */
+function kotlinReceiverTypes(context: ResolutionContext): Set<string> {
+  const hit = KOTLIN_RECEIVER_TYPES.get(context);
+  if (hit) return hit;
+  const types = new Set<string>();
+  const outside = new Set<string>();
+  for (const file of context.getAllFiles()) {
+    if (!/\.kts?$/.test(file)) continue;
+    const source = stripCommentsForRegex(context.readFile(file) ?? '', 'java');
+    for (const m of source.matchAll(/\b([A-Z]\w*)(?:<[^<>()]*(?:<[^<>()]*>[^<>()]*)*>)?\s*\.\s*\(/g)) types.add(m[1]!);
+    // An extension on a type from outside the project (`fun
+    // MacrobenchmarkScope.waitForContent()`, `fun StringBuilder.padInt(…)`)
+    // is written to be called inside that library's lambdas.
+    for (const m of source.matchAll(/\bfun\s+(?:<[^>]*>\s*)?([A-Z]\w*(?:\.[A-Z]\w*)*)(?:<[^<>()]*(?:<[^<>()]*>[^<>()]*)*>)?\??\.[A-Za-z_`][\w`]*\s*\(/g)) {
+      for (const part of m[1]!.split('.')) outside.add(part);
+    }
+  }
+  for (const name of outside) {
+    if (!context.getNodesByName(name).some((n) => MEMBER_CLASS_KINDS.has(n.kind) && (n.language === 'kotlin' || n.language === 'java'))) types.add(name);
+  }
+  // A receiver's members include those it inherits: Exposed's `mergeFrom`
+  // body runs on a MergeTableStatement, whose `whenMatchedDelete` is
+  // MergeStatement's.
+  const queue = [...types];
+  while (queue.length > 0 && types.size < 5000) {
+    const name = queue.shift()!;
+    for (const decl of context.getNodesByName(name)) {
+      if (decl.language !== 'kotlin' || !MEMBER_CLASS_KINDS.has(decl.kind)) continue;
+      for (const sup of classHeadSupertypes(decl, context)) {
+        if (!types.has(sup)) {
+          types.add(sup);
+          queue.push(sup);
+        }
+      }
+    }
+  }
+  KOTLIN_RECEIVER_TYPES.set(context, types);
+  return types;
+}
+
+/**
+ * What the Android framework and AndroidX classes a Kotlin class commonly
+ * extends inherit, so an extension on `ComponentCallbacks` or
+ * `ComponentActivity` is in reach of an `AppCompatActivity` subclass.
+ */
+const KOTLIN_PLATFORM_SUPERS: Readonly<Record<string, readonly string[]>> = {
+  AppCompatActivity: ['FragmentActivity'], FragmentActivity: ['ComponentActivity'],
+  ComponentActivity: ['Activity', 'LifecycleOwner', 'ViewModelStoreOwner', 'SavedStateRegistryOwner'],
+  Activity: ['ContextThemeWrapper', 'ComponentCallbacks2'], ContextThemeWrapper: ['ContextWrapper'],
+  ContextWrapper: ['Context'], Application: ['ContextWrapper', 'ComponentCallbacks2'],
+  Service: ['ContextWrapper', 'ComponentCallbacks2'], ComponentCallbacks2: ['ComponentCallbacks'],
+  Fragment: ['ComponentCallbacks', 'LifecycleOwner', 'ViewModelStoreOwner', 'SavedStateRegistryOwner'],
+  DialogFragment: ['Fragment'], AppCompatDialogFragment: ['DialogFragment'],
+  BottomSheetDialogFragment: ['AppCompatDialogFragment'], AndroidViewModel: ['ViewModel'],
+};
+
+const KOTLIN_HIERARCHIES = new WeakMap<ResolutionContext, WeakMap<UnresolvedRef, Set<string>>>();
+
+/**
+ * The Kotlin types a bare call is written inside — the classes and objects
+ * around it and the receiver of the extension function it is in — and what
+ * they inherit.
+ */
+function kotlinHierarchyAt(ref: UnresolvedRef, context: ResolutionContext): Set<string> {
+  let memo = KOTLIN_HIERARCHIES.get(context);
+  if (!memo) {
+    memo = new WeakMap();
+    KOTLIN_HIERARCHIES.set(context, memo);
+  }
+  const hit = memo.get(ref);
+  if (hit) return hit;
+  const queue: string[] = [];
+  for (const n of context.getNodesInFile(ref.filePath)) {
+    if (n.startLine > ref.line || n.endLine < ref.line) continue;
+    if (MEMBER_CLASS_KINDS.has(n.kind)) queue.push(n.name);
+    // `fun Foo.bar() { baz() }`: Foo is the implicit receiver.
+    else if ((n.kind === 'method' || n.kind === 'function') && n.qualifiedName.includes('::')) {
+      queue.push(n.qualifiedName.slice(0, n.qualifiedName.lastIndexOf('::')).split(/::|\./).pop()!);
+    }
+  }
+  // A Gradle build script runs on the Project (a settings script on Settings).
+  if (ref.filePath.endsWith('.gradle.kts')) queue.push(/(?:^|\/)settings\.gradle\.kts$/.test(ref.filePath) ? 'Settings' : 'Project');
+  // The same read from the source's braces, which also sees an anonymous
+  // `object : Table("t") { … }` and survives a class the parser lost.
+  for (const frame of kotlinBraceFrames(ref.filePath, context)) {
+    if (frame.start <= ref.line && frame.end >= ref.line) queue.push(...frame.names);
+  }
+  const names = new Set<string>();
+  while (queue.length > 0 && names.size < 60) {
+    const name = queue.shift()!;
+    if (names.has(name)) continue;
+    names.add(name);
+    queue.push(...(KOTLIN_PLATFORM_SUPERS[name] ?? []));
+    for (const decl of context.getNodesByName(name)) {
+      if (decl.language === 'kotlin' && MEMBER_CLASS_KINDS.has(decl.kind)) queue.push(...classHeadSupertypes(decl, context));
+    }
+  }
+  memo.set(ref, names);
+  return names;
+}
+
+const KOTLIN_FRAMES = new WeakMap<ResolutionContext, Map<string, Array<{ start: number; end: number; names: string[] }>>>();
+
+/**
+ * The type bodies of a Kotlin file by line range, read from its braces: each
+ * `class` / `object` / `interface` body with its name and supertypes, an
+ * anonymous `object : Base(…)` with its base, and an extension function's
+ * body with its receiver type.
+ */
+function kotlinBraceFrames(file: string, context: ResolutionContext): Array<{ start: number; end: number; names: string[] }> {
+  let memo = KOTLIN_FRAMES.get(context);
+  if (!memo) {
+    memo = new Map();
+    KOTLIN_FRAMES.set(context, memo);
+  }
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const frames: Array<{ start: number; end: number; names: string[] }> = [];
+  const source = blankStringContents(stripCommentsForRegex(context.readFile(file) ?? '', 'java'));
+  const stack: Array<{ start: number; names: string[] | null }> = [];
+  let line = 1;
+  let pending = '';
+  for (const ch of source) {
+    if (ch === '\n') line++;
+    if (ch === '{') {
+      // `with(x) {`, `x.apply {`, `x.run {`: a receiver of whatever type x is.
+      const scoped = /(?:\bwith\s*\([^{}]*\)|\.\s*(?:apply|run)(?:\s*<[^<>]*>)?)\s*$/.test(pending);
+      stack.push({ start: line, names: scoped ? ['*'] : kotlinHeadNames(pending) });
+      pending = '';
+    } else if (ch === '}') {
+      const open = stack.pop();
+      if (open?.names && open.names.length > 0) frames.push({ start: open.start, end: line, names: open.names });
+      pending = '';
+    } else if (ch === ';') pending = '';
+    else if (pending.length < 600) pending += ch;
+    else pending = pending.slice(300) + ch;
+  }
+  memo.set(file, frames);
+  return frames;
+}
+
+/** The type names a Kotlin block head introduces: a type declaration's name and supertypes, or an extension function's receiver. */
+function kotlinHeadNames(head: string): string[] | null {
+  let depth = 0;
+  let flat = '';
+  for (const ch of head) {
+    if (ch === '<' || ch === '(') depth++;
+    else if (ch === '>' || ch === ')') depth = Math.max(0, depth - 1);
+    else if (depth === 0) flat += ch;
+  }
+  const decl = /\b(?:class|interface|object)\b(?:\s+([A-Za-z_]\w*))?([^=]*)$/.exec(flat);
+  if (decl) {
+    const supers = /:\s*([\s\S]*)$/.exec(decl[2] ?? '')?.[1] ?? '';
+    const names = [...supers.replace(/\bwhere\b[\s\S]*$/, '').matchAll(/([A-Z]\w*)\s*(?=,|$|\bby\b)/g)].map((m) => m[1]!);
+    return decl[1] ? [decl[1], ...names] : names;
+  }
+  const receiver = /\bfun\s+(?:<[^>]*>\s*)?([A-Z]\w*)(?:<[^>]*>)?\??\.[A-Za-z_]\w*\s*\(/.exec(head)?.[1];
+  return receiver ? [receiver] : null;
+}
+
+/**
+ * Whether a bare Kotlin call can reach method `n`: a member of a type around
+ * the call or of what it inherits, or of a type the project's function types
+ * take as a lambda receiver (a DSL). koin's `error("…")` — Kotlin's — went to
+ * a Logger's `error`, and `module { … }` in one test to another test class's
+ * private `module`.
+ */
+function isKotlinMemberReachable(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  // A Java class's method, too: Kotlin calls it bare only from a subclass or through a static import.
+  if (n.kind !== 'method' || (n.language !== 'kotlin' && n.language !== 'java')) return true;
+  // `require(n >= 0) { … }`, `check(!closed)`: Kotlin's preconditions, not a
+  // member `require(byteCount: Long)` of the type around the call.
+  if (isKotlinPreconditionCall(ref, context)) return false;
+  // A Gradle script's DSL blocks run on the build tool's own types.
+  if (ref.filePath.endsWith('.kts')) return true;
+  const cut = n.qualifiedName.lastIndexOf('::');
+  if (cut <= 0) return true;
+  const path = n.qualifiedName.slice(0, cut).split(/::|\./);
+  let owner = path.pop()!;
+  const companion = owner === 'Companion' && path.length > 0;
+  if (companion) owner = path.pop()!;
+  // A (Java) constructor is the type's, called by its name.
+  if (n.name === owner) return true;
+  const hierarchy = kotlinHierarchyAt(ref, context);
+  if (hierarchy.has('*') || kotlinReceiverTypes(context).has(owner) || hierarchy.has(owner)) return true;
+  // `import okio.TestUtil.deepCopy` / `import okio.TestUtil.*` names an object's members.
+  const pkg = kotlinFileScope(n.filePath, context).pkg;
+  const objectPath = (pkg ? `${pkg}.${owner}` : owner) + (companion ? '.Companion' : '');
+  const here = kotlinFileScope(ref.filePath, context);
+  return here.imports.has(`${objectPath}.${n.name}`) || here.stars.has(objectPath);
+}
+
+/** Whether a standard-named Kotlin chain link can mean `n`: only through a receiver named after its owner. */
+function isKotlinStdChainTarget(n: Node, receiver: string): boolean {
+  if (n.kind !== 'method' && n.kind !== 'function') return true;
+  return receiver === 'this' || (receiver !== '' && sharesReceiverWord(receiver, n));
+}
+
+/**
+ * How a Swift call is written: `bare` (implicit self, or a free function),
+ * through `self.` / `super.`, or `chained` on some other receiver. The
+ * extractor keeps one receiver level, so `super.init(…)`,
+ * `axis.entries.removeAll()` and `min(a, b)` all arrive as bare names.
+ */
+interface SwiftCallShape {
+  shape: 'bare' | 'self' | 'super' | 'chained';
+  /** A chained call's receiver, calls and subscripts dropped. */
+  receiver: string;
+  /** The first argument's label, if any. */
+  label: string;
+  /** `name[…]`: a subscript of a value, not a call. */
+  subscript: boolean;
+}
+
+function swiftCallShape(ref: UnresolvedRef, context: ResolutionContext): SwiftCallShape | null {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return null;
+  const name = ref.referenceName;
+  let start = line.startsWith(name, ref.column) && !/[\w$]/.test(line[ref.column - 1] ?? '') ? ref.column : -1;
+  if (start < 0) {
+    const m = new RegExp(`(?<![\\w$])${name}\\s*[({<[]`).exec(line);
+    start = m ? m.index : -1;
+  }
+  if (start < 0) return null;
+  const before = line.slice(0, start);
+  const after = line.slice(start + name.length);
+  const base = { receiver: '', label: '', subscript: /^\s*\[/.test(after) };
+  if (!/\.\s*$/.test(before)) return { ...base, shape: 'bare' };
+  // `self.m(` — not `self[i].m(` or `self.items.m(`, which are chains.
+  const plain = /(?:^|[^\w$.)\]])(self|Self|super)\s*[?!]?\s*\.\s*$/.exec(before)?.[1];
+  if (plain) return { ...base, shape: plain === 'super' ? 'super' : 'self' };
+  return {
+    ...base,
+    shape: 'chained',
+    receiver: rustGoReceiverName(before.replace(/[?!]\s*\./g, '.')),
+    label: /^\s*\(\s*([A-Za-z_]\w*)\s*:(?!:)/.exec(after)?.[1] ?? '',
+  };
+}
+
+/** Argument labels the standard library's collection and string methods take. */
+const SWIFT_STD_LABELS: ReadonlySet<string> = new Set([
+  'contentsOf', 'where', 'by', 'at', 'keepingCapacity', 'separator', 'forKey', 'of', 'into', 'in', 'options',
+  'maxSplits', 'omittingEmptySubsequences', 'with', 'after', 'before', 'upTo', 'through', 'offsetBy', 'default',
+]);
+
+/**
+ * Whether a Swift method's declaration takes the argument label a call gives
+ * first (`func contains(jpeg marker: JPEGMarker)` for `data.kf.contains(jpeg:
+ * .SOF2)`). Labels are part of a Swift method's name, so one the standard
+ * library's namesakes never take identifies the project's.
+ */
+function swiftDeclaresLabel(n: Node, label: string, context: ResolutionContext): boolean {
+  if (label === '' || SWIFT_STD_LABELS.has(label)) return false;
+  const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
+  const head = lines.slice(n.startLine - 1, n.startLine + 3).join(' ');
+  return new RegExp(`\\bfunc\\s+${n.name}\\s*(?:<[^>]*>)?\\s*\\(\\s*${label}\\b`).test(head);
+}
+
+/**
+ * What the standard library's collection types and protocols refine, so a
+ * project extension of `Collection` is in reach of a type that conforms to
+ * `RandomAccessCollection`. UIKit / AppKit ancestry comes from the
+ * Objective-C table.
+ */
+const SWIFT_STD_SUPERS: Readonly<Record<string, readonly string[]>> = {
+  RandomAccessCollection: ['BidirectionalCollection'], BidirectionalCollection: ['Collection'],
+  MutableCollection: ['Collection'], RangeReplaceableCollection: ['Collection'], Collection: ['Sequence'],
+  LazySequenceProtocol: ['Sequence'], LazyCollectionProtocol: ['Collection', 'LazySequenceProtocol'],
+  StringProtocol: ['BidirectionalCollection'],
+  Array: ['RandomAccessCollection', 'MutableCollection', 'RangeReplaceableCollection'],
+  ArraySlice: ['RandomAccessCollection', 'MutableCollection', 'RangeReplaceableCollection'],
+  ContiguousArray: ['RandomAccessCollection', 'MutableCollection', 'RangeReplaceableCollection'],
+  String: ['StringProtocol', 'RangeReplaceableCollection'], Substring: ['StringProtocol', 'RangeReplaceableCollection'],
+  Dictionary: ['Collection'], Set: ['Collection', 'SetAlgebra'], Range: ['RandomAccessCollection'],
+  ClosedRange: ['RandomAccessCollection'],
+};
+
+/** Swift declarations a member hangs off: types, protocols, and extensions (extracted as classes). */
+const SWIFT_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'enum', 'interface']);
+const SWIFT_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field', 'enum_member']);
+const SWIFT_DECLS = new WeakMap<ResolutionContext, Map<string, { supers: string[]; projectType: boolean }>>();
+const SWIFT_HIERARCHIES = new WeakMap<ResolutionContext, WeakMap<UnresolvedRef, Map<string, number>>>();
+
+/**
+ * What the project declares a Swift type as: the supertypes and protocols
+ * every declaration and extension of it names, and whether any of them is
+ * the type itself rather than an extension of an outside one
+ * (`extension Sequence`).
+ */
+function swiftDeclOf(typeName: string, context: ResolutionContext): { supers: string[]; projectType: boolean } {
+  let memo = SWIFT_DECLS.get(context);
+  if (!memo) {
+    memo = new Map();
+    SWIFT_DECLS.set(context, memo);
+  }
+  const hit = memo.get(typeName);
+  if (hit) return hit;
+  const system = OBJC_SYSTEM_SUPERS[typeName];
+  const info = { supers: [...(SWIFT_STD_SUPERS[typeName] ?? (system ? [system] : []))], projectType: false };
+  for (const decl of context.getNodesByName(typeName)) {
+    if (decl.language !== 'swift' || !SWIFT_TYPE_KINDS.has(decl.kind)) continue;
+    const head = swiftHeadOf(decl, context);
+    info.supers.push(...head.supers);
+    if (!head.extension) info.projectType = true;
+  }
+  memo.set(typeName, info);
+  return info;
+}
+
+/**
+ * A Swift declaration's head, read up to its body with comments, attribute
+ * arguments and generic parameters dropped: `@objc(ChartViewBase) open class
+ * ChartViewBase<T>: NSUIView, ChartDataProvider where T: Equatable {` →
+ * NSUIView, ChartDataProvider.
+ */
+function swiftHeadOf(decl: Node, context: ResolutionContext): { supers: string[]; extension: boolean } {
+  const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+  const text = lines
+    .slice(decl.startLine - 1, Math.min(decl.endLine, decl.startLine + 20))
+    .join('\n')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/\/\/[^\n]*/g, ' ');
+  let depth = 0;
+  let flat = '';
+  for (const ch of text) {
+    if (ch === '<' || ch === '(') depth++;
+    else if (ch === '>' || ch === ')') depth = Math.max(0, depth - 1);
+    else if (depth === 0) {
+      if (ch === '{') break;
+      flat += ch;
+    }
+  }
+  const head = /\b(class|struct|enum|protocol|extension|actor)\s+[\w.]+\s*([\s\S]*)$/.exec(flat);
+  if (!head) return { supers: [], extension: false };
+  const clause = /^:([\s\S]*?)(?:\bwhere\b|$)/.exec(head[2]!.trim())?.[1] ?? '';
+  return {
+    supers: clause.split(',').map((item) => /([A-Za-z_]\w*)\s*$/.exec(item.trim())?.[1]).filter((w): w is string => !!w),
+    extension: head[1] === 'extension',
+  };
+}
+
+/** The Swift types around a call (depth 0) and what they inherit or conform to, by distance. */
+function swiftHierarchyAt(ref: UnresolvedRef, context: ResolutionContext): Map<string, number> {
+  let memo = SWIFT_HIERARCHIES.get(context);
+  if (!memo) {
+    memo = new WeakMap();
+    SWIFT_HIERARCHIES.set(context, memo);
+  }
+  const hit = memo.get(ref);
+  if (hit) return hit;
+  const depths = new Map<string, number>();
+  const queue: Array<[string, number]> = context
+    .getNodesInFile(ref.filePath)
+    .filter((n) => SWIFT_TYPE_KINDS.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line)
+    .map((n) => [n.name.split('.').pop()!, 0]);
+  while (queue.length > 0 && depths.size < 40) {
+    const [name, depth] = queue.shift()!;
+    if (depths.has(name)) continue;
+    depths.set(name, depth);
+    for (const sup of swiftDeclOf(name, context).supers) queue.push([sup, depth + 1]);
+  }
+  memo.set(ref, depths);
+  return depths;
+}
+
+/**
+ * Of the in-scope members a bare / `self.` / `super.` Swift call could mean,
+ * the nearest: the type's own, else its superclass's — Alamofire's
+ * `self.cancel()` in a DownloadRequest extension is DownloadRequest's
+ * override, not Request's.
+ */
+function nearestSwiftMembers(candidates: Node[], ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  const hierarchy = swiftHierarchyAt(ref, context);
+  const depthOf = (n: Node): number | undefined => {
+    if (!SWIFT_MEMBER_KINDS.has(n.kind) && n.kind !== 'constant' && n.kind !== 'variable') return undefined;
+    const cut = n.qualifiedName.lastIndexOf('::');
+    return cut > 0 ? hierarchy.get(n.qualifiedName.slice(0, cut).split(/::|\./).pop()!) : undefined;
+  };
+  const depths = candidates.map(depthOf).filter((d): d is number => d !== undefined);
+  if (depths.length < 2) return candidates;
+  const nearest = Math.min(...depths);
+  return candidates.filter((n) => {
+    const d = depthOf(n);
+    return d === undefined || d === nearest;
+  });
+}
+
+/**
+ * Methods of Swift's standard collections, strings and optionals and of
+ * Foundation / UIKit views — names a project type rarely carries itself.
+ * Ones it often does (`cancel`, `resume`, `store`, `validate`, `load`) are
+ * left out: Alamofire's `request.resume()`, Kingfisher's `cache.store(…)`.
+ */
+const SWIFT_STD_METHODS: ReadonlySet<string> = new Set([
+  'append', 'insert', 'remove', 'removeAll', 'removeFirst', 'removeLast', 'removeValue', 'contains', 'map',
+  'compactMap', 'flatMap', 'filter', 'reduce', 'forEach', 'sorted', 'sort', 'first', 'last', 'min', 'max',
+  'firstIndex', 'lastIndex', 'index', 'enumerated', 'reversed', 'joined', 'split', 'prefix', 'suffix',
+  'dropFirst', 'dropLast', 'allSatisfy', 'randomElement', 'shuffled', 'popLast', 'replaceSubrange',
+  'replacingOccurrences', 'components', 'trimmingCharacters', 'hasPrefix', 'hasSuffix', 'lowercased',
+  'uppercased', 'appending', 'updateValue', 'merge', 'merging', 'union', 'intersection', 'subtracting',
+  'formUnion', 'isEqual', 'addSubview', 'removeFromSuperview', 'setNeedsDisplay', 'setNeedsLayout',
+  'layoutIfNeeded', 'addGestureRecognizer', 'addTarget', 'addObserver', 'removeObserver', 'eraseToAnyPublisher',
+]);
+
+/**
+ * Whether a Swift file's declarations are visible from another file as far as
+ * separate modules go: one under a `…Tests` directory (SwiftPM's
+ * `Tests/VaporTests`, Xcode's `KingfisherTests`) or in a playground only from
+ * inside it.
+ */
+function isSwiftTargetVisible(declFile: string, fromFile: string): boolean {
+  const segments = declFile.split('/').slice(0, -1);
+  const target = segments.findIndex((seg) => /Tests$|\.playground$/.test(seg));
+  if (target < 0) return true;
+  const prefix = segments.slice(0, target + 1).join('/') + '/';
+  return fromFile.startsWith(prefix);
+}
+
+/**
+ * Whether a Swift call of that shape can mean `n`. A member reached with no
+ * receiver or through `self.` belongs to a type around the call or to what
+ * it inherits or conforms to — `super.` to the latter only; top-level code
+ * has no implicit self. Charts' `min(a, b)` went to a range type's `min`
+ * field, `super.init(…)` to an Objective-C demo's `init` 170 times. A member
+ * reached down a longer chain keeps its match unless its name is one the
+ * standard types all carry: `axis.entries.removeAll()` is the array's, not
+ * a chart data class's (unless the receiver names the owner, or the owner
+ * is an outside type the project only extends).
+ */
+function isSwiftCallTarget(n: Node, shape: SwiftCallShape | null, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!shape) return true;
+  // A global `let` / `var` from another file is subscripted, not called —
+  // Charts' `min(a, b)` went to a playground page's `let min = 20.0`.
+  if ((n.kind === 'constant' || n.kind === 'variable') && n.filePath !== ref.filePath && !shape.subscript) return false;
+  // A test target imports the module it tests, never the reverse.
+  if (!isSwiftTargetVisible(n.filePath, ref.filePath)) return false;
+  const cut = n.qualifiedName.lastIndexOf('::');
+  const owner = cut > 0 ? n.qualifiedName.slice(0, cut).split(/::|\./).pop()! : null;
+  if (!SWIFT_MEMBER_KINDS.has(n.kind) && !(owner !== null && (n.kind === 'constant' || n.kind === 'variable'))) {
+    if (n.kind !== 'function') return true;
+    return shape.shape === 'bare' || owner !== null || (shape.shape === 'chained' && /^[A-Z]/.test(shape.receiver));
+  }
+  if (owner === null) return true;
+  if (shape.shape === 'chained') {
+    if (shape.receiver === '' || !SWIFT_STD_METHODS.has(n.name)) return true;
+    return sharesReceiverWord(shape.receiver.split('.').pop()!, n) || !swiftDeclOf(owner, context).projectType ||
+      swiftDeclaresLabel(n, shape.label, context);
+  }
+  const depth = swiftHierarchyAt(ref, context).get(owner);
+  return depth !== undefined && (shape.shape !== 'super' || depth > 0);
+}
+
+/**
+ * Methods of Rust's Option / Result / iterators / collections / strings /
+ * smart pointers — names a project type rarely carries itself. Ones it often
+ * does (`get`, `set`, `insert`, `next`, `call`, `read`) are left out: serde's
+ * `Attr::set`, clap's own `get`.
+ */
+const RUST_STD_METHODS: ReadonlySet<string> = new Set([
+  'unwrap', 'unwrap_or', 'unwrap_or_else', 'unwrap_or_default', 'unwrap_err', 'unwrap_unchecked', 'expect',
+  'expect_err', 'ok', 'err', 'map', 'map_err', 'map_or', 'map_or_else', 'and_then', 'or_else', 'ok_or',
+  'ok_or_else', 'is_some', 'is_none', 'is_ok', 'is_err', 'is_some_and', 'as_ref', 'as_mut', 'as_deref', 'clone',
+  'cloned', 'copied', 'iter', 'iter_mut', 'into_iter', 'collect', 'enumerate', 'zip', 'rev', 'chain', 'skip',
+  'step_by', 'peekable', 'flat_map', 'filter_map', 'flatten', 'any', 'all', 'len', 'is_empty', 'push', 'push_str',
+  'pop', 'extend', 'drain', 'clear', 'retain', 'truncate', 'reserve', 'with_capacity', 'capacity', 'sort',
+  'sort_by', 'sort_by_key', 'dedup', 'split_off', 'contains_key', 'to_string', 'to_owned', 'to_vec', 'as_str',
+  'as_bytes', 'as_slice', 'as_ptr', 'into', 'try_into', 'borrow', 'borrow_mut', 'deref', 'deref_mut', 'chars',
+  'bytes', 'lines', 'starts_with', 'ends_with', 'trim', 'to_lowercase', 'to_uppercase', 'windows', 'chunks',
+  'then', 'then_some', 'eq', 'cmp', 'partial_cmp', 'read_to_end', 'read_to_string', 'fetch_add', 'fetch_sub',
+  // std::process::Command's pipes and the assert_cmd assertions tests chain
+  // onto it (not `arg` / `env`, which clap's own builders carry)
+  'current_dir', 'stdout', 'stderr', 'stdin', 'success', 'failure',
+]);
+
+/**
+ * Methods of Go's standard types and interfaces — `fmt.Stringer`, `error`,
+ * `http.ResponseWriter`, `sync` locks, `reflect`, `time`. Ones a project type
+ * often carries itself (`Get`, `Set`, `Close`, `Value`, `Next`) are left out:
+ * gin's `c.Set(…)` is its Context's.
+ */
+const GO_STD_METHODS: ReadonlySet<string> = new Set([
+  'String', 'Error', 'Unwrap', 'Is', 'As', 'Header', 'WriteHeader', 'WriteString', 'Lock', 'Unlock', 'RLock',
+  'RUnlock', 'Err', 'Deadline', 'Int', 'Bool', 'Float64', 'Int64', 'Uint64', 'Bytes', 'Len', 'Cap', 'Seconds',
+  'Unix', 'Before', 'After', 'Equal', 'IsNil', 'IsValid', 'Elem', 'NumField', 'Interface', 'Kind',
+]);
+
+const SCALA_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'trait', 'interface', 'enum', 'struct', 'module', 'namespace']);
+const SCALA_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'field', 'property', 'variable', 'constant']);
+const SCALA_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+const SCALA_IMPORTS = new WeakMap<ResolutionContext, Map<string, { owners: Set<string>; members: Set<string> }>>();
+
+/**
+ * Whether a bare Scala name can mean the member `n`, read at its site. Three
+ * shapes:
+ * - a later link of a chain (`fa.iterator.map(f)` — the extractor keeps one
+ *   receiver level, the line still shows the dot): the receiver must be named
+ *   after `n`'s owner (`Foo.bar` on object Foo). cats's chained `.map(…)` went
+ *   to a lazy-list ops class's `map` 186 times;
+ * - a name the enclosing definition binds — a parameter `f: A => B`, a
+ *   `val` — is that local: `f(true)` is not a case class's field `f` (396);
+ * - otherwise a member of the types around it or their `extends` / `with`
+ *   supertypes, of a companion, of the same file, or of an object the file
+ *   imports (`import Foo._`, `import Foo.{bar}`).
+ */
+function isScalaMemberInScope(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return true;
+  const name = ref.referenceName;
+  const at = new RegExp(`(?<![\\w$])${name.replace(/[$]/g, '\\$')}\\b`).exec(line);
+  if (!at) return true;
+  const before = line.slice(0, at.index);
+  if (/\.\s*$/.test(before)) {
+    // A later link of a chain: a member of what the receiver is named after,
+    // never a package object's function — unless it is an `extension` method.
+    if (n.filePath === ref.filePath) return true;
+    if (!SCALA_MEMBER_KINDS.has(n.kind)) return n.kind !== 'function' || isScalaExtensionMethod(n, context);
+    const receiver = scalaReceiverName(before);
+    return receiver !== '' && sharesReceiverWord(receiver, n);
+  }
+  const local = scalaLocalBinder(name, ref, context);
+  if (local) return n.filePath === ref.filePath && n.startLine >= local.startLine && n.endLine <= local.endLine;
+  if (!SCALA_MEMBER_KINDS.has(n.kind)) return true;
+  const cut = n.qualifiedName.lastIndexOf('::');
+  if (cut < 0 || n.filePath === ref.filePath) return true;
+  const owner = n.qualifiedName.slice(0, cut).split('::').pop()!;
+  const imports = scalaImportsOf(ref.filePath, context);
+  if (imports.owners.has(owner) || imports.members.has(`${owner}.${name}`)) return true;
+  // `import builder._` brings in a VALUE's members, of a type the file doesn't say.
+  if ([...imports.owners].some((o) => /^[a-z]/.test(o))) return true;
+  const around = context
+    .getNodesInFile(ref.filePath)
+    .filter((t) => SCALA_TYPE_KINDS.has(t.kind) && t.startLine <= ref.line && t.endLine >= ref.line);
+  if (around.length === 0) return true;
+  const seen = new Set<string>();
+  const queue = [...around.map((t) => t.name), ...scalaAnonymousBases(ref, context)];
+  while (queue.length > 0 && seen.size < 60) {
+    const typeName = queue.shift()!;
+    if (seen.has(typeName)) continue;
+    seen.add(typeName);
+    if (typeName === owner) return true;
+    queue.push(...scalaSupertypesOf(typeName, context));
+  }
+  return false;
+}
+
+/**
+ * The types an anonymous class around a Scala site instantiates — `new
+ * scopt.OptionParser[Config]("scopt") { head("scopt") }` puts OptionParser's
+ * members in scope. Read backwards over the open braces above the site.
+ */
+function scalaAnonymousBases(ref: UnresolvedRef, context: ResolutionContext): string[] {
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split('\n') ?? [];
+  const bases: string[] = [];
+  let depth = 0;
+  for (let i = ref.line - 1; i >= 0 && i >= ref.line - 400; i--) {
+    const text = lines[i]!;
+    for (let c = text.length - 1; c >= 0; c--) {
+      if (text[c] === '}') depth++;
+      else if (text[c] === '{') {
+        if (depth > 0) { depth--; continue; }
+        const head = /\bnew\s+([\w.]+(?:\s*\[[^\]]*\])?(?:\s*\([^)]*\))?(?:\s+with\s+[\w.]+(?:\s*\[[^\]]*\])?)*)\s*$/.exec(text.slice(0, c));
+        if (head) for (const m of head[1]!.replace(/\[[^\]]*\]|\([^)]*\)/g, '').split(/\s+with\s+/)) bases.push(m.trim().split('.').pop()!);
+      }
+    }
+  }
+  return bases;
+}
+
+/**
+ * The receiver a Scala `….name` is written on, as its dotted identifiers with
+ * call and type arguments dropped: `proc("bash").call()` → `proc`,
+ * `Alternative[List].unite` → `Alternative`, `checker.value.onWrite` →
+ * `checker.value`. Read backwards to the expression's start.
+ */
+function scalaReceiverName(before: string): string {
+  const text = before.replace(/\s*\.\s*$/, '');
+  let out = '';
+  let i = text.length - 1;
+  while (i >= 0) {
+    const ch = text[i]!;
+    if (ch === ')' || ch === ']') {
+      const open = ch === ')' ? '(' : '[';
+      let depth = 0;
+      for (; i >= 0; i--) {
+        if (text[i] === ch) depth++;
+        else if (text[i] === open && --depth === 0) break;
+      }
+      if (i < 0) return '';
+      i--;
+    } else if (/[\w$.]/.test(ch)) {
+      out = ch + out;
+      i--;
+    } else break;
+  }
+  return out.replace(/^\.+|\.+$/g, '');
+}
+
+/** Whether a Scala function is declared in an `extension (…)` block. */
+function isScalaExtensionMethod(n: Node, context: ResolutionContext): boolean {
+  const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split('\n') ?? [];
+  return lines.slice(Math.max(0, n.startLine - 4), n.startLine).some((l) => /^\s*extension\b/.test(l));
+}
+
+/**
+ * The definition around a Scala site that binds `name` itself — a parameter, a
+ * `val` / `var` / `def`, a lambda or `for` parameter — or null.
+ */
+function scalaLocalBinder(name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  const fn = context
+    .getNodesInFile(ref.filePath)
+    .filter((f) => (f.kind === 'method' || f.kind === 'function') && f.startLine <= ref.line && f.endLine >= ref.line)
+    .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
+  if (!fn) return null;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split('\n') ?? [];
+  const text = lines.slice(fn.startLine - 1, ref.line).join('\n');
+  const n = name.replace(/[$]/g, '\\$');
+  const binds = new RegExp(`(?:[(,\\[]\\s*(?:implicit\\s+|using\\s+)?${n}\\s*:)|(?:\\b(?:val|var|def|lazy\\s+val)\\s+${n}\\b)|(?:(?<![\\w$.])${n}\\s*(?:=>|<-))|(?:\\(\\s*${n}\\s*(?:,[^)]*)?\\)\\s*=>)`).test(text);
+  return binds ? fn : null;
+}
+
+/** The simple names a Scala type's declarations extend or mix in. */
+function scalaSupertypesOf(typeName: string, context: ResolutionContext): string[] {
+  let memo = SCALA_SUPERS.get(context);
+  if (!memo) SCALA_SUPERS.set(context, (memo = new Map()));
+  const hit = memo.get(typeName);
+  if (hit) return hit;
+  const names: string[] = [typeName];
+  for (const decl of context.getNodesByName(typeName)) {
+    if (decl.language !== 'scala' || !SCALA_TYPE_KINDS.has(decl.kind)) continue;
+    const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+    const text = lines.slice(decl.startLine - 1, decl.startLine + 12).join(' ');
+    let depth = 0;
+    let flat = '';
+    for (const ch of text) {
+      if (ch === '[' || ch === '(') depth++;
+      else if (ch === ']' || ch === ')') depth = Math.max(0, depth - 1);
+      else if (depth === 0) {
+        if (ch === '{' || ch === '=') break;
+        flat += ch;
+      }
+    }
+    const clause = /\bextends\b(.*)$/.exec(flat)?.[1] ?? '';
+    for (const m of clause.matchAll(/([A-Za-z_][\w.]*)/g)) {
+      const simple = m[1]!.split('.').pop()!;
+      if (simple !== 'with' && simple !== 'derives' && simple !== typeName) names.push(simple);
+    }
+  }
+  memo.set(typeName, names.slice(1));
+  return names.slice(1);
+}
+
+/** A Scala file's `import a.b.Obj._` / `import a.b.Obj.*` owners and `import a.b.Obj.{x, y}` / `Obj.x` members. */
+function scalaImportsOf(file: string, context: ResolutionContext): { owners: Set<string>; members: Set<string> } {
+  let memo = SCALA_IMPORTS.get(context);
+  if (!memo) SCALA_IMPORTS.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const found = { owners: new Set<string>(), members: new Set<string>() };
+  for (const m of (context.readFile(file) ?? '').matchAll(/^\s*import\s+([\w.]+?)\.(?:(_|\*)|\{([^}]*)\}|([\w$]+))\s*$/gm)) {
+    const owner = m[1]!.split('.').pop()!;
+    if (m[2]) found.owners.add(owner);
+    else for (const member of (m[3] ?? m[4] ?? '').split(',')) {
+      const id = member.trim().split(/\s*=>\s*/)[0]!;
+      if (id === '_' || id === '*') found.owners.add(owner);
+      else if (id) found.members.add(`${owner}.${id}`);
+    }
+  }
+  memo.set(file, found);
+  return found;
+}
+
+const CSHARP_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'enum', 'struct', 'record']);
+const CSHARP_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field', 'enum_member', 'constant', 'event']);
+const CSHARP_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+const CSHARP_STATIC_USINGS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
+
+/**
+ * Whether a bare C# name — `TestContext`, `Easing`, `Helper()` — can mean the
+ * member `n`: C# reads a bare name as a member of the types around it (outer
+ * classes included) or of their base types, or of a `using static` type.
+ * Never some unrelated class's: eShop's `TestContext.CancellationToken` in
+ * one test class went to another test class's `TestContext` property, MAUI's
+ * `Easing.Linear` to an animation class's `Easing`. Chain links the line
+ * shows a receiver for are not judged.
+ */
+function isCsharpMemberInScope(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!CSHARP_MEMBER_KINDS.has(n.kind)) return true;
+  const cut = n.qualifiedName.lastIndexOf('::');
+  if (cut < 0 || !hasNoReceiverOnLine(ref, context)) return true;
+  const owner = n.qualifiedName.slice(0, cut).split(/::|\./).pop()!;
+  if (csharpStaticUsings(ref.filePath, context).has(owner)) return true;
+  const around = context
+    .getNodesInFile(ref.filePath)
+    .filter((t) => CSHARP_TYPE_KINDS.has(t.kind) && t.startLine <= ref.line && t.endLine >= ref.line);
+  // No type around the name: the declaration wasn't recovered — nothing to judge by.
+  if (around.length === 0) return true;
+  const seen = new Set<string>();
+  const queue = around.map((t) => t.name);
+  while (queue.length > 0 && seen.size < 40) {
+    const name = queue.shift()!;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    if (name === owner) return true;
+    queue.push(...csharpSupertypesOf(name, context));
+  }
+  return false;
+}
+
+/** The simple names a C# type's declarations (every `partial` one) derive from. */
+function csharpSupertypesOf(typeName: string, context: ResolutionContext): string[] {
+  let memo = CSHARP_SUPERS.get(context);
+  if (!memo) CSHARP_SUPERS.set(context, (memo = new Map()));
+  const hit = memo.get(typeName);
+  if (hit) return hit;
+  const names: string[] = [];
+  for (const decl of context.getNodesByName(typeName)) {
+    if (decl.language !== 'csharp' || !CSHARP_TYPE_KINDS.has(decl.kind)) continue;
+    const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+    let head = lines.slice(decl.startLine - 1, decl.startLine + 8).join(' ');
+    head = head.slice(0, (head.indexOf('{') + 1 || head.length + 1) - 1);
+    let depth = 0;
+    let flat = '';
+    for (const ch of head) {
+      if (ch === '<' || ch === '(') depth++;
+      else if (ch === '>' || ch === ')') depth = Math.max(0, depth - 1);
+      else if (depth === 0) flat += ch;
+    }
+    const bases = new RegExp(`\\b${typeName}\\s*:\\s*(.*?)(?:\\bwhere\\b|$)`).exec(flat)?.[1] ?? '';
+    for (const m of bases.matchAll(/([A-Za-z_][\w.]*)/g)) names.push(m[1]!.split('.').pop()!);
+  }
+  memo.set(typeName, names);
+  return names;
+}
+
+/**
+ * The types a C# file sees through static usings: its own `using static
+ * A.B.Type;`, any file's `global using static`, and `<Using Include="A.B.Type"
+ * Static="true"/>` in the `.csproj` / `Directory.Build.props` files above it
+ * (AutoMapper imports its ExpressionBuilder helpers project-wide that way).
+ */
+function csharpStaticUsings(file: string, context: ResolutionContext): Set<string> {
+  let memo = CSHARP_STATIC_USINGS.get(context);
+  if (!memo) CSHARP_STATIC_USINGS.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const owners = new Set<string>(csharpProjectStaticUsings(path.posix.dirname(file), context, memo));
+  for (const m of (context.readFile(file) ?? '').matchAll(/^\s*(?:global\s+)?using\s+static\s+([\w.]+)\s*;/gm)) owners.add(m[1]!.split('.').pop()!);
+  memo.set(file, owners);
+  return owners;
+}
+
+/** Static usings that apply to every file under `dir`: project files on the way up, and every `global using static`. */
+function csharpProjectStaticUsings(dir: string, context: ResolutionContext, memo: Map<string, Set<string>>): Set<string> {
+  const key = `dir:${dir}`;
+  const hit = memo.get(key);
+  if (hit) return hit;
+  let owners: Set<string>;
+  if (dir === '.' || dir === '' || dir === '/') {
+    owners = new Set();
+    for (const f of context.getAllFiles()) {
+      if (!f.endsWith('.cs')) continue;
+      const text = context.readFile(f) ?? '';
+      if (!text.includes('global using static')) continue;
+      for (const m of text.matchAll(/^\s*global\s+using\s+static\s+([\w.]+)\s*;/gm)) owners.add(m[1]!.split('.').pop()!);
+    }
+  } else {
+    owners = new Set(csharpProjectStaticUsings(path.posix.dirname(dir), context, memo));
+  }
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(path.join(context.getProjectRoot(), dir === '.' ? '' : dir));
+  } catch {
+    entries = [];
+  }
+  for (const entry of entries) {
+    if (!/\.(?:csproj|props)$/i.test(entry)) continue;
+    let text = '';
+    try {
+      text = fs.readFileSync(path.join(context.getProjectRoot(), dir === '.' ? '' : dir, entry), 'utf8');
+    } catch {
+      continue;
+    }
+    for (const m of text.matchAll(/<Using\s+Include\s*=\s*"([\w.]+)"[^>]*\bStatic\s*=\s*"true"/gi)) owners.add(m[1]!.split('.').pop()!);
+  }
+  memo.set(key, owners);
+  return owners;
+}
+
+const OBJC_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+const OBJC_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field']);
+
+/**
+ * How a bare Objective-C name is written at its site: `c-call` for C call
+ * syntax (`completionBlock()` — a function, a block or a function pointer,
+ * never a method), `self-send` for a message to `self` / `super` /
+ * `[self class]`, whose receiver the extractor drops; null otherwise.
+ */
+function objcCallShape(ref: UnresolvedRef, context: ResolutionContext): 'c-call' | 'self-send' | 'super-send' | null {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return null;
+  const name = ref.referenceName.split(':')[0]!;
+  if (!name) return null;
+  const at = new RegExp(`(?<![\\w.])${name}\\b`, 'g');
+  let m: RegExpExecArray | null;
+  let shape: 'c-call' | 'self-send' | 'super-send' | null = null;
+  while ((m = at.exec(line))) {
+    const before = line.slice(0, m.index);
+    const after = line.slice(m.index + name.length);
+    if (/^\s*\(/.test(after) && !/\[\s*[\w.]+\s+$/.test(before)) shape ??= 'c-call';
+    else if (/\[\s*super\s+$/.test(before)) return 'super-send';
+    else if (/\[\s*(?:self|\[\s*self\s+class\s*\])\s+$/.test(before)) return 'self-send';
+  }
+  return shape;
+}
+
+/**
+ * The classes a message to `self` / `super` can reach: the class it is
+ * written in and every class that one inherits from (read from its
+ * `@interface Name : Super` declarations; category methods are indexed under
+ * the class they extend). Null outside any class.
+ */
+function objcHierarchyAt(ref: UnresolvedRef, context: ResolutionContext): Set<string> | null {
+  const inFile = context.getNodesInFile(ref.filePath);
+  let here = inFile
+    .filter((c) => c.kind === 'class' && c.startLine <= ref.line && c.endLine >= ref.line)
+    .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0]?.name;
+  // An `@implementation` whose range the index lost still names its class in
+  // its methods: `SDWebImageDownloaderDecryptor::initWithBlock:`.
+  if (!here) {
+    const method = inFile.find((c) => c.kind === 'method' && c.startLine <= ref.line && c.endLine >= ref.line && c.qualifiedName.includes('::'));
+    here = method?.qualifiedName.slice(0, method.qualifiedName.lastIndexOf('::'));
+  }
+  if (!here) return null;
+  const seen = new Set<string>();
+  const queue = [here];
+  while (queue.length > 0 && seen.size < 30) {
+    const name = queue.shift()!;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    queue.push(...objcSupertypesOf(name, context));
+  }
+  return seen;
+}
+
+/**
+ * Whether a message to `self` / `super` can mean `n`: a method of a class in
+ * the sender's hierarchy — SDWebImage's `[self class]` went to SDWeakProxy's
+ * `class` 71 times. When tree-sitter-objc loses an `@implementation`
+ * (AFNetworking's AFURLSessionManager) its methods are indexed as functions:
+ * one in the sender's own file, or in the file named after a class of its
+ * hierarchy, still counts (as does any, when the sender's own class was lost
+ * too). A function elsewhere is never what `[super init]` sends to.
+ */
+function isObjcSelfSendTarget(n: Node, ref: UnresolvedRef, context: ResolutionContext, toSuper = false): boolean {
+  const hierarchy = objcHierarchyAt(ref, context);
+  if (OBJC_MEMBER_KINDS.has(n.kind)) {
+    const cut = n.qualifiedName.lastIndexOf('::');
+    if (cut < 0 || hierarchy === null) return true;
+    const owner = n.qualifiedName.slice(0, cut);
+    // `[super init]` goes past the class it is written in.
+    return hierarchy.has(owner) && !(toSuper && owner === [...hierarchy][0]);
+  }
+  if (n.filePath === ref.filePath) return !toSuper;
+  if (hierarchy === null) return true;
+  const base = n.filePath.slice(n.filePath.lastIndexOf('/') + 1).replace(/\.\w+$/, '');
+  return hierarchy.has(base) && !(toSuper && base === [...hierarchy][0]);
+}
+
+/**
+ * UIKit / AppKit superclasses, for a category on a system class: an
+ * `UIImageView (WebCache)` method sending `[self sd_internalSetImageWithURL:…]`
+ * reaches the `UIView (WebCache)` category.
+ */
+const OBJC_SYSTEM_SUPERS: Readonly<Record<string, string>> = {
+  UIResponder: 'NSObject', UIView: 'UIResponder', UIViewController: 'UIResponder', UIWindow: 'UIView',
+  UIControl: 'UIView', UIButton: 'UIControl', UITextField: 'UIControl', UISwitch: 'UIControl', UISlider: 'UIControl',
+  UISegmentedControl: 'UIControl', UIStepper: 'UIControl', UIPageControl: 'UIControl', UIDatePicker: 'UIControl',
+  UIRefreshControl: 'UIControl', UIStackView: 'UIView', UINavigationBar: 'UIView', UIToolbar: 'UIView',
+  UITabBar: 'UIView', UISearchBar: 'UIView', UIVisualEffectView: 'UIView', UIActivityIndicatorView: 'UIView',
+  UIProgressView: 'UIView', UIPickerView: 'UIView', UITableViewHeaderFooterView: 'UIView',
+  UITableViewController: 'UIViewController', UICollectionViewController: 'UIViewController',
+  UINavigationController: 'UIViewController', UITabBarController: 'UIViewController',
+  UIPageViewController: 'UIViewController', UISplitViewController: 'UIViewController',
+  UIAlertController: 'UIViewController', UIHostingController: 'UIViewController',
+  UIImageView: 'UIView', UILabel: 'UIView', UIScrollView: 'UIView', UITableView: 'UIScrollView',
+  UICollectionView: 'UIScrollView', UITextView: 'UIScrollView', UITableViewCell: 'UIView',
+  UICollectionReusableView: 'UIView', UICollectionViewCell: 'UICollectionReusableView',
+  MKAnnotationView: 'UIView', MKMapView: 'UIView',
+  NSResponder: 'NSObject', NSView: 'NSResponder', NSViewController: 'NSResponder', NSWindow: 'NSResponder',
+  NSControl: 'NSView', NSImageView: 'NSControl', NSButton: 'NSControl', NSTextField: 'NSControl', NSTableView: 'NSControl',
+};
+
+/**
+ * Whether an Objective-C receiver's type owns `method`, in its hierarchy: the
+ * receiver names a class (`[AllTypesObject objectsInRealm:…]` — a class
+ * method inherited from RLMObject), or is a property one of whose
+ * `@property … Type *name` declarations gives such a type
+ * (`managed.anyDataObj` → RLMSet, for `containsObject:`).
+ */
+function objcReceiverReaches(receiver: string, method: Node, context: ResolutionContext): boolean {
+  const cut = method.qualifiedName.lastIndexOf('::');
+  if (cut < 0) return false;
+  const owner = method.qualifiedName.slice(0, cut);
+  let types: string[] = [];
+  if (/^[A-Z]\w*$/.test(receiver)) {
+    if (context.getNodesByName(receiver).some((n) => n.kind === 'class' && n.language === 'objc')) types = [receiver];
+  } else if (receiver.includes('.')) types = objcPropertyTypes(receiver.split('.').pop()!, context);
+  const seen = new Set<string>();
+  const queue = [...types];
+  while (queue.length > 0 && seen.size < 40) {
+    const name = queue.shift()!;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    if (name === owner) return true;
+    queue.push(...objcSupertypesOf(name, context));
+  }
+  return false;
+}
+
+/** The classes the `@property … Type *name` declarations of `name` give. */
+function objcPropertyTypes(name: string, context: ResolutionContext): string[] {
+  const types = new Set<string>();
+  const decl = new RegExp(`@property\\s*(?:\\([^)]*\\)\\s*)?([A-Z]\\w*)\\s*(?:<[^;]*>\\s*)?\\*\\s*(?:_Nullable\\s+|_Nonnull\\s+)?${name}\\b`);
+  for (const n of context.getNodesByName(name)) {
+    if (n.kind !== 'property' || n.language !== 'objc') continue;
+    const line = context.getFileLines?.(n.filePath)?.[n.startLine - 1] ?? context.readFile(n.filePath)?.split('\n')[n.startLine - 1] ?? '';
+    const t = decl.exec(line)?.[1];
+    if (t) types.add(t);
+  }
+  return [...types];
+}
+
+/** The superclasses an Objective-C class's `@interface` declarations name. */
+function objcSupertypesOf(name: string, context: ResolutionContext): string[] {
+  let memo = OBJC_SUPERS.get(context);
+  if (!memo) OBJC_SUPERS.set(context, (memo = new Map()));
+  const hit = memo.get(name);
+  if (hit) return hit;
+  const supers: string[] = [];
+  for (const decl of context.getNodesByName(name)) {
+    if (decl.kind !== 'class' || decl.language !== 'objc') continue;
+    const line = context.getFileLines?.(decl.filePath)?.[decl.startLine - 1] ?? context.readFile(decl.filePath)?.split('\n')[decl.startLine - 1] ?? '';
+    const sup = /@interface\s+\w+\s*:\s*(\w+)/.exec(line)?.[1];
+    if (sup && !supers.includes(sup)) supers.push(sup);
+  }
+  const system = OBJC_SYSTEM_SUPERS[name];
+  if (supers.length === 0 && system) supers.push(system);
+  memo.set(name, supers);
+  return supers;
+}
+
+const VB_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field', 'enum_member', 'constant', 'variable']);
+
+/**
+ * What a VB.NET member access is written on, read at the call site: the
+ * extractor keeps a call's last name only, so `Me.CMB.Buttons.Add(x)` and
+ * `New System.Drawing.Size(1, 2)` arrive as bare `Add` / `Size`. Returns null
+ * for a genuinely bare name, `''` for a `With` block's `.Name`, else the
+ * text before the dot (`Me.CMB.Buttons`, `System.Drawing`).
+ */
+function vbReceiverOf(ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return null;
+  const lower = line.toLowerCase();
+  const name = ref.referenceName.toLowerCase();
+  let start = lower.startsWith(name, ref.column) ? ref.column : -1;
+  if (start < 0) {
+    const m = new RegExp(`(?<![\\w])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w])`).exec(lower);
+    start = m ? m.index : -1;
+  }
+  if (start < 0) return null;
+  const before = line.slice(0, start);
+  const dot = /([\w.()]*?)\s*\.\s*$/.exec(before);
+  if (!dot) return null;
+  // `GetService(Of TrayNotifierService).Notify()` — the type argument names the receiver.
+  const typeArg = /\(\s*Of\s+([\w.]+)\s*\)\s*\.\s*$/i.exec(before);
+  if (typeArg) return typeArg[1]!;
+  return dot[1]!.replace(/\([^()]*\)/g, '');
+}
+
+/**
+ * Whether a VB.NET member access can mean `n`: through `Me` / `MyBase` /
+ * `MyClass`, or through a name that is `n`'s own type or module
+ * (`Module1.Log()`, `Colors.Red`). Any other receiver has a type nothing here
+ * names — SCrawler's `New System.Drawing.Size(…)` went to a nested enum's
+ * `Size` case 713 times, its designer's `Controls.Add(…)` to a collection
+ * class's `Add` 547.
+ */
+function isVbMemberReachable(n: Node, receiver: string): boolean {
+  if (!VB_MEMBER_KINDS.has(n.kind)) return true;
+  const cut = n.qualifiedName.lastIndexOf('::');
+  if (cut < 0) return true;
+  const last = receiver.split('.').pop()!.toLowerCase();
+  if (/^(?:me|mybase|myclass)$/.test(last) && !receiver.includes('.')) return true;
+  const owner = n.qualifiedName.slice(0, cut).split(/::|\./).pop()!.toLowerCase();
+  return last !== '' && last === owner;
+}
+
+const CFML_CHAINS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
+
+/**
+ * Whether a bare CFML call written in a component can mean `method`: its own
+ * component's, or one of the components it `extends` (read from source — a
+ * dotted path matched against the indexed files by its longest suffix). A
+ * call in a `.cfm` template is not judged: a ColdBox view runs inside the
+ * renderer's scope. coldbox's `now()` — the built-in — went to a date
+ * helper's `now` 228 times; chained `.then()` calls arrive bare too, and keep
+ * their method.
+ */
+function isCfmlMethodInScope(method: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!/\.cfc$/i.test(ref.filePath) || !hasNoReceiverOnLine(ref, context)) return true;
+  return cfmlChain(ref.filePath, context).has(method.filePath);
+}
+
+/** A component file and every component file it extends. */
+function cfmlChain(file: string, context: ResolutionContext): Set<string> {
+  let memo = CFML_CHAINS.get(context);
+  if (!memo) CFML_CHAINS.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const chain = new Set<string>();
+  const queue = [file];
+  while (queue.length > 0 && chain.size < 30) {
+    const f = queue.shift()!;
+    if (chain.has(f)) continue;
+    chain.add(f);
+    const text = context.readFile(f) ?? '';
+    const head = text.slice(0, text.search(/\bfunction\b|<cffunction/i) >>> 0 || text.length);
+    const ext = /\bextends\s*=\s*["']?([\w.\/:-]+)["']?/i.exec(head)?.[1];
+    if (ext) queue.push(...cfmlComponentFiles(ext, f, context));
+  }
+  memo.set(file, chain);
+  return chain;
+}
+
+/** The indexed `.cfc` files a component path names: the same directory first, else the longest path suffix. */
+function cfmlComponentFiles(dotted: string, from: string, context: ResolutionContext): string[] {
+  const segments = dotted.replace(/\//g, '.').split('.').filter(Boolean);
+  const name = segments[segments.length - 1]!.toLowerCase();
+  const files = [...new Set(context.getNodesByLowerName(name)
+    .filter((n) => n.kind === 'class' && /\.cfc$/i.test(n.filePath))
+    .map((n) => n.filePath))];
+  if (files.length === 0) return [];
+  const dir = from.slice(0, from.lastIndexOf('/') + 1);
+  if (segments.length === 1) {
+    const local = files.filter((f) => f.slice(0, f.lastIndexOf('/') + 1) === dir);
+    return local.length > 0 ? local : files;
+  }
+  for (let take = segments.length; take >= 1; take--) {
+    const suffix = '/' + segments.slice(-take).join('/').toLowerCase() + '.cfc';
+    const hits = files.filter((f) => ('/' + f.toLowerCase()).endsWith(suffix));
+    if (hits.length > 0) return hits;
+  }
+  return files;
+}
+
+/**
+ * Whether a bare reference is receiver-less at its call site, name case
+ * aside: the name is not preceded by a `.` on its line (true when the line
+ * can't tell). An extractor that keeps one receiver level hands the later
+ * links of a chain (`newFuture(f).then(g)`) over bare.
+ */
+function hasNoReceiverOnLine(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return true;
+  const lower = line.toLowerCase();
+  const name = ref.referenceName.toLowerCase();
+  let start = -1;
+  if (lower.startsWith(name, ref.column)) start = ref.column;
+  else if (ref.column >= name.length && lower.startsWith(name, ref.column - name.length)) start = ref.column - name.length;
+  else start = lower.search(new RegExp(`(?<![\\w$])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(`));
+  // Not on its line at all: a link of a chain written across lines.
+  if (start < 0) return false;
+  return !/\.\s*$/.test(line.slice(0, start));
+}
+
+const RUBY_ANCESTRY = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
+
+/**
+ * Whether a bare Ruby call written inside a class body can mean `method`: a
+ * receiver-less call is a call on `self`, so it reaches the class's own
+ * methods, its superclasses', and those of the modules any of them
+ * `include`s, `extend`s or `prepend`s — read from source, resolved against
+ * the lexical nesting (`class Foo < Base` inside `module RuboCop::Cop` is
+ * `RuboCop::Cop::Base`). A call in a module body, a block at the top of a
+ * file (a spec, a DSL) or a script is not judged: a module's methods run on
+ * whatever includes it, and a block may be evaluated on anything. rubocop's
+ * `format(…)` — Kernel's — went to the LSP runtime's `format` 411 times.
+ */
+function isRubyMethodInScope(method: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const cut = method.qualifiedName.lastIndexOf('::');
+  if (cut < 0) return true;
+  const here = context
+    .getNodesInFile(ref.filePath)
+    .filter((n) => (n.kind === 'class' || n.kind === 'module') && n.startLine <= ref.line && n.endLine >= ref.line)
+    .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
+  if (!here || here.kind !== 'class') return true;
+  return rubyAncestry(here.qualifiedName, context).has(method.qualifiedName.slice(0, cut));
+}
+
+/** A Ruby class's qualified name, those of its superclasses, and of every module mixed into any of them. */
+function rubyAncestry(qn: string, context: ResolutionContext): Set<string> {
+  let memo = RUBY_ANCESTRY.get(context);
+  if (!memo) RUBY_ANCESTRY.set(context, (memo = new Map()));
+  const hit = memo.get(qn);
+  if (hit) return hit;
+  const seen = new Set<string>();
+  const queue = [qn];
+  while (queue.length > 0 && seen.size < 60) {
+    const q = queue.shift()!;
+    if (seen.has(q)) continue;
+    seen.add(q);
+    for (const decl of context.getNodesByQualifiedName(q)) {
+      if (decl.language !== 'ruby' || (decl.kind !== 'class' && decl.kind !== 'module')) continue;
+      const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+      const outer = q.includes('::') ? q.slice(0, q.lastIndexOf('::')) : '';
+      const sup = /^\s*class\s+[\w:]+\s*<\s*(::)?([A-Z][\w:]*)/.exec(lines[decl.startLine - 1] ?? '');
+      if (sup) queue.push(rubyConstantQn(sup[2]!, sup[1] ? '' : outer, context));
+      for (const line of lines.slice(decl.startLine, decl.endLine)) {
+        const mix = /^\s*(?:include|extend|prepend)\s+([A-Z:][\w:]*(?:\s*,\s*[A-Z:][\w:]*)*)/.exec(line);
+        if (!mix) continue;
+        for (const name of mix[1]!.split(/\s*,\s*/)) {
+          queue.push(name.startsWith('::') ? rubyConstantQn(name.slice(2), '', context) : rubyConstantQn(name, q, context));
+        }
+      }
+    }
+  }
+  memo.set(qn, seen);
+  return seen;
+}
+
+/** The class or module a constant written inside `scope` names: the nearest enclosing namespace that has it, else the name itself. */
+function rubyConstantQn(name: string, scope: string, context: ResolutionContext): string {
+  for (let prefix = scope; ; prefix = prefix.includes('::') ? prefix.slice(0, prefix.lastIndexOf('::')) : '') {
+    const qn = prefix ? `${prefix}::${name}` : name;
+    if (context.getNodesByQualifiedName(qn).some((n) => n.language === 'ruby' && (n.kind === 'class' || n.kind === 'module'))) return qn;
+    if (!prefix) return name;
+  }
+}
+
+const KOTLIN_FILE_SCOPES = new WeakMap<ResolutionContext, Map<string, { pkg: string; imports: Set<string>; stars: Set<string> }>>();
+/** Packages every Kotlin file imports without writing it. */
+const KOTLIN_DEFAULT_IMPORTS: ReadonlySet<string> = new Set([
+  'kotlin', 'kotlin.annotation', 'kotlin.collections', 'kotlin.comparisons', 'kotlin.io', 'kotlin.ranges',
+  'kotlin.sequences', 'kotlin.text', 'kotlin.jvm', 'java.lang', 'kotlin.js',
+]);
+const KOTLIN_ENCLOSING_KINDS: ReadonlySet<string> = new Set([
+  'class', 'interface', 'enum', 'struct', 'trait', 'protocol', 'module', 'namespace', 'function', 'method',
+]);
+
+/** A Kotlin file's `package` and the names and packages its `import`s bring in. */
+function kotlinFileScope(file: string, context: ResolutionContext): { pkg: string; imports: Set<string>; stars: Set<string> } {
+  let memo = KOTLIN_FILE_SCOPES.get(context);
+  if (!memo) KOTLIN_FILE_SCOPES.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const text = (context.readFile(file) ?? '').replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/`/g, '');
+  const pkg = /^\s*package\s+([\w.]+)/m.exec(text)?.[1] ?? '';
+  const imports = new Set<string>();
+  const stars = new Set<string>();
+  for (const m of text.matchAll(/^\s*import\s+([\w.]+?)(\.\*)?(?:\s+as\s+\w+)?\s*;?\s*(?:\/\/.*)?$/gm)) {
+    if (m[2]) stars.add(m[1]!);
+    else imports.add(m[1]!);
+  }
+  const scope = { pkg, imports, stars };
+  memo.set(file, scope);
+  return scope;
+}
+
+/**
+ * Whether a top-level Kotlin declaration — a function, an extension function
+ * (indexed under its receiver type, `JdbcTransaction::assertEquals`), a
+ * property — can be named from the file a call is written in: its own
+ * package, an `import` of it, or a star import of its package. A member of a
+ * class is not judged here; a lambda's receiver can put any type's members in
+ * scope. Exposed's tests call `assertEquals(…)` from kotlin.test and JUnit, or
+ * import the JDBC suite's extension; the calls went to the R2DBC suite's
+ * extension 3,075 times.
+ */
+function isKotlinTopLevelVisible(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (n.language !== 'kotlin' || n.filePath === ref.filePath) return true;
+  const enclosed = context
+    .getNodesInFile(n.filePath)
+    .some((o) => o.id !== n.id && KOTLIN_ENCLOSING_KINDS.has(o.kind) && o.startLine <= n.startLine && o.endLine >= n.endLine &&
+      (o.startLine < n.startLine || o.endLine > n.endLine));
+  if (enclosed) return true;
+  const pkg = kotlinFileScope(n.filePath, context).pkg;
+  const here = kotlinFileScope(ref.filePath, context);
+  return pkg === here.pkg || here.stars.has(pkg) || here.imports.has(pkg ? `${pkg}.${n.name}` : n.name) || KOTLIN_DEFAULT_IMPORTS.has(pkg);
+}
+
+const PHP_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'trait', 'interface', 'enum']);
+const PHP_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+/**
+ * How a bare PHP method name was written at its call site: `$this->m()` /
+ * `self::m()` / `static::m()` are the enclosing class's own (or inherited)
+ * methods, `parent::m()` an ancestor's; null for anything else.
+ */
+function phpSelfReceiver(ref: UnresolvedRef, context: ResolutionContext): 'self' | 'parent' | null {
+  if (ref.language !== 'php' || ref.referenceKind !== 'calls' || !/^\w+$/.test(ref.referenceName)) return null;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (!line) return null;
+  const name = ref.referenceName;
+  if (new RegExp(String.raw`\$this\s*\??->\s*${name}\s*\(|\b(?:self|static)\s*::\s*${name}\s*\(`).test(line)) return 'self';
+  if (new RegExp(String.raw`\bparent\s*::\s*${name}\s*\(`).test(line)) return 'parent';
+  return null;
+}
+
+/**
+ * Whether `method` belongs to the class the call is written in, one it
+ * extends, or a trait any of them uses — read from source, since the
+ * resolver's supertype edges don't exist yet on the first pass, and resolved
+ * the way PHP resolves a class name: through the file's `namespace` and `use`
+ * imports (aliases included) to one fully qualified class. A parent outside
+ * the repository (PHPUnit's TestCase, Orchestra's) ends the chain. Drupal's
+ * `$this->assertEquals()` is PHPUnit's; it went to the one in-repo
+ * `assertEquals`, a comparator's, 8,832 times.
+ */
+function isPhpMethodInScope(method: Node, ref: UnresolvedRef, via: 'self' | 'parent', context: ResolutionContext): boolean {
+  const cut = method.qualifiedName.lastIndexOf('::');
+  if (cut < 0) return true;
+  const ownerQn = method.qualifiedName.slice(0, cut);
+  const enclosing = context
+    .getNodesInFile(ref.filePath)
+    .filter((n) => PHP_TYPE_KINDS.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line)
+    .sort((a, b) => b.startLine - a.startLine)[0];
+  // Inside a trait, `$this` is whichever class uses it: Laravel's
+  // ValidatesAttributes calls the Validator's `getValue()`.
+  if (!enclosing || enclosing.kind === 'trait') return true;
+  const up = phpAncestry(via === 'parent' ? phpSupertypeQns(enclosing, context) : [enclosing.qualifiedName], context);
+  if (up.qns.has(ownerQn)) return true;
+  // A base class may call what a subclass defines (BookStack's Entity calls
+  // `$this->chapter()`, a Page method): the owner descends from the caller.
+  if (via === 'self' && phpAncestry([ownerQn], context).qns.has(enclosing.qualifiedName)) return true;
+  // Past an ancestor outside the repository (Orchestra's TestCase) that
+  // ancestor's members are unseen — the repository's traits it uses among
+  // them. A trait's method may still be the one meant; an unrelated class's
+  // (Drupal's comparator `assertEquals`) never is.
+  return up.leavesRepo && context.getNodesByQualifiedName(ownerQn).some((d) => d.kind === 'trait');
+}
+
+/**
+ * Whether a PHP receiver is named after a class that has `method` in its
+ * ancestry: `$page->save()` → Page, which extends Entity; `$newRole->users()`
+ * → Role. BookStack's `$role->save()` is not Entity's (Role is a Model).
+ */
+function phpReceiverReaches(receiver: string, method: Node, context: ResolutionContext): boolean {
+  const cut = method.qualifiedName.lastIndexOf('::');
+  if (cut < 0) return false;
+  const owner = method.qualifiedName.slice(0, cut);
+  const last = receiver.split('.').pop()!.replace(/^\$/, '');
+  if (!last) return false;
+  const words = splitCamelCase(last);
+  const names = new Set([last, words[words.length - 1] ?? last].map((w) => w.charAt(0).toUpperCase() + w.slice(1)));
+  for (const name of names) {
+    for (const decl of context.getNodesByName(name)) {
+      if (decl.language !== 'php' || !PHP_TYPE_KINDS.has(decl.kind)) continue;
+      if (phpAncestry([decl.qualifiedName], context).qns.has(owner)) return true;
+    }
+  }
+  return false;
+}
+
+/** Every type `start` reaches through `extends` and trait `use`, and whether it left the repository on the way. */
+function phpAncestry(start: readonly string[], context: ResolutionContext): { qns: Set<string>; leavesRepo: boolean } {
+  const qns = new Set<string>();
+  const queue = [...start];
+  let leavesRepo = false;
+  while (queue.length > 0 && qns.size < 80) {
+    const qn = queue.shift()!;
+    if (qns.has(qn)) continue;
+    qns.add(qn);
+    const decls = context.getNodesByQualifiedName(qn).filter((d) => d.language === 'php' && PHP_TYPE_KINDS.has(d.kind));
+    if (decls.length === 0) leavesRepo = true;
+    for (const decl of decls) queue.push(...phpSupertypeQns(decl, context));
+  }
+  return { qns, leavesRepo };
+}
+
+const PHP_FILE_SCOPES = new WeakMap<ResolutionContext, Map<string, { namespace: string; uses: Map<string, string> }>>();
+
+/** A PHP file's `namespace` and its `use A\B\C [as D];` imports, alias → fully qualified name. */
+function phpFileScope(file: string, context: ResolutionContext): { namespace: string; uses: Map<string, string> } {
+  let memo = PHP_FILE_SCOPES.get(context);
+  if (!memo) PHP_FILE_SCOPES.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const text = context.readFile(file) ?? '';
+  const namespace = /^\s*namespace\s+([\w\\]+)\s*[;{]/m.exec(text)?.[1] ?? '';
+  const uses = new Map<string, string>();
+  // File-level imports sit before the first type; a trait `use` inside a class body is not one.
+  const header = text.slice(0, text.search(/^\s*(?:(?:abstract|final|readonly)\s+)*(?:class|trait|interface|enum)\s/m) >>> 0 || text.length);
+  for (const m of header.matchAll(/^\s*use\s+(?:function\s+|const\s+)?([\w\\]+)(?:\s+as\s+(\w+))?\s*;/gm)) {
+    const fqn = m[1]!.replace(/^\\/, '');
+    uses.set(m[2] ?? fqn.split('\\').pop()!, fqn);
+  }
+  const scope = { namespace, uses };
+  memo.set(file, scope);
+  return scope;
+}
+
+/** The qualified name (`A\B::C`) a PHP class name written in `file` refers to. */
+function phpTypeQn(name: string, file: string, context: ResolutionContext): string {
+  let fqn: string;
+  if (name.startsWith('\\')) fqn = name.slice(1);
+  else {
+    const { namespace, uses } = phpFileScope(file, context);
+    const [head, ...rest] = name.split('\\');
+    const imported = uses.get(head!);
+    fqn = imported ? [imported, ...rest].join('\\') : namespace ? `${namespace}\\${name}` : name;
+  }
+  const at = fqn.lastIndexOf('\\');
+  return at < 0 ? fqn : `${fqn.slice(0, at)}::${fqn.slice(at + 1)}`;
+}
+
+/** The qualified names a PHP class or trait extends and the traits it uses. */
+function phpSupertypeQns(decl: Node, context: ResolutionContext): string[] {
+  let memo = PHP_SUPERS.get(context);
+  if (!memo) {
+    memo = new Map();
+    PHP_SUPERS.set(context, memo);
+  }
+  const hit = memo.get(decl.id);
+  if (hit) return hit;
+  const names: string[] = [];
+  const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+  const head = lines.slice(decl.startLine - 1, decl.startLine + 4).join(' ');
+  const extended = /\bextends\s+([^{]*?)(?:\bimplements\b|\{)/.exec(head)?.[1] ?? '';
+  for (const m of extended.matchAll(/(\\?[A-Za-z_][\w\\]*)/g)) names.push(m[1]!);
+  // `use StringTranslationTrait, MessengerTrait;` at the top of the body —
+  // one per line or one list across several (Laravel's Command, Model).
+  const bodyLines = lines.slice(decl.startLine, Math.min(decl.endLine, decl.startLine + 80));
+  const firstFunction = bodyLines.findIndex((l) => /\bfunction\b/.test(l));
+  const body = bodyLines.slice(0, firstFunction < 0 ? bodyLines.length : firstFunction).join('\n');
+  for (const used of body.matchAll(/^\s*use\s+([\w\\,\s]+?)\s*[;{]/gm)) {
+    for (const t of used[1]!.split(',')) if (t.trim()) names.push(t.trim());
+  }
+  const qns = names.map((n) => phpTypeQn(n, decl.filePath, context));
+  memo.set(decl.id, qns);
+  return qns;
+}
+
+/** Names the Rust prelude puts in every module; a project item of the same name needs a `use` to shadow one. */
+const RUST_PRELUDE = new Set([
+  'Ok', 'Err', 'Some', 'None', 'Result', 'Option', 'Box', 'Vec', 'String', 'Default', 'Drop', 'Iterator',
+  'IntoIterator', 'From', 'Into', 'Clone', 'Copy', 'Send', 'Sync', 'Sized', 'ToString', 'ToOwned', 'PartialEq',
+  'Eq', 'PartialOrd', 'Ord', 'AsRef', 'AsMut', 'Fn', 'FnMut', 'FnOnce', 'Extend', 'drop',
+]);
+
+interface RustUses {
+  /** Every identifier in the file's project `use` trees — not `std::` / `core::` / `alloc::` ones. */
+  names: Set<string>;
+  /** `X` of each `use …::X::*` (`super` for `use super::*`). */
+  globs: Set<string>;
+}
+const RUST_USES = new WeakMap<ResolutionContext, Map<string, RustUses>>();
+
+function rustUsesOf(filePath: string, context: ResolutionContext): RustUses {
+  let memo = RUST_USES.get(context);
+  if (!memo) {
+    memo = new Map();
+    RUST_USES.set(context, memo);
+  }
+  const hit = memo.get(filePath);
+  if (hit) return hit;
+  const uses: RustUses = { names: new Set(), globs: new Set() };
+  // Comments first: a doc comment's prose ("…use the Option…") is not a `use`.
+  const text = stripCommentsForRegex(context.readFile(filePath) ?? '', 'rust');
+  for (const m of text.matchAll(/(?:^|[;{}\s])use\s+([^;]{1,2000});/g)) {
+    const tree = m[1]!;
+    if (/^\s*(?:::)?(?:std|core|alloc)\b/.test(tree)) continue;
+    for (const id of tree.matchAll(/[A-Za-z_]\w*/g)) uses.names.add(id[0]);
+    for (const g of tree.matchAll(/(\w+)\s*::\s*(?:\{[^}]*)?\*/g)) uses.globs.add(g[1]!);
+  }
+  memo.set(filePath, uses);
+  return uses;
+}
+
+/** The module a Rust file is: `src/glob.rs` → `glob`, `src/walk/mod.rs` → `walk`. */
+function rustModuleName(filePath: string): string {
+  const parts = filePath.split('/');
+  const base = parts[parts.length - 1]!.replace(/\.rs$/, '');
+  return base === 'mod' || base === 'lib' || base === 'main' ? parts[parts.length - 2] ?? base : base;
+}
+
+/** Does one of the file's globs bring in this candidate's module (or, for `use super::*`, its parent's)? */
+function rustGlobCovers(uses: RustUses, candidate: Node, ref: UnresolvedRef): boolean {
+  if (uses.globs.has(rustModuleName(candidate.filePath))) return true;
+  if (!uses.globs.has('super')) return false;
+  const dir = (p: string): string => p.slice(0, p.lastIndexOf('/'));
+  // `use super::*` in a child module: the parent's file, or a sibling in the parent's directory.
+  return dir(candidate.filePath) === dir(ref.filePath) || dir(candidate.filePath) === dir(dir(ref.filePath));
+}
+
+/**
+ * Whether a bare Rust name can mean this candidate. An enum's variant is in
+ * scope bare only through a `use` of it or of its enum's `*`, and never
+ * names a TYPE — ripgrep's every `Some(x)` bound to its `EncodingMode::Some`
+ * variant, every `Ok(x)` to `ParseResult::Ok`. A prelude name (`Ok`,
+ * `Result`, `Box`) is the prelude's unless the file defines it or imports a
+ * project item of that name — serde's macro-hygiene tests declare `struct
+ * Ok`, `struct Result`, and serde bound its own `Ok(…)` and `Result<…>` to them.
+ */
+export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const name = ref.referenceName;
+  // Bare in the SOURCE: the index keeps `crate::error::Result` by its last
+  // segment, and a path is not a prelude lookup.
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line !== undefined && line.startsWith(name, ref.column) && /::\s*$/.test(line.slice(0, ref.column))) return true;
+  if (candidate.kind === 'enum_member') {
+    if (ref.referenceKind === 'references') return false;
+    const uses = rustUsesOf(ref.filePath, context);
+    const cut = candidate.qualifiedName.lastIndexOf('::');
+    const owner = cut >= 0 ? candidate.qualifiedName.slice(0, cut).split('::').pop()! : '';
+    return (owner !== '' && uses.globs.has(owner)) || (uses.names.has(name) && uses.names.has(owner));
+  }
+  if (!RUST_PRELUDE.has(name) || candidate.filePath === ref.filePath) return true;
+  const uses = rustUsesOf(ref.filePath, context);
+  return uses.names.has(name) || rustGlobCovers(uses, candidate, ref);
+}
+
+/** What only exists inside a type, reachable through a receiver alone. */
+const TYPE_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field', 'enum_member']);
 
 /** Per-context memo: `file\0name` → "the file binds this name locally". */
 const LOCAL_BINDING_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
@@ -1786,10 +4142,16 @@ function bindsAtSites(source: string, name: string, sites: LocalBindingSites): b
   return false;
 }
 
-/** Languages where a receiver-less call inside a class body means `this.m()`. */
-const IMPLICIT_THIS_LANGUAGES = new Set<string>(['java', 'kotlin', 'csharp', 'scala', 'swift', 'cpp', 'dart', 'ruby']);
-/** Languages whose extractor drops a `this.`/`self.`/`$this->` receiver but where a bare call never means a member. */
-const EXPLICIT_THIS_LANGUAGES = new Set<string>(['python', 'php', 'typescript', 'tsx', 'javascript', 'jsx']);
+/**
+ * Languages where a receiver-less call inside a class body means `this.m()`,
+ * and whose scoping filters in matchByExactName can still leave the caller's
+ * own member and a sibling class's side by side (Scala and C++ keep every
+ * same-file member; Java keeps every type a same-named nested type extends).
+ * Kotlin, C#, Swift, Dart and Ruby filter a bare call to what is in reach.
+ */
+const IMPLICIT_THIS_LANGUAGES = new Set<string>(['java', 'scala', 'cpp']);
+/** Languages whose extractor drops a `this.`/`self.` receiver but where a bare call never means a member. */
+const EXPLICIT_THIS_LANGUAGES = new Set<string>(['python', 'typescript', 'tsx', 'javascript', 'jsx']);
 const MEMBER_OWNER_KINDS = new Set<Node['kind']>(['class', 'struct', 'interface', 'trait', 'protocol', 'enum', 'union', 'module']);
 
 /**
@@ -1821,8 +4183,8 @@ function callReceiverKind(ref: UnresolvedRef, context: ResolutionContext): 'bare
 
 /**
  * A call that means a member of the class it is written in — a receiver-less
- * `render()` in Java / Kotlin / C# / Scala / Swift / C++ / Dart / Ruby, or
- * `this.render()` / `self.render()` / `$this->render()` anywhere — binds by
+ * `render()` in Java / Scala / C++, or `this.render()` / `self.render()` in
+ * TypeScript / JavaScript / Python — binds by
  * the language's scoping, not by which same-named method sits nearest: the
  * caller's own class first, then what it inherits, then (for a bare call) the
  * classes it is nested in. Without this the same-file line-distance term
@@ -1862,7 +4224,7 @@ function matchEnclosingScopeMember(
   }
   // Whatever a scope declares under the name shadows the scopes outside it —
   // a Scala `val` applied like a function, a nested class constructed by a
-  // Kotlin call — but a method is the likelier target when both exist.
+  // bare call — but a method is the likelier target when both exist.
   const callableFirst = (found: Node[]): Node[] =>
     [...found].sort((a, b) => Number(b.kind === 'method' || b.kind === 'function') - Number(a.kind === 'method' || a.kind === 'function'));
   // `Owner::Owner` is a constructor: a bare `Owner(...)` builds a new
@@ -1875,7 +4237,7 @@ function matchEnclosingScopeMember(
     context.getNodesByQualifiedName(qn).filter((n) => MEMBER_OWNER_KINDS.has(n.kind) && sameLanguageFamily(n.language, ref.language));
   // One member of `owner`: the caller's file first; another file only when a
   // single type in the index carries that qualified name (C++ out-of-line
-  // bodies, Swift / Kotlin extensions, C# partials).
+  // bodies).
   const pick = (owner: string, isType: boolean): Node | null => {
     const found = members(owner);
     if (found.length === 0) return null;
@@ -1991,92 +4353,9 @@ function matchEnclosingScopeMember(
     if (simple.startsWith('<')) return true; // an anonymous class always has one
     const header = typeHeader(scope);
     if (header === null) return true;
-    // `extends` / `implements` / `with`, a `:` base list (C++, C#, Kotlin,
-    // Swift), Ruby's `class A < B`.
-    return /\b(?:extends|implements|with)\b|[\w>)\]]\s*:(?!:)|\bclass\s+\w+\s*<\s*[A-Z]/.test(header);
+    // `extends` / `implements` / `with`, a C++ `:` base list.
+    return /\b(?:extends|implements|with)\b|[\w>)\]]\s*:(?!:)/.test(header);
   }
-}
-
-/**
- * Whether the call site's own name is bound by an import of a BARE specifier —
- * a Node builtin or an npm package. Such a binding names a symbol that is not
- * in the graph at all, so no project node is the right target for it, however
- * few candidates are left standing. That is the trap the name-based strategies
- * fall into: filtering narrows a crowd of same-named symbols but says nothing
- * about whether the true target was ever in the crowd, so when one survives it
- * inherits the call. `import { resolve } from 'node:path'` is the case that
- * matters — a common name, many project definitions, and the real target
- * external.
- *
- * Relative, alias, and workspace imports are deliberately not treated this way:
- * those point at project files, so a name match is a reasonable recovery when
- * the import resolver could not follow the path.
- *
- * Only the JS/TS family is checked. There, a project-internal import is
- * distinguishable by shape — it is relative, aliased, or a workspace member —
- * so "bare" really does mean external. In Java, Kotlin, Go and Python a
- * project's own modules are imported by absolute name too, and the same test
- * would reject the internal case along with the external one.
- */
-export function isBoundToBareImport(ref: UnresolvedRef, context: ResolutionContext): boolean {
-  if (
-    ref.language !== 'typescript' &&
-    ref.language !== 'javascript' &&
-    ref.language !== 'tsx' &&
-    ref.language !== 'jsx' &&
-    ref.language !== 'arkts'
-  ) {
-    return false;
-  }
-  // Optional-called: a minimal context (tests, embedders) may not carry
-  // import mappings, and without them nothing is known to be bare.
-  const source = context
-    .getImportMappings?.(ref.filePath, ref.language)
-    ?.find((i) => i.localName === ref.referenceName)?.source;
-  if (source === undefined) return false;
-  if (source.startsWith('.') || source.startsWith('/')) return false;
-  // `~`, `#` and `$` cannot begin an npm package name, so the prefix alone
-  // proves a local binding and no resolver lookup is needed: `~utils` (a
-  // tsconfig `paths` entry, which a nested tsconfig the alias loader never
-  // reads still declares), `#types/hmrPayload` (a package.json `imports`
-  // subpath), `$lib/...` (SvelteKit). Matching only `~/` classed the slashless
-  // spellings as bare and sent real project edges out with the wrong ones.
-  if (source.startsWith('~') || source.startsWith('#') || source.startsWith('$')) return false;
-  if (source.startsWith('@/') || source.startsWith('src/')) return false;
-  const aliases = context.getProjectAliases?.();
-  if (aliases?.patterns.some((p) => source.startsWith(p.prefix))) return false;
-  const workspaces = context.getWorkspacePackages?.();
-  if (workspaces && resolveWorkspaceImport(source, workspaces)) return false;
-  // A `link:` / `file:` dependency is a directory in the project that no
-  // workspace glob need cover, so the workspace map above cannot see it:
-  // vitest imports `@vitest/bundled-lib` from `test/browser/bundled-lib`,
-  // which its `test/*` globs stop short of. The name is local even though it
-  // is spelled exactly like a scoped registry package.
-  if (workspaces?.localLinkNames?.has(packageNameOf(source))) return false;
-  // A nested tsconfig may define baseUrl while the project-root alias map
-  // knows nothing about it. A root path such as lib/utils is still local.
-  // Builtins keep their meaning even when a same-named directory exists.
-  if (!source.startsWith('node:') && !NODE_BUILTIN_SPECIFIERS.has(source)) {
-    const head = packageNameOf(source);
-    let memo = ROOT_IMPORT_PATHS.get(context);
-    if (!memo) { memo = new Map(); ROOT_IMPORT_PATHS.set(context, memo); }
-    let local = memo.get(head);
-    if (local === undefined) {
-      local = context.fileExists(head);
-      memo.set(head, local);
-    }
-    if (local) return false;
-  }
-  return true;
-}
-
-/**
- * The package a specifier names, without its subpath: `@scope/pkg/sub` →
- * `@scope/pkg`, `pkg/sub` → `pkg`. Scoped names keep two segments.
- */
-function packageNameOf(source: string): string {
-  const parts = source.split('/');
-  return source.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0]!;
 }
 
 /**
@@ -2096,10 +4375,25 @@ export function matchByExactName(
   // findBestMatch — O(K²) per package, the dominant cost of "Resolving refs" on
   // large import-heavy (front-end + back-end) repos (#915).
   const bareJs = isBareJsCall(ref, context);
-  const bareGo = isBareGoCall(ref, context);
+  const bareNoMembers = isBareGoCall(ref, context) || isBareRCall(ref, context);
+  const solidityBare = isReceiverLessSolidityCall(ref, context);
+  const barePhp = isBarePhpCall(ref, context);
+  // A type, a value or an import the file binds from a package outside the
+  // repository names nothing in it, whatever kind of reference it is.
+  if (!bareJs && JS_FAMILY.has(ref.language) && ref.referenceKind !== 'calls' &&
+      /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) && isOutOfRepoBinding(ref.referenceName, ref, context)) {
+    return null;
+  }
+  // `import { useQuery } from '@tanstack/react-query'`: the call means the
+  // package's, and no other file's same-named symbol. A declaration of the
+  // name in this file's inner scope still shadows the import.
+  let outOfRepoCall = false;
   if (bareJs) {
     const storeAction = matchJsStoreBindingCall(ref, context);
     if (storeAction) return storeAction;
+    const returned = matchDestructuredCallResult(ref, context);
+    if (returned) return returned;
+    outOfRepoCall = isOutOfRepoBinding(ref.referenceName, ref, context);
   }
   // Every rule below judges one candidate on its own, so they run as ONE pass,
   // the kind/language checks before the ones that read source: a common name
@@ -2108,7 +4402,9 @@ export function matchByExactName(
   const valueRef = ref.referenceKind === 'references' || ref.referenceKind === 'function_ref';
   const importRef = ref.referenceKind === 'imports';
   const inheritanceRef = isInheritanceRef(ref);
-  const sameName = context.getNodesByName(ref.referenceName);
+  const sameName = outOfRepoCall
+    ? context.getNodesByName(ref.referenceName).filter((n) => n.filePath === ref.filePath)
+    : context.getNodesByName(ref.referenceName);
   // `NAME(...)` where NAME is a function-like macro somewhere in the project is
   // an expansion or a call to a same-named function — never the macro itself
   // (#1839), and never a type that happens to share the name (#2070: expat's
@@ -2116,14 +4412,70 @@ export function matchByExactName(
   // upstream's language gate on the chosen result.
   const cMacroCall = ref.referenceKind === 'calls' && (ref.language === 'c' || ref.language === 'cpp') &&
     sameName.some((n) => n.kind === 'constant' && CPP_DEFINE_SIGNATURE.test(n.signature ?? ''));
-  let candidates = sameName.filter((n) =>
+  const typeRef = isDotNetTypeRef(ref, context);
+  const rustBare = ref.language === 'rust' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
+  const pythonShape = pythonCallShape(ref, context);
+  const javaBare = ref.language === 'java' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
+  const dartBare = ref.language === 'dart' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) && isReceiverLessDartCall(ref, context);
+  const kotlinCall = ref.language === 'kotlin' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
+  const kotlinBare = kotlinCall && isReceiverLessKotlinCall(ref, context);
+  const rubyBare = ref.language === 'ruby' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*[?!]?$/.test(ref.referenceName);
+  const cfmlBare = (ref.language === 'cfml' || ref.language === 'cfscript') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
+  const vbReceiver = ref.language === 'vbnet' && (ref.referenceKind === 'calls' || ref.referenceKind === 'instantiates') && /^\w+$/.test(ref.referenceName)
+    ? vbReceiverOf(ref, context) : null;
+  const objcShape = ref.language === 'objc' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*:*(?:\w+:)*$/.test(ref.referenceName)
+    ? objcCallShape(ref, context) : null;
+  const csharpBare = ref.language === 'csharp' && (ref.referenceKind === 'calls' || ref.referenceKind === 'references') && /^[A-Za-z_]\w*$/.test(ref.referenceName);
+  const scalaBare = ref.language === 'scala' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
+  const rustGoShape = (ref.language === 'rust' || ref.language === 'go') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)
+    ? rustGoCallShape(ref, context) : null;
+  const kotlinStdChain = ref.language === 'kotlin' && ref.referenceKind === 'calls' && KOTLIN_STD_METHODS.has(ref.referenceName)
+    ? kotlinChainReceiver(ref, context) : null;
+  const swiftShape = ref.language === 'swift' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)
+    ? swiftCallShape(ref, context) : null;
+  const phpSelf = phpSelfReceiver(ref, context);
+  const filtered = sameName.filter((n) =>
+    !(kotlinStdChain !== null && !isKotlinStdChainTarget(n, kotlinStdChain)) &&
+    !(swiftShape && !isSwiftCallTarget(n, swiftShape, ref, context)) &&
+    !(rustGoShape && !isRustGoCallTarget(n, rustGoShape)) &&
+    !(scalaBare && !isScalaMemberInScope(n, ref, context)) &&
+    !(csharpBare && !isCsharpMemberInScope(n, ref, context)) &&
+    !(objcShape === 'c-call' && OBJC_MEMBER_KINDS.has(n.kind)) &&
+    !(objcShape === 'self-send' && !isObjcSelfSendTarget(n, ref, context)) &&
+    !(objcShape === 'super-send' && !isObjcSelfSendTarget(n, ref, context, true)) &&
+    !(vbReceiver !== null && !isVbMemberReachable(n, vbReceiver)) &&
+    !(rubyBare && n.kind === 'method' && !isRubyMethodInScope(n, ref, context)) &&
+    !(cfmlBare && n.kind === 'method' && !isCfmlMethodInScope(n, ref, context)) &&
+    !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)) &&
+    !(kotlinCall && !isKotlinTopLevelVisible(n, ref, context)) &&
+    !(kotlinBare && !isKotlinMemberReachable(n, ref, context)) &&
+    !isKotlinNumberBitwise(n, ref) &&
+    !(solidityBare && !isSolidityMemberInScope(n, ref, context)) &&
+    !(dartBare && isDartMember(n) && !isDartMethodInScope(n, ref, context)) &&
+    !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))) &&
+    !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
+    !(rustBare && !isRustNameInScope(n, ref, context)) &&
     !(cMacroCall && n.kind !== 'function' && n.kind !== 'method') &&
+    !(typeRef && !canNameInTypePosition(n)) &&
+    // A Scala type position (`Arbitrary[B]`) never names a method: an
+    // `implicit def A: Order[A]` shares its name with half of cats' type
+    // parameters. Scala's value references only read a file's own vals.
+    !(ref.language === 'scala' && ref.referenceKind === 'references' && /^[A-Z]/.test(ref.referenceName) &&
+      (n.kind === 'method' || n.kind === 'function')) &&
     // Type/value references retain same-family eligibility: a native namesake
     // must not hide the actual web type. Calls still gate only the winner.
     (!valueRef || sameLanguageFamily(n.language, ref.language)) &&
     n.kind !== 'import' &&
-    // A receiver-less JS/TS or Go call cannot reach a method (#1714, #1857).
-    !((bareJs || bareGo) && n.kind === 'method') &&
+    // A receiver-less JS/TS or Go call cannot reach a member of a type — a
+    // method (#1714, #1857), nor a property, field or case: mocha's global
+    // `it(…)` bound to an interface's `it` property, `describe(…)` to a
+    // command class's `describe` string.
+    !((bareJs || bareNoMembers) && TYPE_MEMBER_KINDS.has(n.kind)) &&
+    // A bare PHP call is a function call: nothing else is callable without a receiver.
+    !(barePhp && n.kind !== 'function') &&
+    // A Vue component's own method is `this.m()` inside that component — not
+    // `this.$refs['input'].click()` on an element another component renders.
+    !(ref.referenceKind === 'calls' && JS_FAMILY.has(ref.language) && isVueComponentMethod(n) && !isThisCallInOwnFile(n, ref, context)) &&
     // An `extends`/`implements` ref names a supertype, so anything that can't
     // BE one is not a candidate at all. This is eligibility, not
     // ranking: kind is only a scoring bonus below (and none is awarded for
@@ -2145,17 +4497,8 @@ export function matchByExactName(
     // file's symbol of that name, so a bare call has no cross-file candidate.
     !(bareJs && n.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context))
   );
-
-  // A name bound to a bare import (`import { test } from 'vitest'`) has its
-  // target outside the graph: no other file's `test` is it, however unique.
-  // A same-file definition stays eligible — a local declaration shadows the
-  // file-level import, and that is what the reference then means.
-  if (
-    candidates.some((n) => n.filePath !== ref.filePath) &&
-    isBoundToBareImport(ref, context)
-  ) {
-    candidates = candidates.filter((n) => n.filePath === ref.filePath);
-  }
+  const candidates = dartBare ? nearestDartMembers(filtered, ref, context)
+    : swiftShape && swiftShape.shape !== 'chained' ? nearestSwiftMembers(filtered, ref, context) : filtered;
 
   if (candidates.length === 0) {
     return null;
@@ -2163,8 +4506,7 @@ export function matchByExactName(
 
   // If only one match, use it — but penalize cross-language matches
   if (candidates.length === 1) {
-    if (!isCrossFileReachable(candidates[0]!, ref, context) ||
-      isUnevidencedBareLibraryCall(candidates[0]!, ref, context)) return null;
+    if (!isCrossFileReachable(candidates[0]!, ref, context)) return null;
     const isCrossLanguage = candidates[0]!.language !== ref.language;
     return {
       original: ref,
@@ -2192,8 +4534,7 @@ export function matchByExactName(
 
   // Multiple matches - try to narrow down
   const bestMatch = findBestMatch(ref, candidates, context);
-  if (bestMatch && isCrossFileReachable(bestMatch, ref, context) &&
-    !isUnevidencedBareLibraryCall(bestMatch, ref, context)) {
+  if (bestMatch && isCrossFileReachable(bestMatch, ref, context)) {
     // Lower confidence when the match is from a distant/unrelated module
     const proximity = computePathProximity(ref.filePath, bestMatch.filePath);
     // Every candidate is a copy of one symbol and this is the caller's own
@@ -2211,26 +4552,6 @@ export function matchByExactName(
   }
 
   return null;
-}
-
-/**
- * Whether `qualifiedName` ends with `suffix` at a real `::` scope boundary —
- * NOT a plain `String.endsWith`, which false-matches across an identifier
- * boundary purely by character coincidence: `"Aaa::operator+"` ends with the
- * literal substring `"a::operator+"` only because `Aaa` itself happens to
- * end in the letter `a`, even though `"a"` there was never meant as a scope
- * qualifier at all — it was a C++ receiver *variable* named `a` in a
- * `a.operator+(b)` call, decoy-matching the unrelated `Aaa::operator+`
- * method instead of leaving receiver-type inference (`matchMethodCall`) to
- * find the real `V::operator+`. A match only counts when the
- * suffix is the WHOLE qualifiedName, or the two characters immediately
- * preceding it are a real `::` separator.
- */
-function endsWithQualifiedSegment(qualifiedName: string, suffix: string): boolean {
-  if (qualifiedName === suffix) return true;
-  if (!qualifiedName.endsWith(suffix)) return false;
-  const boundary = qualifiedName.length - suffix.length;
-  return boundary >= 2 && qualifiedName[boundary - 1] === ':' && qualifiedName[boundary - 2] === ':';
 }
 
 /**
@@ -2252,31 +4573,14 @@ export function matchByQualifiedName(
   // must never resolve to a yaml/properties config node — that's a wrong edge
   // AND it hides the real callee. Drop those from both the exact and the partial
   // candidate sets so resolution falls through to method resolution below (#1180).
-  const keepForRef = (nodes: Node[]): Node[] => {
-    let kept = nodes;
-    if (ref.referenceKind === 'calls') {
-      kept = kept.filter(
-        (n) => !(n.kind === 'constant' && (n.language === 'yaml' || n.language === 'properties')),
-      );
-    }
-    return isInheritanceRef(ref) ? kept.filter(isSupertypeTarget) : kept;
-  };
+  const keepForRef = (nodes: Node[]): Node[] =>
+    ref.referenceKind === 'calls'
+      ? nodes.filter(
+          (n) => !(n.kind === 'constant' && (n.language === 'yaml' || n.language === 'properties')),
+        )
+      : nodes;
 
-  // The GENERIC class-hierarchy walker's qualifiedName always joins scope
-  // with `::` (buildQualifiedName in tree-sitter.ts) regardless of source
-  // language, but an extends/implements clause's own text is recorded
-  // verbatim from the language's own syntax — so a Java/C# dotted supertype
-  // (`Outer.Inner`, `IFoo.Stub`) never matched a real indexed type's
-  // `::`-joined qualifiedName without normalizing the separator first.
-  // Scoped to ONLY inheritance references: several non-generic extractors
-  // (MyBatis XML statements, for one) deliberately build a MIXED
-  // qualifiedName that keeps literal dots from an already-dotted Java
-  // package/namespace string and adds `::` only at one specific boundary —
-  // blanket-normalizing every reference's dots to `::` mangled those.
-  const normalizedQualifiedRef = isInheritanceRef(ref)
-    ? ref.referenceName.replace(/\./g, '::')
-    : ref.referenceName;
-  const candidates = keepForRef(context.getNodesByQualifiedName(normalizedQualifiedRef));
+  const candidates = keepForRef(context.getNodesByQualifiedName(ref.referenceName));
 
   if (candidates.length === 1) {
     return {
@@ -2337,28 +4641,9 @@ export function matchByQualifiedName(
   const parts = ref.referenceName.split(/[:.]/);
   const lastName = parts[parts.length - 1];
   if (lastName) {
-    // The strict `::`-boundary check only matters where normalization
-    // actually ran (inheritance refs) — every other reference kind keeps
-    // the original, deliberately loose `endsWith` (e.g. Expo's JS call site
-    // binds a shortened alias like `Haptics` that only matches the END of
-    // the native module's `...::ExpoHaptics.method` qualifiedName by design,
-    // with no `::` immediately before it).
     const partialCandidates = keepForRef(context.getNodesByName(lastName))
-      .filter((candidate) =>
-        isInheritanceRef(ref)
-          ? endsWithQualifiedSegment(candidate.qualifiedName, normalizedQualifiedRef)
-          : candidate.qualifiedName.endsWith(normalizedQualifiedRef)
-      );
-    // `RecyclerView.LayoutManager` can exist in both AndroidX and the
-    // framework. For inheritance, pick the uniquely closest source tree;
-    // an equal-distance tie has no safe target.
-    const closest = isInheritanceRef(ref) && partialCandidates.length > 1
-      ? partialCandidates.map((node) => ({ node, distance: computePathProximity(ref.filePath, node.filePath) }))
-          .sort((a, b) => b.distance - a.distance)
-      : null;
-    const chosen = closest
-      ? (closest[0]!.distance > closest[1]!.distance ? closest[0]!.node : null)
-      : preferCallSiteFile(partialCandidates, ref.filePath)[0];
+      .filter((candidate) => candidate.qualifiedName.endsWith(ref.referenceName));
+    const chosen = preferCallSiteFile(partialCandidates, ref.filePath)[0];
     if (chosen) {
       return {
         original: ref,
@@ -2648,10 +4933,6 @@ export function resolveMethodOnType(
   /** Recursion guard for the supertype/conformance walk. */
   depth = 0,
 ): ResolvedRef | null {
-  // Only calls and captured method values have a callable receiver. Inheritance
-  // references such as `class Foo extends IBar.Stub` must not reach this helper.
-  if (ref.referenceKind !== 'calls' && ref.referenceKind !== 'function_ref') return null;
-
   // Look up methods by name and match by qualifiedName ending in
   // `<typeName>::<methodName>`. This works whether the method is defined
   // in-class (`class Foo { int bar() { ... } }`) or out-of-line in a separate
@@ -3000,7 +5281,6 @@ export function matchCppCallChain(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): ResolvedRef | null {
-  if (ref.referenceKind !== 'calls') return null;
   const m = ref.referenceName.match(/^(.+)\(\)\.(\w+)$/);
   if (!m || !m[1] || !m[2]) return null;
   const cls = resolveCppCallResultType(m[1], ref, context);
@@ -3023,7 +5303,6 @@ export function matchScopedCallChain(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): ResolvedRef | null {
-  if (ref.referenceKind !== 'calls') return null;
   const m = ref.referenceName.match(/^(.+)\(\)\.(\w+)$/);
   if (!m || !m[1] || !m[2]) return null;
   const inner = m[1];
@@ -3063,7 +5342,6 @@ export function matchDottedCallChain(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): ResolvedRef | null {
-  if (ref.referenceKind !== 'calls') return null;
   const m = ref.referenceName.match(/^(.+)\(\)\.(\w+)$/);
   if (!m || !m[1] || !m[2]) return null;
   const inner = m[1]; // `Foo.getInstance`
@@ -3633,24 +5911,6 @@ function kotlinInheritedPropertyType(
 }
 
 /**
- * Java: a capitalized receiver that names a class the file imports (or a
- * `java.lang` class) and that is a library type — a static call into a
- * library (`Log.d(…)`, `TextUtils.isEmpty(…)`), which no project method is.
- */
-function isImportedJavaLibraryClass(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
-  const imported =
-    JAVA_LANG_CLASSES.has(name) ||
-    context.getImportMappings(ref.filePath, ref.language).some((i) => i.localName === name);
-  return imported && javaTypeRef(name, ref.filePath, context) === null;
-}
-
-const JAVA_LANG_CLASSES = new Set([
-  'Boolean', 'Byte', 'Character', 'Class', 'Double', 'Enum', 'Float', 'Integer', 'Long', 'Math',
-  'Object', 'Runtime', 'Short', 'StrictMath', 'String', 'StringBuilder', 'StringBuffer', 'System',
-  'Thread', 'ThreadLocal', 'Throwable',
-]);
-
-/**
  * Java: the declared type of a receiver the field lookup reaches — a field
  * (`mRepo`, `this.mRepo`, `Outer.this.mRepo`) or a chain of up to three
  * fields after it (`mState.menu`, `this.mOwner.mRepo`), whose head may also
@@ -4076,6 +6336,12 @@ export function normalizeInferredTypeName(raw: string): string | null {
 }
 
 /**
+ * A Java / C# type's optional type arguments (one level of nesting) and array
+ * ranks, as a regex source: `<L, R>`, `<string, List<int>>`, `[]`, `[,]`.
+ */
+const TYPE_ARGS = '(?:<[^;=(){}<>]*(?:<[^;=(){}<>]*>[^;=(){}<>]*)*>)?\\s*(?:\\[[\\s,]*\\]\\s*)*';
+
+/**
  * Per-language patterns that recover a local variable's (or typed parameter's)
  * type from its declaration/initializer. Each regex captures the type in group
  * 1; `r` is the already-escaped receiver name. Ordered most-specific first.
@@ -4142,6 +6408,44 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   AWAITED_FILES.delete(context);
   C_STATIC_MEMO.delete(context);
   RUST_TRAIT_IMPL_MEMO.delete(context);
+  RUST_USES.delete(context);
+  LEXICAL_SCOPE_MEMO.delete(context);
+  JAVA_SUPERS.delete(context);
+  PHP_SUPERS.delete(context);
+  DART_SUPERS.delete(context);
+  DART_HIERARCHIES.delete(context);
+  SWIFT_DECLS.delete(context);
+  KOTLIN_RECEIVER_TYPES.delete(context);
+  KOTLIN_HIERARCHIES.delete(context);
+  KOTLIN_FRAMES.delete(context);
+  CPP_NS_MACROS.delete(context);
+  CPP_NS_FRAMES.delete(context);
+  CPP_NS_ALIASES.delete(context);
+  SOLIDITY_SUPERS.delete(context);
+  DECLARED_SUPERS.delete(context);
+  INHERITED_METHODS.delete(context);
+  MEMBER_SHADOWS.delete(context);
+  MEMBER_WALKS.delete(context);
+  MEMBER_LINES.delete(context);
+  SOLIDITY_HIERARCHIES.delete(context);
+  MEMBER_TYPE_MEMO.delete(context);
+  CSHARP_ALIASES.delete(context);
+  SWIFT_HIERARCHIES.delete(context);
+  KOTLIN_FILE_SCOPES.delete(context);
+  RUBY_ANCESTRY.delete(context);
+  CFML_CHAINS.delete(context);
+  OBJC_SUPERS.delete(context);
+  CSHARP_SUPERS.delete(context);
+  CSHARP_STATIC_USINGS.delete(context);
+  SCALA_SUPERS.delete(context);
+  SCALA_IMPORTS.delete(context);
+  ESM_EXPORT_LISTS.delete(context);
+  LUA_LOCALS.delete(context);
+  LUA_MEMBERS.delete(context);
+  PHP_FILE_SCOPES.delete(context);
+  JAVA_STATIC_IMPORTS.delete(context);
+  PY_IMPORTS.delete(context);
+  PY_MODULE_LOCAL.delete(context);
   PRIVATE_OWNER_MEMO.delete(context);
   SEALED_MODULES.delete(context);
   LOCAL_BINDING_MEMO.delete(context);
@@ -4151,7 +6455,6 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   TS_FIELD_DECL_MEMO.delete(context);
   TS_CLASS_LINES.delete(context);
   TARGET_LANGUAGE.delete(context);
-  ROOT_IMPORT_PATHS.delete(context);
 }
 
 function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {
@@ -4190,7 +6493,12 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
       ];
     case 'python':
       return [
-        new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w.]*)\\s*\\(`), // lg = Logger(...)
+        // group = VLANGroup.objects.create(…) — a Django manager call that
+        // returns one instance of the model (not `filter`/`all`, a QuerySet).
+        new RegExp(`(?:^|;)\\s*${r}\\s*=(?!=)\\s*([A-Z]\\w*)\\.objects\\.(?:create|get|first|last|latest|earliest|get_by_natural_key)\\s*\\(`),
+        // lg = Logger(...) — a statement of its own: `prefix=IPNetwork(…),`
+        // inside a call's arguments is a keyword argument, not a binding.
+        new RegExp(`(?:^|;)\\s*${r}\\s*=(?!=)\\s*([A-Z][\\w.]*)\\s*\\((?![^\\n]*,\\s*$)`),
         // A quoted forward reference (`lg: "Logger"`, `lg: 'pkg.Logger'`) is the
         // same annotation — and what every file under `from __future__ import
         // annotations` or with a not-yet-defined class writes. The unquoted
@@ -4200,15 +6508,10 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
         new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.]*)`), // lg: Logger  (PEP 526)
       ];
     case 'java':
-      // The type may be written with its package (`play.api.mvc.BodyParser<B>
-      // delegate`): capture it whole, so javaTypeRef pins that declaration.
       return [
         new RegExp(`\\b${r}\\b\\s*=\\s*new\\s+([A-Za-z_][\\w.]*)`), // = new Logger()
-        new RegExp(`\\b((?:[a-z_]\\w*\\.)*[A-Z][\\w.]*)\\s+${r}\\b\\s*[=;,):]`), // Logger lg;  / param / for (Logger lg : …)
-        // A generic declaration — `Map<String, List<Foo>> lg =`: the type is
-        // the name before its type arguments, matched as balanced brackets
-        // (two levels deep) so `Map<K, V> map, Foo<T> lg)` reads `Foo`.
-        new RegExp(`\\b((?:[a-z_]\\w*\\.)*[A-Z][\\w.]*)\\s*<(?:[^<>;=(){}]|<(?:[^<>;=(){}]|<[^<>;=(){}]*>)*>)*>\\s+${r}\\b\\s*[=;,):]`),
+        new RegExp(`\\b([A-Z][\\w.]*)\\s*${TYPE_ARGS}\\s+${r}\\b\\s*[=;,)]`), // Logger lg;  / Pair<L, R> pair / String[] args
+        new RegExp(`\\bfor\\s*\\(\\s*(?:final\\s+)?([A-Z][\\w.]*)\\s*${TYPE_ARGS}\\s+${r}\\s*:`), // for (Element el : els)
       ];
     case 'kotlin':
       return [
@@ -4218,7 +6521,15 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
     case 'csharp':
       return [
         new RegExp(`\\b${r}\\b\\s*=\\s*new\\s+([A-Za-z_][\\w.]*)`), // = new Logger()
-        new RegExp(`\\b([A-Z][\\w.]*)\\s+${r}\\b\\s*[=;,)]`), // Logger lg;  / param
+        new RegExp(`\\b([A-Z][\\w.]*)\\s*${TYPE_ARGS}\\??\\s+${r}\\b\\s*[=;,)]`), // Logger lg;  / List<string> names / JProperty? p
+        new RegExp(`\\bforeach\\s*\\(\\s*([A-Z][\\w.]*)\\s*${TYPE_ARGS}\\??\\s+${r}\\s+in\\b`), // foreach (JProperty p in props)
+      ];
+    case 'objc':
+      return [
+        // FMResultSet *rs = …  /  NSString * _Nullable name;  /  a block's ^(FMResultSet *rs)
+        new RegExp(`\\b([A-Z]\\w*)\\s*(?:<[^<>;]*>\\s*)?\\*\\s*(?:(?:_Nullable|_Nonnull|__strong|__weak|__unsafe_unretained|const)\\s+)*${r}\\b(?!\\s*\\()`),
+        // a method parameter: - (void)read:(nullable FMResultSet *)rs
+        new RegExp(`\\(\\s*(?:(?:nullable|nonnull|__kindof)\\s+)*([A-Z]\\w*)\\s*(?:<[^<>)]*>\\s*)?\\*[^)]*\\)\\s*${r}\\b`),
       ];
     case 'swift':
       return [
@@ -4335,6 +6646,349 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
     default:
       return [];
   }
+}
+
+/** Languages whose fields and properties declare their type where the class declares them. */
+const MEMBER_TYPED_LANGUAGES: ReadonlySet<string> = new Set(['csharp', 'java', 'kotlin']);
+const MEMBER_CLASS_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'interface', 'enum', 'record']);
+const MEMBER_TYPE_MEMO = new WeakMap<ResolutionContext, Map<string, string | null>>();
+/** Words that can stand where a declaration's type does without being one. */
+const MEMBER_TYPE_NON_TYPES: ReadonlySet<string> = new Set([
+  'return', 'new', 'case', 'throw', 'else', 'in', 'out', 'ref', 'params', 'await', 'yield', 'is', 'as', 'using',
+  'var', 'val', 'goto', 'nameof', 'typeof', 'sizeof', 'default', 'when', 'where', 'get', 'set', 'init',
+  'class', 'interface', 'enum', 'struct', 'record', 'object', 'namespace', 'package', 'import', 'extends',
+  'implements', 'fun', 'static', 'final', 'abstract', 'sealed', 'override', 'virtual', 'delegate', 'event',
+]);
+
+/**
+ * The type a C# / Java / Kotlin receiver has as a field or property of the
+ * class around the call — `private readonly JsonWriter _innerWriter;`,
+ * `public JsonReader Reader { get; }`, `private val sink: BufferedSink` — or
+ * null when the class declares no such member or the calling method binds
+ * the name itself. Only the class's own lines are read, never a method body
+ * or a nested type. Newtonsoft's `_innerWriter.WriteValue(…)` inside
+ * TraceJsonWriter went to TraceJsonWriter's own `WriteValue` by name.
+ */
+function inferMemberReceiverType(receiver: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const name = receiver.replace(/^this\./, '');
+  if (!/^[A-Za-z_]\w*$/.test(name)) return null;
+  const inFile = context.getNodesInFile(ref.filePath).filter((n) => n.language === ref.language);
+  let cls: Node | undefined;
+  let fn: Node | undefined;
+  for (const n of inFile) {
+    if (n.startLine > ref.line || n.endLine < ref.line) continue;
+    if (MEMBER_CLASS_KINDS.has(n.kind) && (!cls || n.startLine >= cls.startLine)) cls = n;
+    else if ((n.kind === 'method' || n.kind === 'function') && (!fn || n.startLine >= fn.startLine)) fn = n;
+  }
+  if (!cls) return null;
+  const found = memberTypeThroughHierarchy(cls, name, context);
+  if (!found) return null;
+  // A lambda parameter, `var` local, `out` variable or `foreach` binding in
+  // the calling method shadows the field, and the local inference that ran
+  // first cannot type those.
+  return fn && bindsNameItself(fn, name, context) ? null : found;
+}
+
+const MEMBER_SHADOWS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+const MEMBER_WALKS = new WeakMap<ResolutionContext, Map<string, string | null>>();
+
+/** Whether a C# / Java / Kotlin function body binds `name` itself — a `var`/`val`, an `out` or loop variable, a lambda parameter. */
+function bindsNameItself(fn: Node, name: string, context: ResolutionContext): boolean {
+  let memo = MEMBER_SHADOWS.get(context);
+  if (!memo) MEMBER_SHADOWS.set(context, (memo = new Map()));
+  const key = `${fn.id}|${name}`;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  const lines = context.getFileLines?.(fn.filePath) ?? context.readFile(fn.filePath)?.split(/\r?\n/) ?? [];
+  const body = lines.slice(fn.startLine - 1, fn.endLine).join('\n');
+  const r = name.replace(/\$/g, '\\$');
+  const binds = new RegExp(`\\b(?:var|val|out\\s+[\\w.<>?]+|foreach\\s*\\(\\s*[\\w.<>?,\\s]+?)\\s+${r}\\b|\\bfor\\s*\\([^;)]*\\s${r}\\s*:|\\b${r}\\s*=>|[(,]\\s*${r}\\s*(?:,[^()]*)?\\)\\s*=>|\\b${r}\\s*(?:,[^{}]*)?->`).test(body);
+  memo.set(key, binds);
+  return binds;
+}
+
+/**
+ * The type `cls` declares a member `name` with, or one of its supertypes
+ * does — the class's own members first, then those it inherits (a base
+ * class's `internal readonly JsonSerializer Serializer;`), each inherited
+ * class carrying what its type parameters stand for in the class the walk
+ * came from (`: IntegrationTest<DatabaseInitializer>`).
+ */
+function memberTypeThroughHierarchy(cls: Node, name: string, context: ResolutionContext): string | null {
+  let memo = MEMBER_WALKS.get(context);
+  if (!memo) MEMBER_WALKS.set(context, (memo = new Map()));
+  const key = `${cls.id}|${name}`;
+  if (memo.has(key)) return memo.get(key)!;
+  let result: string | null = null;
+  const seen = new Set<string>();
+  const queue: Array<{ type: Node; args: Map<string, string> }> = [{ type: cls, args: new Map() }];
+  while (queue.length > 0 && seen.size < 8) {
+    const { type, args } = queue.shift()!;
+    if (seen.has(type.id)) continue;
+    seen.add(type.id);
+    const found = classMemberType(type, name, context);
+    if (found) {
+      if (type === cls) {
+        result = found;
+        break;
+      }
+      // A member typed by the declaring class's own type parameter
+      // (`protected TFixture Fixture { get; }`) is the argument the subclass
+      // gave it, else its bound — with neither, only `object`'s members.
+      const given = args.get(found);
+      if (given) {
+        result = given;
+        break;
+      }
+      const bound = typeParameterBoundIn(found, [type], context);
+      result = bound === undefined ? found : bound ?? 'object';
+      break;
+    }
+    for (const sup of classHeadSupertypes(type, context)) {
+      const given = headTypeArguments(type, sup, context).map((a) => args.get(a) ?? a);
+      for (const decl of context.getNodesByName(sup)) {
+        if (decl.language !== type.language || !MEMBER_CLASS_KINDS.has(decl.kind)) continue;
+        const params = declaredTypeParameters(decl, context);
+        queue.push({ type: decl, args: new Map(params.map((p, i) => [p, given[i] ?? ''] as [string, string]).filter(([, a]) => a !== '')) });
+      }
+    }
+  }
+  memo.set(key, result);
+  return result;
+}
+
+/** The first `<…>` of a declaration's head, split at its top-level commas. */
+function angleArguments(text: string): string[] {
+  const open = text.indexOf('<');
+  if (open < 0) return [];
+  const out: string[] = [];
+  let depth = 0;
+  let cur = '';
+  for (const ch of text.slice(open + 1)) {
+    if (ch === '<') depth++;
+    else if (ch === '>' && depth-- === 0) break;
+    if (ch === ',' && depth === 0) {
+      out.push(cur);
+      cur = '';
+    } else cur += ch;
+  }
+  out.push(cur);
+  return out.map((a) => a.trim());
+}
+
+/** The type parameters a class declares: `TDbContextFixture` for `class IntegrationTest<TDbContextFixture>`. */
+function declaredTypeParameters(decl: Node, context: ResolutionContext): string[] {
+  const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+  const head = lines.slice(decl.startLine - 1, decl.startLine + 3).join(' ');
+  const at = new RegExp(`\\b${decl.name}\\s*<`).exec(head);
+  if (!at) return [];
+  return angleArguments(head.slice(at.index)).map((p) => /([A-Za-z_]\w*)\s*(?:extends\b.*|:.*)?$/.exec(p.replace(/^(?:in|out|reified)\s+/, ''))?.[1] ?? '');
+}
+
+/** The type arguments a class's head gives a supertype, as simple names: `DatabaseInitializer` for `: IntegrationTest<ParameterizedQueries.DatabaseInitializer>`. */
+function headTypeArguments(cls: Node, sup: string, context: ResolutionContext): string[] {
+  const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
+  const head = lines.slice(cls.startLine - 1, cls.startLine + 8).join(' ').split('{')[0]!;
+  const at = new RegExp(`(?:[:,]|\\bextends|\\bimplements)\\s*(?:[\\w.]+\\.)?${sup}\\s*<`).exec(head);
+  if (!at) return [];
+  return angleArguments(head.slice(at.index)).map((a) => a.replace(/<[\s\S]*$/, '').split('.').pop()!.trim());
+}
+
+/**
+ * The supertypes a class declaration names in its own head, for the
+ * languages whose heads say it plainly: Pascal `TX = class(TBase, IFoo)`,
+ * Python `class X(Base):`, Ruby `class X < Base`, PHP / TS / JS `extends
+ * Base`, and the Java-family heads.
+ */
+const DECLARED_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+const INHERITED_METHODS = new WeakMap<ResolutionContext, Map<string, Node | null>>();
+
+function declaredSupertypes(cls: Node, context: ResolutionContext): string[] {
+  let memo = DECLARED_SUPERS.get(context);
+  if (!memo) DECLARED_SUPERS.set(context, (memo = new Map()));
+  const hit = memo.get(cls.id);
+  if (hit) return hit;
+  const supers = readDeclaredSupertypes(cls, context);
+  memo.set(cls.id, supers);
+  return supers;
+}
+
+function readDeclaredSupertypes(cls: Node, context: ResolutionContext): string[] {
+  switch (cls.language) {
+    case 'java': case 'csharp': case 'kotlin': return classHeadSupertypes(cls, context);
+    case 'dart': return dartSupertypesOf(cls.name, context);
+    case 'swift': return swiftDeclOf(cls.name, context).supers;
+    case 'objc': return objcSupertypesOf(cls.name, context);
+    case 'scala': return scalaSupertypesOf(cls.name, context);
+    default: break;
+  }
+  const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
+  const head = lines.slice(cls.startLine - 1, cls.startLine + 2).join(' ');
+  const names = (text: string | undefined): string[] =>
+    text ? [...text.matchAll(/([A-Za-z_][\w.:\\]*)/g)].map((m) => m[1]!.split(/::|\.|\\/).pop()!).filter((w) => !/^(?:metaclass|object)$/.test(w)) : [];
+  switch (cls.language) {
+    case 'pascal': return names(/=\s*class\s*\(([^)]*)\)/i.exec(head)?.[1]);
+    case 'python': return names(/\bclass\s+\w+\s*\(([^)]*)\)/.exec(head)?.[1]?.replace(/\w+\s*=\s*[\w.]+/g, ''));
+    case 'ruby': return names(/\bclass\s+[\w:]+\s*<\s*([\w:]+)/.exec(head)?.[1]);
+    case 'php': case 'typescript': case 'tsx': case 'javascript': case 'jsx':
+      return names(/\bextends\s+([\w.\\]+)/.exec(head)?.[1]);
+    default: return [];
+  }
+}
+
+/** A method named `name` on a supertype of the given classes, nearest first. */
+function inheritedClassMethod(classes: Node[], name: string, context: ResolutionContext): Node | null {
+  if (classes.length === 0) return null;
+  let memo = INHERITED_METHODS.get(context);
+  if (!memo) INHERITED_METHODS.set(context, (memo = new Map()));
+  const key = `${classes.map((c) => c.id).join(',')}|${name}`;
+  if (memo.has(key)) return memo.get(key)!;
+  const found = findInheritedClassMethod(classes, name, context);
+  memo.set(key, found);
+  return found;
+}
+
+function findInheritedClassMethod(classes: Node[], name: string, context: ResolutionContext): Node | null {
+  const seen = new Set<string>(classes.map((c) => c.id));
+  let frontier = classes;
+  for (let depth = 0; depth < 5 && frontier.length > 0; depth++) {
+    const next: Node[] = [];
+    for (const cls of frontier) {
+      for (const sup of declaredSupertypes(cls, context)) {
+        for (const decl of context.getNodesByName(sup)) {
+          if (decl.language !== cls.language || !isMethodOwnerKind(decl) || seen.has(decl.id)) continue;
+          seen.add(decl.id);
+          const method = context.getNodesInFile(decl.filePath).find((n) => n.kind === 'method' && n.name === name &&
+            n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop() === decl.name);
+          if (method) return method;
+          next.push(decl);
+        }
+      }
+    }
+    frontier = next;
+  }
+  return null;
+}
+
+/** The simple names a Java / C# / Kotlin class declaration's head extends or implements. */
+function classHeadSupertypes(cls: Node, context: ResolutionContext): string[] {
+  const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
+  let depth = 0;
+  let head = '';
+  for (const ch of lines.slice(cls.startLine - 1, cls.startLine + 8).join(' ').replace(/\/\/[^\n]*|\/\*.*?\*\//g, ' ')) {
+    if (ch === '{' && depth === 0) break;
+    if (ch === '<' || ch === '(') depth++;
+    else if (ch === '>' || ch === ')') depth = Math.max(0, depth - 1);
+    else if (depth === 0) head += ch;
+  }
+  const clause = /\b(?:extends|implements)\b([\s\S]*)$/.exec(head)?.[1] ??
+    /\b(?:class|interface|struct|record|object)\s+\w+[^:]*:([\s\S]*)$/.exec(head)?.[1] ?? '';
+  return [...clause.replace(/\bwhere\b[\s\S]*$/, '').matchAll(/([A-Z]\w*)\s*(?=,|$|\bimplements\b)/g)].map((m) => m[1]!);
+}
+
+/**
+ * The type a class declares a member `name` with, read from the lines at its
+ * body's own brace depth (or its header, for a primary constructor's
+ * parameters) — deeper ones are method, accessor and indexer bodies or
+ * nested types.
+ */
+function classMemberType(cls: Node, name: string, context: ResolutionContext): string | null {
+  let memo = MEMBER_TYPE_MEMO.get(context);
+  if (!memo) {
+    memo = new Map();
+    MEMBER_TYPE_MEMO.set(context, memo);
+  }
+  const key = `${cls.id}|${name}`;
+  if (memo.has(key)) return memo.get(key)!;
+  const r = name.replace(/\$/g, '\\$');
+  const pattern = cls.language === 'kotlin'
+    ? new RegExp(`\\b(?:val|var)\\s+${r}\\s*:\\s*([A-Z][\\w.]*)`)
+    : new RegExp(`(?:^|[\\s(,])([A-Za-z_][\\w.]*)\\s*${TYPE_ARGS}\\??\\s+${r}\\s*(?:[=;,)]|\\{)`);
+  let found: string | null = null;
+  for (const { text, depth } of classMemberLines(cls, context)) {
+    if (!text.includes(name)) continue;
+    const m = pattern.exec(text);
+    // Inside parentheses at member depth is a method's parameter list; only
+    // the header's (a primary constructor's) declares members.
+    const inParens = m !== null && depth === 1 &&
+      (text.slice(0, m.index).match(/\(/g)?.length ?? 0) > (text.slice(0, m.index).match(/\)/g)?.length ?? 0);
+    if (m && !inParens && !MEMBER_TYPE_NON_TYPES.has(m[1]!)) {
+      found = normalizeInferredTypeName(m[1]!);
+      break;
+    }
+  }
+  memo.set(key, found);
+  return found;
+}
+
+const MEMBER_LINES = new WeakMap<ResolutionContext, Map<string, Array<{ text: string; depth: number }>>>();
+
+/**
+ * A class's own member-declaration lines — those at its body's brace depth,
+ * or its header (a primary constructor's parameters) — with comments and
+ * string contents dropped; method, accessor and indexer bodies and nested
+ * types are deeper and left out. Read once per class.
+ */
+function classMemberLines(cls: Node, context: ResolutionContext): Array<{ text: string; depth: number }> {
+  let memo = MEMBER_LINES.get(context);
+  if (!memo) MEMBER_LINES.set(context, (memo = new Map()));
+  const hit = memo.get(cls.id);
+  if (hit) return hit;
+  const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
+  const out: Array<{ text: string; depth: number }> = [];
+  let depth = 0;
+  let inComment = false;
+  for (let line = cls.startLine; line <= cls.endLine; line++) {
+    let raw = lines[line - 1] ?? '';
+    if (inComment) {
+      const close = raw.indexOf('*/');
+      if (close < 0) continue;
+      raw = raw.slice(close + 2);
+      inComment = false;
+    }
+    let text = raw.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '""').replace(/\/\*.*?\*\//g, ' ').replace(/\/\/.*$/, '');
+    const open = text.indexOf('/*');
+    if (open >= 0) {
+      text = text.slice(0, open);
+      inComment = true;
+    }
+    if (depth <= 1 && text.trim() !== '') out.push({ text, depth });
+    for (const ch of text) {
+      if (ch === '{') depth++;
+      else if (ch === '}') depth = Math.max(0, depth - 1);
+    }
+  }
+  memo.set(cls.id, out);
+  return out;
+}
+
+/**
+ * What a Java / C# / Kotlin type parameter of the class or method around a
+ * call is bounded by: `ExceptionContext` for `T` in `class Test<T extends
+ * ExceptionContext & Serializable>` / `where T : ExceptionContext` / `<T :
+ * ExceptionContext>`, null when it is a type parameter with no named bound,
+ * undefined when it is not a type parameter there at all.
+ */
+function typeParameterBound(typeName: string, ref: UnresolvedRef, context: ResolutionContext): string | null | undefined {
+  const around = context.getNodesInFile(ref.filePath).filter((n) => n.startLine <= ref.line && n.endLine >= ref.line &&
+    (MEMBER_CLASS_KINDS.has(n.kind) || n.kind === 'method' || n.kind === 'function'));
+  return typeParameterBoundIn(typeName, around, context);
+}
+
+/** {@link typeParameterBound}, over the heads of the given declarations. */
+function typeParameterBoundIn(typeName: string, decls: Node[], context: ResolutionContext): string | null | undefined {
+  if (!/^[A-Z]\w*$/.test(typeName)) return undefined;
+  const t = typeName;
+  let declared = false;
+  for (const n of decls) {
+    const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
+    const head = lines.slice(n.startLine - 1, n.startLine + 5).join(' ').split('{')[0]!;
+    const bound = new RegExp(`[<,]\\s*(?:in\\s+|out\\s+|reified\\s+)?${t}\\s*(?:extends|:)\\s*([A-Z][\\w.]*)`).exec(head)?.[1] ??
+      new RegExp(`\\bwhere\\s+${t}\\s*:\\s*([A-Z][\\w.]*)`).exec(head)?.[1];
+    if (bound) return bound.split('.').pop()!;
+    if (new RegExp(`[<,]\\s*(?:in\\s+|out\\s+|reified\\s+)?${t}\\s*[,>]`).test(head)) declared = true;
+  }
+  return declared ? null : undefined;
 }
 
 /** 1-based start line of the tightest function/method enclosing the call. */
@@ -4802,12 +7456,6 @@ export function matchMethodCall(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  // A dotted/scoped name is not necessarily an invocation: Java inheritance
-  // refs such as `IBar.Stub` have the same surface shape. Let type-reference
-  // strategies handle non-call refs rather than falling through to the
-  // same-named-method heuristics below.
-  if (ref.referenceKind !== 'calls') return null;
-
   // Parse method call patterns like "obj.method" or "Class::method". The method
   // part allows trailing `:` keywords so Objective-C selectors resolve
   // (`SDImageCache.storeImage:`, `obj.setX:y:`); colons never appear in other
@@ -4935,6 +7583,18 @@ export function matchMethodCall(
       ref.language === 'cpp'
         ? inferCppReceiverType(objectOrClass!, ref, context)
         : inferLocalReceiverType(objectOrClass!, ref, context));
+    if (!inferredType && MEMBER_TYPED_LANGUAGES.has(ref.language) && dotMatch) {
+      inferredType = nmTimedT('mc-member', ref, () => inferMemberReceiverType(objectOrClass!, ref, context));
+      // A field of a built-in type (`string _name`, `int count`) has no project method.
+      if (inferredType && /^[a-z]/.test(inferredType)) return null;
+    }
+    // A type parameter is its bound; with none, only `Object`'s methods.
+    if (inferredType && MEMBER_TYPED_LANGUAGES.has(ref.language) &&
+        !context.getNodesByName(inferredType).some(isMethodOwnerKind)) {
+      const bound = typeParameterBound(inferredType, ref, context);
+      if (bound === null) return null;
+      if (bound !== undefined) inferredType = bound;
+    }
     const awaited = !inferredType && ESM_FAMILY.has(ref.language)
       ? inferEsmAwaitedCallType(objectOrClass!, ref, context) : null;
     if (awaited) {
@@ -4979,6 +7639,11 @@ export function matchMethodCall(
         'instance-method',
         importedFqn,
       ));
+      if (typedMatch && ref.language === 'kotlin') {
+        // `medium and 0xff` on an Int: the standard library's member, not a project `Int.and(Long)`.
+        const target = context.getNodeById?.(typedMatch.targetNodeId);
+        if (target && isKotlinNumberBitwise(target, ref)) return null;
+      }
       if (typedMatch) {
         if (awaited) {
           const target = context.getNodeById?.(typedMatch.targetNodeId);
@@ -5003,6 +7668,17 @@ export function matchMethodCall(
         ESM_FAMILY.has(ref.language) &&
         (JS_BUILT_INS.has(inferredType) || TS_PRIMITIVE_TYPES.has(inferredType))
       ) {
+        return null;
+      }
+      // The receiver's declared type is one the project doesn't declare —
+      // `List<Roshambo> list`, `String s`, `val sb = StringBuilder()` — so the
+      // method is that outside type's. gson's `list.add(…)` went to a project
+      // list wrapper's `add`, commons-lang's `s.length()` to a writer's.
+      // (Only a type name — `java.util.List`, not a call chain like Python's
+      // `Device.objects.create(…)` the initializer pattern also captures.)
+      const typeName = inferredType.split('.').pop()!;
+      if (/^[A-Z]/.test(typeName) &&
+          !context.getNodesByName(typeName).some((n) => isMethodOwnerKind(n) && sameLanguageFamily(n.language, ref.language))) {
         return null;
       }
     }
@@ -5074,8 +7750,7 @@ export function matchMethodCall(
   // Java: a field receiver — `mRepo`, `this.mRepo`, `Outer.this.mRepo`, or a
   // chain of fields `mState.menu` — resolves on its declared type, and a
   // library type (`Handler`, `Context`) gets NO edge rather than the
-  // name-only guesses below. A static call on an imported library class
-  // (`Log.d(…)`, `TextUtils.isEmpty(…)`) is left unresolved the same way.
+  // name-only guesses below.
   if (ref.language === 'java' && dotMatch && !localInferred) {
     const declared = nmTimedT('mc-java-declared', ref, () =>
       javaReceiverDeclaredType(objectOrClass!, ref, context));
@@ -5083,8 +7758,6 @@ export function matchMethodCall(
     if (declared) {
       const typedMatch = nmTimedT('mc-rmot', ref, () => resolveOnJavaType(declared, methodName!, ref, context));
       if (typedMatch) return typedMatch;
-    } else if (/^[A-Z]\w*$/.test(objectOrClass!) && isImportedJavaLibraryClass(objectOrClass!, ref, context)) {
-      return null;
     }
   }
 
@@ -5311,6 +7984,10 @@ export function matchMethodCall(
         };
       }
     }
+    // A class method the named class inherits — Horse's `THorse.Get(…)` is
+    // THorseCore's, three `class(…)` heads up — before any guess by name.
+    const inherited = inheritedClassMethod(classCandidates.filter((c) => c.language === ref.language), methodName!, context);
+    if (inherited) return { original: ref, targetNodeId: inherited.id, confidence: 0.8, resolvedBy: 'qualified-name' };
     return null;
   });
   if (strat1) return strat1;
@@ -5322,6 +7999,46 @@ export function matchMethodCall(
   if (ref.referenceKind === 'calls' && JS_FAMILY.has(ref.language) &&
       objectOrClass !== 'this' && objectOrClass !== 'super' &&
       JS_BUILTIN_METHODS.has(methodName!)) return null;
+
+  // A receiver the file imports is past guessing. A namespace import is the
+  // module object, whose members are its exports, never some class's method;
+  // a binding from a package outside the repository names nothing in it. The
+  // import resolver placed what it could, and a method picked by name alone is
+  // wrong: zod's `z.string()` (`import * as z from "zod/v4"`) bound 3,207 calls
+  // to a test helper's `string` getter, trpc's `z.record()` another class's.
+  if (ref.referenceKind === 'calls' && JS_FAMILY.has(ref.language) && isImportedModuleReceiver(objectOrClass!, ref, context)) {
+    return null;
+  }
+
+  // A receiver written as a type name the project doesn't declare
+  // (`Exception.Create(…)` in Delphi, `Collections.sort(…)`) is a type from
+  // outside it: a same-named method of some project type is a guess. horse's
+  // `Exception.Create` went to its own `EHorseException::Create` 44 times.
+  // A C# using alias names its type: `using Assert = Newtonsoft.Json.Tests.XUnitAssert;`.
+  const aliased = ref.language === 'csharp' ? csharpUsingAlias(objectOrClass!, ref, context) : null;
+  if (aliased) {
+    return resolveMethodOnType(aliased, methodName!, ref, context, 0.9, 'instance-method', undefined);
+  }
+
+  // In C# and Java a capitalized receiver the class around it doesn't declare
+  // is a type — a project property of that name elsewhere (a test object's
+  // `DateTime`) does not make `DateTime.Parse(…)` the project's.
+  const typesOnly = ref.language === 'csharp' || ref.language === 'java' || ref.language === 'rust';
+  if (namesExternalType(objectOrClass!, ref.language) &&
+      !context.getNodesByName(objectOrClass!).some((n) => sameLanguageFamily(n.language, ref.language) &&
+        (!typesOnly || isMethodOwnerKind(n) || n.kind === 'enum' || n.kind === 'namespace' || n.kind === 'module' ||
+          n.kind === 'trait' || n.kind === 'type_alias'))) {
+    return null;
+  }
+  // Rust `task::spawn(…)` / `io::stdout()`: a function through a module path —
+  // never a method some type of that name owns.
+  if (ref.language === 'rust' && match === colonMatch && /^[a-z_][\w]*(?:::[a-z_]\w*)*$/.test(objectOrClass!)) {
+    return null;
+  }
+  // `string.Equals(…)`, `object.ReferenceEquals(…)`: a C# keyword type.
+  if (ref.language === 'csharp' && /^(?:string|object|int|long|short|byte|bool|char|double|float|decimal|uint|ulong|ushort|sbyte)$/.test(objectOrClass!)) {
+    return null;
+  }
 
   // Strategy 2: Instance variable receiver - try capitalized form to find class
   // e.g., "permissionEngine" → look for classes containing "PermissionEngine"
@@ -5386,25 +8103,64 @@ export function matchMethodCall(
       return null;
     }
     const methods = methodCandidates.filter(
-      (n) => n.kind === 'method' && n.name === methodName && isLexicallyReachable(n, ref, context)
+      (n) => n.kind === 'method' && n.name === methodName
     );
 
     // Filter to same-language candidates first
     const sameLanguageMethods = methods.filter(m => m.language === ref.language);
     let targetMethods = sameLanguageMethods.length > 0 ? sameLanguageMethods : methods;
-    // Scala `Outer.Inner(args)` is a case-class / companion `apply`, not a Java
-    // constructor: a Java ctor (`Outer::Inner::Inner`) found only by receiver-
-    // word overlap names no class the call pins, and it steals calls meant for
-    // the Scala type of the same name. An imported / `new`-constructed Java
-    // class resolves through the import and instantiate paths, not this guess.
-    if (ref.language === 'scala' && sameLanguageMethods.length === 0) {
-      targetMethods = targetMethods.filter((m) => !isOtherLanguageConstructor(m, ref.language));
+    // A receiver the file imports is another module's value: never a method
+    // declared in the calling file. expo-camera's `CameraManager.isAvailableAsync()`
+    // (`import CameraManager from './ExpoCameraManager'`) went to `CameraView`'s
+    // own static `isAvailableAsync` — the method making the call.
+    // Ruling the caller's file out may reject a guess; it must never
+    // manufacture one — the one method left is then no likelier than before.
+    let narrowed = false;
+    if (JS_FAMILY.has(ref.language) && isImportBinding(objectOrClass!, ref, context)) {
+      const kept = targetMethods.filter((m) => m.filePath !== ref.filePath);
+      narrowed = kept.length !== targetMethods.length;
+      targetMethods = kept;
+    }
+    // Ruling these out must not leave a lone other `destroy` to guess at.
+    {
+      const kept = targetMethods.filter((m) => !(DISPATCHED_ACTIONS.has(m.name) &&
+        DISPATCHED_OWNER.test(m.qualifiedName.slice(0, Math.max(0, m.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop()!)) &&
+        !isKotlinNumberBitwise(m, ref));
+      narrowed ||= kept.length !== targetMethods.length;
+      targetMethods = kept;
+    }
+    // Production code never calls into a test suite: a guess from
+    // rest_framework/renderers.py's `view.reverse_action(…)` is not a test's
+    // `DummyView`. The test's methods were never in the running.
+    if (!isTestPath(ref.filePath)) targetMethods = targetMethods.filter((m) => !isTestPath(m.filePath));
+    // A Vue component's own method is reached as `this.m()` inside it —
+    // never as `e.preventDefault()` on an event, nor `this.editor.setValue()`
+    // on something the component holds. A template ref
+    // (`this.$refs.form.validate()`) names a child this cannot tell apart.
+    if (JS_FAMILY.has(ref.language)) {
+      const kept = targetMethods.filter((m) => !isVueComponentMethod(m) || (objectOrClass === 'this' && m.filePath === ref.filePath));
+      narrowed ||= kept.length !== targetMethods.length;
+      targetMethods = kept;
     }
 
-    if (isUnevidencedLibraryCall(targetMethods, objectOrClass!, methodName!, ref)) return null;
-
-    // If only one same-language method with this name exists, use it
-    if (targetMethods.length === 1 && targetMethods[0]!.language === ref.language) {
+    // If only one same-language method with this name exists, use it —
+    // except in Ruby, where nothing types a receiver: there the one method
+    // must also belong to something the receiver is named after
+    // (`web_push_request.legacy_encrypt` → WebPushRequest). rubocop's
+    // `node.loc` on a rubocop-ast node went to the one `loc` in the project
+    // 1,201 times; lobsters' `value.to_s` to a short-id class's.
+    if (targetMethods.length === 1 && !narrowed && targetMethods[0]!.language === ref.language &&
+        !((ref.language === 'lua' || ref.language === 'luau') && isLuaLibraryCall(objectOrClass!, methodName!, ref, targetMethods[0]!)) &&
+        // Rust / Go / Kotlin / C# / Python / Scala / Java: a standard-library
+        // method name on an untyped receiver (`sym.map(…)`,
+        // `w.Header().Get(…)`, `reader.Value.ToString()`,
+        // `options.setdefault(…)`) is the library type's.
+        !(stdMethodNames(ref.language)?.has(methodName!) &&
+          !/^(?:self|Self|this|base|cls)$/.test(objectOrClass!) && !sharesReceiverWord(receiverLink(objectOrClass!), targetMethods[0]!)) &&
+        !(UNTYPED_RECEIVER_LANGUAGES.has(ref.language) && !/^(?:self|self\.class|this|super|weak_?self|strong_?self)$/i.test(objectOrClass!) &&
+          !sharesReceiverWord(objectOrClass!, targetMethods[0]!) &&
+          !(ref.language === 'objc' && objcReceiverReaches(objectOrClass!, targetMethods[0]!, context)) &&
+          !(ref.language === 'php' && phpReceiverReaches(objectOrClass!, targetMethods[0]!, context)))) {
       if (isForeignReceiverSelfLoop(targetMethods[0]!, objectOrClass!, ref, context)) return null;
       return {
         original: ref,
@@ -5416,18 +8172,34 @@ export function matchMethodCall(
 
     // Multiple methods: score by receiver name word overlap with class name
     if (targetMethods.length > 1) {
-      const receiverWords = splitCamelCase(objectOrClass!);
+      // What the receiver is named after is its last link: `builder.tokeniser`
+      // is a Tokeniser, `table.Columns` no kind of table.
+      const receiverWords = splitCamelCase(receiverLink(objectOrClass!));
+      const head = receiverWords[receiverWords.length - 1]?.toLowerCase();
       let bestMatch: typeof targetMethods[0] | undefined;
       let bestScore = 0;
 
       // Same-file candidates first, so a score tie (`score > bestScore` keeps
       // the first seen) resolves to the call site's own file rather than the
       // first-indexed duplicate (#1079).
+      const std = stdMethodNames(ref.language)?.has(methodName!) && !/^(?:self|Self|this|base|cls)$/.test(objectOrClass!);
       for (const method of preferCallSiteFile(targetMethods, ref.filePath)) {
-        const classWords = splitCamelCase(method.qualifiedName);
+        if (std && !sharesReceiverWord(receiverLink(objectOrClass!), method)) continue;
+        // The owner type's own name — not its namespace (`eShop.ClientApp…`
+        // shares `Client` with every `httpClient`) nor the method's.
+        const cut = method.qualifiedName.lastIndexOf('::');
+        const classWords = cut > 0 ? splitCamelCase(method.qualifiedName.slice(0, cut).split(/::|\./).pop()!) : [];
         let score = receiverWords.filter(w =>
           classWords.some(cw => cw.toLowerCase() === w.toLowerCase())
         ).length;
+        // A test double is only what a test constructs or names — never a
+        // guess from `response.json()` (mealie's `_FakeHTTPResponse`) in a
+        // file that never mentions it.
+        if (TEST_DOUBLE_OWNER.test(classWords.join(' ')) && !receiverWords.some((w) => TEST_DOUBLE_OWNER.test(w)) &&
+            !(context.readFile(ref.filePath) ?? '').includes(method.qualifiedName.slice(0, cut).split(/::|\./).pop()!)) continue;
+        // The receiver's head noun naming the owner's: `bookPage` is a Page
+        // before it is anything of a Book's.
+        if (head !== undefined && head === classWords[classWords.length - 1]?.toLowerCase()) score += 1;
         // Bonus for same language
         if (method.language === ref.language) score += 1;
         if (score > bestScore) {
@@ -5454,6 +8226,41 @@ export function matchMethodCall(
   return null;
 }
 
+/**
+ * Is a member call's receiver (`z` in `z.string`, `ns` in `ns.util.fn`) an
+ * import binding that is a module namespace, or one from outside the repo?
+ */
+function isImportedModuleReceiver(receiver: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const root = receiver.split('.')[0]!;
+  const binding = context.getImportMappings?.(ref.filePath, ref.language)?.find((m) => m.localName === root);
+  if (!binding) return false;
+  return binding.isNamespace || context.isOutOfRepoImport?.(binding.source, ref.filePath, ref.language) === true;
+}
+
+/** A method a Vue Options API component declares for itself (`index::handleLogin` in `index.vue`). */
+function isVueComponentMethod(n: Node): boolean {
+  return n.kind === 'method' && n.filePath.endsWith('.vue') && n.qualifiedName === `${path.posix.basename(n.filePath, '.vue')}::${n.name}`;
+}
+
+/** Is `ref` written as `this.<name>(` in the file that declares `n`? */
+function isThisCallInOwnFile(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (n.filePath !== ref.filePath) return false;
+  const line = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1] ?? '';
+  return new RegExp(String.raw`\bthis\s*\??\.\s*${n.name.replace(/\$/g, '\\$')}\s*\(`).test(line);
+}
+
+/** Is the root of a member call's receiver (`CameraManager` in `CameraManager.x`) one of the file's imports? */
+function isImportBinding(receiver: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const root = receiver.split('.')[0]!;
+  return context.getImportMappings?.(ref.filePath, ref.language)?.some((m) => m.localName === root) === true;
+}
+
+/** Does the file bind `name` by importing it from outside the repository? */
+function isOutOfRepoBinding(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const binding = context.getImportMappings?.(ref.filePath, ref.language)?.find((m) => m.localName === name);
+  return !!binding && context.isOutOfRepoImport?.(binding.source, ref.filePath, ref.language) === true;
+}
+
 /** Go standard-library package names a `pkg.Func` reference is skipped for. */
 export const GO_STDLIB_PACKAGES = new Set([
   'fmt', 'os', 'io', 'net', 'http', 'log', 'math', 'sort', 'sync',
@@ -5468,6 +8275,17 @@ export const GO_STDLIB_PACKAGES = new Set([
   // Kubernetes-common stdlib aliases
   'utilruntime', 'utilwait', 'utilnet',
 ]);
+
+/**
+ * A constructor node of another language: a method named like its owner
+ * (`pkg::Outer::Inner::Inner`), which is how the Java/Kotlin extractors record
+ * an explicit constructor.
+ */
+function isOtherLanguageConstructor(node: Node, language: string): boolean {
+  if (node.language === language) return false;
+  const segs = node.qualifiedName.split('::');
+  return segs.length >= 2 && segs[segs.length - 1] === segs[segs.length - 2];
+}
 
 /** Receivers that name the current object (or its own class/base) — a call
  * through one of these may genuinely recurse into the enclosing method. */
@@ -5499,17 +8317,6 @@ function isForeignReceiverSelfLoop(
     if (goRecv && goRecv[1] === receiver) return false;
   }
   return true;
-}
-
-/**
- * A constructor node of another language: a method named like its owner
- * (`pkg::Outer::Inner::Inner`), which is how the Java/Kotlin extractors record
- * an explicit constructor.
- */
-function isOtherLanguageConstructor(node: Node, language: string): boolean {
-  if (node.language === language) return false;
-  const segs = node.qualifiedName.split('::');
-  return segs.length >= 2 && segs[segs.length - 1] === segs[segs.length - 2];
 }
 
 /** Go builtin/primitive field types that can never carry a project method. */
@@ -6290,15 +9097,28 @@ export function newReceiverClass(ref: UnresolvedRef, context: ResolutionContext)
 
 /**
  * Resolve a {@link NEW_RECEIVER_SHAPE} call on the constructed class or one of
- * its supertypes (validated by resolveMethodOnType), or not at all: a class
- * with no project declaration — `new URL(u).toString()` — has no project
- * method to bind to.
+ * its supertypes (validated by resolveMethodOnType), or on a function assigned
+ * onto an ES5 constructor function's prototype in its file, or not at all: a
+ * class with no project declaration — `new URL(u).toString()` — has no
+ * project method to bind to.
  */
 export function matchNewReceiverCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   const cls = newReceiverClass(ref, context);
   const method = ref.referenceName.match(NEW_RECEIVER_SHAPE)?.[2];
   if (!cls || !method) return null;
-  return resolveMethodOnType(cls, method, ref, context, 0.9, 'instance-method');
+  const onClass = resolveMethodOnType(cls, method, ref, context, 0.9, 'instance-method');
+  if (onClass) return onClass;
+  // An ES5 constructor function (`function Params() {}`) keeps its methods as
+  // functions assigned onto its prototype in its own file
+  // (`prototype.render = function render() {…}`).
+  const ctors = context.getNodesByName(cls).filter((n) => n.kind === 'function' && sameLanguageFamily(n.language, ref.language));
+  if (ctors.length !== 1) return null;
+  const lines = context.getFileLines?.(ctors[0]!.filePath) ?? context.readFile(ctors[0]!.filePath)?.split(/\r?\n/);
+  const onProto = context.getNodesInFile(ctors[0]!.filePath).filter((n) =>
+    n.name === method && (n.kind === 'function' || n.kind === 'method') && /\bprototype\b/.test(lines?.[n.startLine - 1] ?? ''));
+  return onProto.length === 1
+    ? { original: ref, targetNodeId: onProto[0]!.id, confidence: 0.8, resolvedBy: 'instance-method' }
+    : null;
 }
 
 /** Resolve the implementation inside the identified store, not a namesake or
@@ -6395,6 +9215,72 @@ function matchDestructuredStoreCall(ref: UnresolvedRef, context: ResolutionConte
   return null;
 }
 
+/**
+ * A bare call through a name destructured from a call's result — a composable
+ * or custom hook, `const { getDefaultActivityRoute } = useDefaultActivity()`
+ * (mealie), `const { login } = useAuth()` — is the function the callee returns
+ * under that key: one declared in the callee's own body, else a top-level one
+ * of the callee's module (returned as `{ getDefaultActivityRoute, … }`). The
+ * callee is resolved through the file's imports (or found in the same file),
+ * and its source must return the key; a later declaration of the name at the
+ * call's scope shadows the binding. The local binding otherwise ruled out
+ * every cross-file candidate, so the call resolved to nothing.
+ */
+function matchDestructuredCallResult(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const source = context.readFile(ref.filePath);
+  if (!source || !/\b(?:const|let|var)\s*\{/.test(source)) return null;
+  const name = ref.referenceName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const lines = source.split('\n');
+  const before = lines.slice(0, ref.line - 1).concat(lines[ref.line - 1]?.slice(0, ref.column) ?? '').join('\n');
+  const code = blankStringContents(stripCommentsForRegex(before, 'typescript'));
+  const binding = /\b(?:const|let|var)\s*\{([^{}]*)\}\s*=\s*(?:await\s+)?([A-Za-z_$][\w$]*)\s*(?:<[^<>()]*>)?\s*\(/g;
+  const stackAt = (end: number): number[] => {
+    const stack: number[] = [];
+    for (let i = 0; i < end; i++) {
+      if (code[i] === '{') stack.push(i);
+      else if (code[i] === '}') stack.pop();
+    }
+    return stack;
+  };
+  const callScope = stackAt(code.length);
+  for (const m of [...code.matchAll(binding)].reverse()) {
+    let key: string | null = null;
+    for (const part of m[1]!.split(',')) {
+      const [k, v] = part.split(':').map((x) => x.trim().replace(/\s*=.*$/, ''));
+      if ((v ?? k) === ref.referenceName && /^[A-Za-z_$][\w$]*$/.test(k ?? '')) key = k!;
+    }
+    if (!key) continue;
+    if (!stackAt(m.index!).every((pos, i) => callScope[i] === pos)) continue;
+    const rest = code.slice(m.index! + m[0].length);
+    if (new RegExp(`\\b(?:const|let|var|function|class)\\s+(?:${name}\\b|\\{[^}]*\\b${name}\\b)`).test(rest)) return null;
+    const calleeName = m[2]!;
+    const imported = context.resolveImport?.({ ...ref, referenceName: calleeName, referenceKind: 'calls' });
+    // Through the import; else the same file's; else the one function of that
+    // name in the project (an alias the import resolver can't follow, like
+    // Nuxt's `~/composables/…`) — the returned key is checked below either way.
+    const holders = context.getNodesByName(calleeName).filter((n) =>
+      (n.kind === 'function' || n.kind === 'constant' || n.kind === 'variable') && sameLanguageFamily(n.language, ref.language));
+    const callee = (imported && context.getNodeById?.(imported.targetNodeId)) ??
+      holders.find((n) => n.filePath === ref.filePath) ??
+      (holders.length === 1 ? holders[0] : undefined);
+    if (!callee || !sameLanguageFamily(callee.language, ref.language)) return null;
+    const calleeText = (context.getFileLines?.(callee.filePath) ?? context.readFile(callee.filePath)?.split('\n') ?? [])
+      .slice(callee.startLine - 1, callee.endLine).join('\n');
+    if (!new RegExp(`\\breturn\\s*\\{[^]*?\\b${key}\\b`).test(calleeText)) return null;
+    const callable = (n: Node) => n.kind === 'function' || n.kind === 'method' || n.kind === 'constant' || n.kind === 'variable';
+    const inFile = context.getNodesInFile(callee.filePath);
+    const inner = inFile.filter((n) => n.name === key && callable(n) && n.id !== callee.id && rangeWithin(n, callee) &&
+      !inFile.some((f) => f.id !== callee.id && f.id !== n.id && (f.kind === 'function' || f.kind === 'method') &&
+        rangeWithin(f, callee) && rangeWithin(n, f) && !sameRange(f, n)));
+    const top = inner.length > 0 ? inner : inFile.filter((n) => n.name === key && callable(n) && !n.qualifiedName.includes('::') &&
+      !inFile.some((f) => (f.kind === 'function' || f.kind === 'method') && f.id !== n.id && rangeWithin(n, f) && !sameRange(f, n)));
+    const target = top.sort((a, b) => Number(b.kind === 'function') - Number(a.kind === 'function'))[0];
+    if (!target) return null;
+    return { original: ref, targetNodeId: target.id, confidence: 0.85, resolvedBy: 'instance-method' };
+  }
+  return null;
+}
+
 /** Bound action names need not have a same-named definition (selectors may
  * rename them). The resolver's symbol-existence prefilter must allow them. */
 export function matchJsStoreBindingCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
@@ -6403,9 +9289,11 @@ export function matchJsStoreBindingCall(ref: UnresolvedRef, context: ResolutionC
 }
 
 /** A qualified untyped chain is useful source evidence, not permission to
- * infer a property type. Framework resolution runs before this guard. */
+ * infer a property type. Framework resolution runs before this guard. Vue,
+ * Svelte and Astro files keep resolving them: there `api.groupReports.getAll()`
+ * reaches its API client class far more often than a wrong namesake. */
 export function isUnresolvedJsMemberCall(ref: UnresolvedRef): boolean {
-  return ref.referenceKind === 'calls' && JS_FAMILY.has(ref.language) &&
+  return ref.referenceKind === 'calls' && JS_TS.has(ref.language) &&
     !/^(?:this|window)\./.test(ref.referenceName) &&
     /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*){2,}$/.test(ref.referenceName);
 }
@@ -6497,6 +9385,75 @@ function hasParameterBinding(code: string, escapedName: string): boolean {
 /**
  * Split a camelCase or PascalCase string into words.
  */
+/**
+ * Whether a receiver written as `Name` is a type in `language`'s conventions.
+ * Not in Go (an exported package variable is `FormPost`), nor C / C++ / Rust
+ * (their type paths use `::`); in Pascal every identifier is capitalized, so
+ * only Delphi's type prefixes (`TFoo`, `EFoo`, `IFoo`) and `Exception` count —
+ * `AWebRequest` / `LRequest` are a parameter and a local.
+ */
+function namesExternalType(receiver: string, language: string): boolean {
+  if (!/^[A-Z][A-Za-z0-9_]*$/.test(receiver)) return false;
+  if (language === 'pascal') return /^(?:[TEI][A-Z]\w*|Exception)$/.test(receiver);
+  // Rust: `Vec::new()`, `String::from(…)`, `Default::default()` — but `Self::` is the impl's own type,
+  // and a SCREAMING_CASE receiver (`REQ_ID.scope(…)`) a static.
+  if (language === 'rust') return receiver !== 'Self' && /[a-z]/.test(receiver);
+  return !['go', 'c', 'cpp', 'cuda', 'metal'].includes(language);
+}
+
+/**
+ * Languages whose receivers nothing types, where a unique method name alone
+ * is no evidence: CFML's `server.keyExists()` is the struct member function,
+ * not the one component method named `keyExists`; Objective-C's
+ * `image.respondsToSelector:` is NSObject's, not a proxy class's override;
+ * PHP's `$request->has()` is the framework request's, not a settings
+ * service's.
+ */
+const UNTYPED_RECEIVER_LANGUAGES: ReadonlySet<string> = new Set(['ruby', 'cfml', 'cfscript', 'objc', 'php']);
+
+/**
+ * Lua's standard and host libraries: a call through one of these tables is
+ * the library's, never the one project method that shares its name (busted's
+ * `assert.truthy` went to a condition helper 987 times, `string.find` to a
+ * picker's `find`, Neovim's `vim.split` to a build module's).
+ */
+const LUA_LIBRARY_TABLES: ReadonlySet<string> = new Set([
+  'string', 'table', 'math', 'io', 'os', 'coroutine', 'debug', 'utf8', 'package', 'bit', 'bit32', 'jit', 'ffi',
+  'vim', 'ngx', 'assert', 'spy', 'stub', 'mock', 'love',
+]);
+/** Lua string methods, reached with `s:find(…)` on any string. */
+const LUA_STRING_METHODS: ReadonlySet<string> = new Set([
+  'find', 'match', 'gmatch', 'gsub', 'sub', 'format', 'upper', 'lower', 'len', 'rep', 'byte', 'reverse',
+]);
+
+/**
+ * Whether a Lua call is a library's rather than `candidate`: through a library
+ * table the project doesn't patch itself (kong's globalpatches do define
+ * `ngx.sleep`), or a string method on a value.
+ */
+function isLuaLibraryCall(receiver: string, method: string, ref: UnresolvedRef, candidate: Node): boolean {
+  const root = receiver.split(/[.:]/)[0]!;
+  if (LUA_LIBRARY_TABLES.has(root)) return candidate.qualifiedName.split(/::|\./)[0] !== root;
+  return LUA_STRING_METHODS.has(method) && ref.referenceName.endsWith(`:${method}`);
+}
+
+/**
+ * Whether a receiver is named after the owner of `method`, case aside: the
+ * receiver's last segment is the owner's name (`cbsecurity` → CBSecurity), or
+ * they share a word of three letters or more (`web_push_request` →
+ * WebPushRequest, `executor1` → Executor, `decodedImage` → UIImage).
+ */
+function sharesReceiverWord(receiver: string, method: Node): boolean {
+  const cut = method.qualifiedName.lastIndexOf('::');
+  if (cut < 0) return false;
+  const ownerQn = method.qualifiedName.slice(0, cut);
+  const flat = (w: string) => w.replace(/[^A-Za-z0-9]/g, '').replace(/\d+$/, '').toLowerCase();
+  if (flat(receiver.split('.').pop()!) === flat(ownerQn.split(/::|\./).pop()!)) return true;
+  // Two-letter words are class prefixes (`SD`, `NS`, `UI`), not names.
+  const owner = new Set(splitCamelCase(ownerQn).map(flat).filter((w) => w.length > 2));
+  return splitCamelCase(receiver).some((w) => owner.has(flat(w)));
+}
+
 function splitCamelCase(str: string): string[] {
   return str.replace(/([a-z])([A-Z])/g, '$1 $2')
     .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
@@ -6745,20 +9702,70 @@ export function matchFuzzy(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  if (isBoundToBareImport(ref, context)) return null;
   const lowerName = ref.referenceName.toLowerCase();
 
   // Use pre-built lowercase index for O(1) lookup instead of scanning all nodes
   const candidates = context.getNodesByLowerName(lowerName);
 
-  // Calls use callable kinds; inheritance is a type reference and must never
-  // fall through to a same-named method/function (HIGH-1).
-  const eligibleCandidates = isInheritanceRef(ref)
-    ? candidates.filter(isSupertypeTarget)
-    : candidates.filter((n) => n.kind === 'function' || n.kind === 'method' || n.kind === 'class');
-  const callableCandidates = eligibleCandidates.filter((n) =>
-    (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
-    sameLanguageFamily(n.language, ref.language));
+  // Filter to callable kinds only (function, method, class)
+  const callableKinds = new Set(['function', 'method', 'class']);
+  const typeRef = isDotNetTypeRef(ref, context);
+  const rustBare = ref.language === 'rust' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
+  const pythonShape = pythonCallShape(ref, context);
+  const javaBare = ref.language === 'java' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
+  const dartBare = ref.language === 'dart' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) && isReceiverLessDartCall(ref, context);
+  const kotlinCall = ref.language === 'kotlin' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
+  const kotlinBare = kotlinCall && isReceiverLessKotlinCall(ref, context);
+  const rubyBare = ref.language === 'ruby' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*[?!]?$/.test(ref.referenceName);
+  const cfmlBare = (ref.language === 'cfml' || ref.language === 'cfscript') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
+  const vbReceiver = ref.language === 'vbnet' && (ref.referenceKind === 'calls' || ref.referenceKind === 'instantiates') && /^\w+$/.test(ref.referenceName)
+    ? vbReceiverOf(ref, context) : null;
+  const objcShape = ref.language === 'objc' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*:*(?:\w+:)*$/.test(ref.referenceName)
+    ? objcCallShape(ref, context) : null;
+  const csharpBare = ref.language === 'csharp' && (ref.referenceKind === 'calls' || ref.referenceKind === 'references') && /^[A-Za-z_]\w*$/.test(ref.referenceName);
+  const scalaBare = ref.language === 'scala' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
+  const rustGoShape = (ref.language === 'rust' || ref.language === 'go') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)
+    ? rustGoCallShape(ref, context) : null;
+  const kotlinStdChain = ref.language === 'kotlin' && ref.referenceKind === 'calls' && KOTLIN_STD_METHODS.has(ref.referenceName)
+    ? kotlinChainReceiver(ref, context) : null;
+  const swiftShape = ref.language === 'swift' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)
+    ? swiftCallShape(ref, context) : null;
+  const phpSelf = phpSelfReceiver(ref, context);
+  // Names are case-sensitive in every language but a handful: Rust's
+  // `Bytes` is not the method `bytes`, Python's builtin `dir(…)` not a class
+  // `Dir`, halo's `type RsbuildConfig` not its local `rsbuildConfig`, a Java
+  // `Node` not a `node()`. Only PHP, Pascal/Delphi, CFML, COBOL and VB.NET
+  // resolve a name without regard to case, which is what this fallback's
+  // lowercase index is for.
+  const bareR = isBareRCall(ref, context);
+  const solidityBare = isReceiverLessSolidityCall(ref, context);
+  const callableCandidates = candidates.filter((n) => callableKinds.has(n.kind) && !(typeRef && !canNameInTypePosition(n)) &&
+    !(bareR && n.kind === 'method') &&
+    !(solidityBare && !isSolidityMemberInScope(n, ref, context)) &&
+    // `new …MockData()` makes an instance of a type; a method is never what it names.
+    !(ref.referenceKind === 'instantiates' && n.kind === 'method') &&
+    !(rustBare && !isRustNameInScope(n, ref, context)) &&
+    !(!CASE_INSENSITIVE_LANGUAGES.has(ref.language) && n.name !== ref.referenceName) &&
+    !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
+    !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)) &&
+    !(dartBare && isDartMember(n) && !isDartMethodInScope(n, ref, context)) &&
+    !(kotlinCall && !isKotlinTopLevelVisible(n, ref, context)) &&
+    !(kotlinBare && !isKotlinMemberReachable(n, ref, context)) &&
+    !isKotlinNumberBitwise(n, ref) &&
+    !(rubyBare && n.kind === 'method' && !isRubyMethodInScope(n, ref, context)) &&
+    !(cfmlBare && n.kind === 'method' && !isCfmlMethodInScope(n, ref, context)) &&
+    !(vbReceiver !== null && !isVbMemberReachable(n, vbReceiver)) &&
+    !(objcShape === 'c-call' && OBJC_MEMBER_KINDS.has(n.kind)) &&
+    !(objcShape === 'self-send' && !isObjcSelfSendTarget(n, ref, context)) &&
+    !(objcShape === 'super-send' && !isObjcSelfSendTarget(n, ref, context, true)) &&
+    !(csharpBare && !isCsharpMemberInScope(n, ref, context)) &&
+    !(scalaBare && !isScalaMemberInScope(n, ref, context)) &&
+    !(rustGoShape && !isRustGoCallTarget(n, rustGoShape)) &&
+    !(kotlinStdChain !== null && !isKotlinStdChainTarget(n, kotlinStdChain)) &&
+    !(swiftShape && !isSwiftCallTarget(n, swiftShape, ref, context)) &&
+    !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))))
+    .filter((n) => (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
+      sameLanguageFamily(n.language, ref.language));
 
   // Prefer same-language matches
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);
@@ -6783,11 +9790,14 @@ export function matchFuzzy(
     finalCandidates.length === 1 &&
     isVisibleAcrossFiles(finalCandidates[0]!, ref, context) &&
     isCrossFileReachable(finalCandidates[0]!, ref, context) &&
-    !isUnevidencedBareLibraryCall(finalCandidates[0]!, ref, context) &&
     !(isBareJsCall(ref, context) &&
-      (finalCandidates[0]!.kind === 'method' ||
+      (TYPE_MEMBER_KINDS.has(finalCandidates[0]!.kind) ||
         (finalCandidates[0]!.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))) &&
+    !(JS_FAMILY.has(ref.language) && isOutOfRepoBinding(ref.referenceName, ref, context)) &&
     !(finalCandidates[0]!.kind === 'method' && isBareGoCall(ref, context)) &&
+    // A bare PHP call is a function call (case-insensitive, so fuzzy may find
+    // one) — never the class `View` for `view(…)`, never a method.
+    !(finalCandidates[0]!.kind !== 'function' && isBarePhpCall(ref, context)) &&
     isLexicallyReachable(finalCandidates[0]!, ref, context)
   ) {
     const isCrossLanguage = finalCandidates[0]!.language !== ref.language;
@@ -6929,6 +9939,12 @@ function matchReferenceInner(
     };
   }
 
+  // A bare Lua call through a `local` alias reaches what the alias names.
+  if ((ref.language === 'lua' || ref.language === 'luau') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)) {
+    const aliased = luaAliasTarget(ref, context);
+    if (aliased !== undefined) return aliased;
+  }
+
   // Erlang `-behaviour(m)` refs target a MODULE. Letting them fall through to
   // bare-name matching grabs any same-named symbol — on emqx,
   // `-behaviour(supervisor)` resolved to a `-define(supervisor, …)` macro
@@ -6958,10 +9974,11 @@ function matchReferenceInner(
   // Erlang call/fun refs carry the call-site arity (`f/1` — #1610) because
   // arity is part of the function's identity and every erlang function's
   // qualifiedName carries it (`mod::f/1`). Resolve ONLY to a definition of
-  // that exact arity in the call site's own module. Explicit `-import`s are
-  // handled by resolveViaImport before this matcher. A bare call can otherwise
-  // only be a local function or an auto-imported BIF, so it must never fall
-  // through to a same-named function in another module.
+  // that exact arity: the call site's own file first (a local call targets its
+  // own module by language semantics; `-import`ed functions ride the
+  // cross-file branch), and when no definition of that arity exists anywhere,
+  // resolve to NOTHING rather than a sibling arity — the real target may be
+  // macro-generated or out of repo, and a wrong-arity edge is worse than none.
   if (
     ref.language === 'erlang' &&
     !ref.referenceName.includes('::') &&
@@ -6971,23 +9988,56 @@ function matchReferenceInner(
     if (am) {
       // endsWith is length-anchored, so `/1` cannot match `…/11`.
       const arityTail = `/${am[2]}`;
-      const sameFile = context
-        .getNodesInFile(ref.filePath)
-        .find(
+      const candidates = context
+        .getNodesByName(am[1]!)
+        .filter(
           (n) =>
-            n.language === 'erlang' &&
-            n.kind === 'function' &&
-            n.name === am[1] &&
-            n.qualifiedName.endsWith(arityTail),
+            n.language === 'erlang' && n.kind === 'function' && n.qualifiedName.endsWith(arityTail),
         );
-      if (sameFile) {
-        return { original: ref, targetNodeId: sameFile.id, confidence: 0.95, resolvedBy: 'exact-match' };
+      if (candidates.length > 0) {
+        const sameFile = candidates.find((n) => n.filePath === ref.filePath);
+        if (sameFile) {
+          return { original: ref, targetNodeId: sameFile.id, confidence: 0.95, resolvedBy: 'exact-match' };
+        }
+        // Another module's function is called bare only through `-import(Mod,
+        // [f/N])` (or from a `.hrl` a module includes): cowboy's
+        // `-import(req_SUITE, [do_get/3])` went to compress_SUITE's `do_get/3`.
+        const imported = erlangImportedModule(am[1]!, am[2]!, ref, context);
+        if (imported !== undefined) {
+          const chosen = candidates.find((n) => n.qualifiedName.startsWith(`${imported}::`));
+          return chosen ? { original: ref, targetNodeId: chosen.id, confidence: 0.9, resolvedBy: 'exact-match' } : null;
+        }
+        if (!/\.hrl$/.test(ref.filePath)) {
+          const included = candidates.filter((n) => /\.hrl$/.test(n.filePath));
+          if (included.length === 0) return null;
+          candidates.splice(0, candidates.length, ...included);
+        }
+        if (candidates.length === 1) {
+          return { original: ref, targetNodeId: candidates[0]!.id, confidence: 0.8, resolvedBy: 'exact-match' };
+        }
+        const best = findBestMatch(ref, candidates, context);
+        if (best) {
+          const proximity = computePathProximity(ref.filePath, best.filePath);
+          return {
+            original: ref,
+            targetNodeId: best.id,
+            confidence: proximity >= 30 ? 0.7 : 0.4,
+            resolvedBy: 'exact-match',
+          };
+        }
       }
       return null;
     }
   }
 
   if (isUnresolvedJsMemberCall(ref)) return null;
+
+  // A Swift call through a type path (`API.PackageController.GetRoute.query`)
+  // resolves on the type the path names, or not at all: the strategies below
+  // would bind it by the member's name alone.
+  if (ref.language === 'swift' && ref.referenceKind === 'calls' && SWIFT_TYPE_PATH_CALL.test(ref.referenceName)) {
+    return nmTimed('swiftTypePath', ref, () => resolveSwiftTypePathCall(ref, context));
+  }
 
   // Try strategies in order of confidence
   let result: ResolvedRef | null;
@@ -7093,5 +10143,219 @@ function matchReferenceInner(
   result = nmTimed('fuzzy', ref, () => matchFuzzy(ref, context));
   if (result) return result;
 
+  // 5. A C / C++ name qualified by a namespace the project opens with a macro
+  // (`fmt::format` — `FMT_BEGIN_NAMESPACE`), which the index cannot see.
+  if ((ref.language === 'cpp' || ref.language === 'c') && ref.referenceName.includes('::')) {
+    return matchCppMacroNamespaced(ref, context);
+  }
+
   return null;
+}
+
+const SOLIDITY_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+const SOLIDITY_HIERARCHIES = new WeakMap<ResolutionContext, WeakMap<UnresolvedRef, Set<string>>>();
+const SOLIDITY_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'struct', 'module', 'trait']);
+
+/** What a Solidity contract, interface or library inherits: `contract Governor is Context, ERC165(…), IGovernor {`. */
+function soliditySupertypesOf(name: string, context: ResolutionContext): string[] {
+  let memo = SOLIDITY_SUPERS.get(context);
+  if (!memo) SOLIDITY_SUPERS.set(context, (memo = new Map()));
+  const hit = memo.get(name);
+  if (hit) return hit;
+  const supers: string[] = [];
+  for (const decl of context.getNodesByName(name)) {
+    if (decl.language !== 'solidity' || !SOLIDITY_TYPE_KINDS.has(decl.kind)) continue;
+    const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+    let depth = 0;
+    let head = '';
+    for (const ch of lines.slice(decl.startLine - 1, decl.startLine + 10).join(' ').replace(/\/\/[^\n]*|\/\*.*?\*\//g, ' ')) {
+      if (ch === '{' && depth === 0) break;
+      if (ch === '(') depth++;
+      else if (ch === ')') depth = Math.max(0, depth - 1);
+      else if (depth === 0) head += ch;
+    }
+    const clause = /\bis\b([\s\S]*)$/.exec(head)?.[1] ?? '';
+    for (const m of clause.matchAll(/([A-Za-z_]\w*)\s*(?=,|$)/g)) supers.push(m[1]!);
+  }
+  memo.set(name, supers);
+  return supers;
+}
+
+/**
+ * Whether a bare Solidity call can reach method `n`: a function of the
+ * contract around the call or of one it inherits, or a free function.
+ * OpenZeppelin's `_msgSender()` in Governor (a Context) went to
+ * ERC2771Context's override 83 times.
+ */
+function isSolidityMemberInScope(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (n.kind !== 'method' || n.language !== 'solidity') return true;
+  const cut = n.qualifiedName.lastIndexOf('::');
+  if (cut <= 0) return true;
+  const owner = n.qualifiedName.slice(0, cut).split('::').pop()!;
+  let memo = SOLIDITY_HIERARCHIES.get(context);
+  if (!memo) SOLIDITY_HIERARCHIES.set(context, (memo = new WeakMap()));
+  let names = memo.get(ref);
+  if (!names) {
+    names = new Set<string>();
+    const queue = context.getNodesInFile(ref.filePath)
+      .filter((c) => SOLIDITY_TYPE_KINDS.has(c.kind) && c.startLine <= ref.line && c.endLine >= ref.line)
+      .map((c) => c.name);
+    while (queue.length > 0 && names.size < 60) {
+      const name = queue.shift()!;
+      if (names.has(name)) continue;
+      names.add(name);
+      queue.push(...soliditySupertypesOf(name, context));
+    }
+    memo.set(ref, names);
+  }
+  return names.has(owner);
+}
+
+/** Whether a Solidity call is written with no receiver (`_msgSender()`, not `token._msgSender()`). */
+function isReceiverLessSolidityCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'solidity' || ref.referenceKind !== 'calls' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return false;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (!line) return false;
+  const m = new RegExp(`(?<![\\w$])${ref.referenceName}\\s*\\(`).exec(line);
+  return !!m && !/\.\s*$/.test(line.slice(0, m.index));
+}
+
+/** The module an Erlang file `-import`s `name/arity` from, or undefined. */
+function erlangImportedModule(name: string, arity: string, ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  const source = context.readFile(ref.filePath);
+  if (!source || !source.includes('-import')) return undefined;
+  const fn = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const m of source.matchAll(/^-import\(\s*'?([A-Za-z_][\w@]*)'?\s*,\s*\[([^\]]*)\]\s*\)\s*\./gm)) {
+    if (new RegExp(`(?:^|[\\s,])'?${fn}'?\\s*/\\s*${arity}\\b`).test(m[2]!)) return m[1]!;
+  }
+  return undefined;
+}
+
+const CPP_NS_MACROS = new WeakMap<ResolutionContext, { openers: Map<string, string[]>; openerFns: Set<string>; closers: Map<string, number>; aliases: Map<string, string> }>();
+const CPP_NS_FRAMES = new WeakMap<ResolutionContext, Map<string, Array<{ start: number; end: number; path: string[] }>>>();
+/** A closing macro's body: `}` / `} }`, maybe beside a pragma macro (`PYBIND11_WARNING_POP }`). */
+const CPP_CLOSER_BODY = /^(?:[A-Za-z_]\w*\s+)*\}(?:\s*\})*\s*;?$/;
+const CPP_NS_ALIASES = new WeakMap<ResolutionContext, Map<string, string>>();
+
+/** The project's namespace aliases: `namespace py = pybind11;`. */
+function cppNamespaceAliases(context: ResolutionContext): Map<string, string> {
+  const hit = CPP_NS_ALIASES.get(context);
+  if (hit) return hit;
+  const aliases = new Map<string, string>();
+  for (const file of context.getAllFiles()) {
+    if (!/\.(?:h|hh|hpp|hxx|inl|c|cc|cpp|cxx)$/i.test(file)) continue;
+    const source = context.readFile(file);
+    if (!source || !source.includes('namespace')) continue;
+    for (const m of source.matchAll(/^[ \t]*namespace[ \t]+([A-Za-z_]\w*)[ \t]*=[ \t]*(?:::)?([A-Za-z_][\w:]*)[ \t]*;/gm)) {
+      if (!aliases.has(m[1]!)) aliases.set(m[1]!, m[2]!);
+    }
+  }
+  CPP_NS_ALIASES.set(context, aliases);
+  return aliases;
+}
+
+/**
+ * The project's namespace-opening macros — `#define FMT_BEGIN_NAMESPACE
+ * namespace fmt { inline namespace v12 {`, `#define RAPIDJSON_NAMESPACE_BEGIN
+ * namespace RAPIDJSON_NAMESPACE {` (through `#define RAPIDJSON_NAMESPACE
+ * rapidjson`) — as the namespace path each opens (inline namespaces are
+ * transparent), and the closing macros as how many scopes each closes.
+ */
+function cppNamespaceMacros(context: ResolutionContext): { openers: Map<string, string[]>; openerFns: Set<string>; closers: Map<string, number>; aliases: Map<string, string> } {
+  const hit = CPP_NS_MACROS.get(context);
+  if (hit) return hit;
+  const openers = new Map<string, string[]>();
+  // `#define PYBIND11_NAMESPACE_BEGIN(name) namespace name {`, used as `PYBIND11_NAMESPACE_BEGIN(detail)`.
+  const openerFns = new Set<string>();
+  const closers = new Map<string, number>();
+  const aliases = new Map<string, string>();
+  const bodies: Array<[string, string]> = [];
+  for (const file of context.getAllFiles()) {
+    if (!/\.(?:h|hh|hpp|hxx|h\+\+|inl|ipp|tcc)$/i.test(file)) continue;
+    const raw = context.readFile(file);
+    if (!raw || !raw.includes('#') || !raw.includes('define')) continue;
+    const source = stripCommentsForRegex(raw.replace(/\\\r?\n/g, ' '), 'cpp');
+    for (const m of source.matchAll(/^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)(\(\s*([A-Za-z_]\w*)?\s*\))?[ \t]+([^\n]*)$/gm)) {
+      const body = m[4]!.trim();
+      if (m[2] !== undefined) {
+        // (a trailing pragma macro — `PYBIND11_WARNING_PUSH` — rides along)
+        if (m[3] && new RegExp(`^namespace\\s+${m[3]}\\s*\\{[\\w\\s]*$`).test(body)) openerFns.add(m[1]!);
+        else if (CPP_CLOSER_BODY.test(body)) closers.set(m[1]!, (body.match(/\}/g) ?? []).length);
+        continue;
+      }
+      if (/^[A-Za-z_]\w*$/.test(body)) aliases.set(m[1]!, body);
+      else if (CPP_CLOSER_BODY.test(body)) closers.set(m[1]!, (body.match(/\}/g) ?? []).length);
+      // An inline namespace (transparent, and often named by a macro call) is skipped.
+      else if (/^(?:inline\s+namespace\s+[^{}]*\{\s*|namespace\s+[A-Za-z_]\w*\s*\{\s*)+[\w\s]*$/.test(body)) bodies.push([m[1]!, body]);
+    }
+  }
+  for (const [name, body] of bodies) {
+    if (openers.has(name)) continue;
+    const path = [...body.replace(/inline\s+namespace\s+[^{}]*\{/g, '').matchAll(/namespace\s+([A-Za-z_]\w*)/g)]
+      .map((m) => aliases.get(m[1]!) ?? m[1]!);
+    if (path.length > 0) openers.set(name, path);
+  }
+  const macros = { openers, openerFns, closers, aliases };
+  CPP_NS_MACROS.set(context, macros);
+  return macros;
+}
+
+/** The line ranges of a C / C++ file each namespace macro opens, with the namespace path it opens. */
+function cppMacroNamespaceFrames(file: string, context: ResolutionContext): Array<{ start: number; end: number; path: string[] }> {
+  let memo = CPP_NS_FRAMES.get(context);
+  if (!memo) {
+    memo = new Map();
+    CPP_NS_FRAMES.set(context, memo);
+  }
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const frames: Array<{ start: number; end: number; path: string[] }> = [];
+  const { openers, openerFns, closers, aliases } = cppNamespaceMacros(context);
+  if (openers.size > 0 || openerFns.size > 0) {
+    const lines = context.getFileLines?.(file) ?? context.readFile(file)?.split(/\r?\n/) ?? [];
+    const open: Array<{ start: number; path: string[] }> = [];
+    lines.forEach((text, i) => {
+      const m = /^[ \t]*([A-Z_][A-Z0-9_]*)(?:\(\s*([A-Za-z_]\w*)?\s*\))?[ \t]*;?[ \t]*(?:\/\/.*|\/\*.*\*\/[ \t]*)?\r?$/.exec(text);
+      const token = m?.[1];
+      if (!token) return;
+      const arg = m[2];
+      const path = arg !== undefined && openerFns.has(token) ? [aliases.get(arg) ?? arg] : arg === undefined ? openers.get(token) : undefined;
+      if (path) open.push({ start: i + 1, path });
+      else if (closers.has(token) && open.length > 0) frames.push({ ...open.pop()!, end: i + 1 });
+    });
+    for (const frame of open) frames.push({ ...frame, end: lines.length });
+  }
+  memo.set(file, frames);
+  return frames;
+}
+
+/**
+ * Resolve `fmt::format` / `fmt::detail::to_unsigned` to the declaration a
+ * namespace macro puts there: a node named `format` (qualified `format` or
+ * `detail::to_unsigned` in the index, which cannot see the macro) inside a
+ * `FMT_BEGIN_NAMESPACE` … `FMT_END_NAMESPACE` range. On fmt, 1,728
+ * `fmt::format(…)` calls resolved to nothing.
+ */
+function matchCppMacroNamespaced(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  let target = ref.referenceName.replace(/^::/, '');
+  const head = target.slice(0, target.indexOf('::'));
+  const alias = cppNamespaceAliases(context).get(head);
+  // `py::str` under `namespace py = pybind11;` is `pybind11::str`.
+  if (alias) target = alias + target.slice(head.length);
+  const name = target.slice(target.lastIndexOf('::') + 2);
+  if (!/^[A-Za-z_~]\w*$/.test(name)) return null;
+  let best: Node | null = null;
+  for (const n of context.getNodesByName(name)) {
+    if (n.language !== 'cpp' && n.language !== 'c') continue;
+    if (!['function', 'method', 'class', 'struct', 'enum', 'type_alias', 'union', 'variable', 'constant'].includes(n.kind)) continue;
+    const prefix = cppMacroNamespaceFrames(n.filePath, context)
+      .filter((f) => f.start <= n.startLine && f.end >= n.startLine)
+      .sort((a, b) => a.start - b.start)
+      .flatMap((f) => f.path);
+    const effective = prefix.length > 0 ? `${prefix.join('::')}::${n.qualifiedName}` : alias ? n.qualifiedName : '';
+    if (effective !== target) continue;
+    // One of an overload set is as good as another; a declaration outside the tests over one in them.
+    if (!best || (isTestPath(best.filePath) && !isTestPath(n.filePath))) best = n;
+  }
+  return best ? { original: ref, targetNodeId: best.id, confidence: 0.8, resolvedBy: 'qualified-name' } : null;
 }

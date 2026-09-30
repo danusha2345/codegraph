@@ -272,10 +272,6 @@ class Holder<T extends Hook> {
     expect(callees('Controller', 'cookie')).toEqual(['p::Http::Cookie::value']);
   });
 
-  it('a static call on an imported library class gets no edge', () => {
-    expect(callees('Screen', 'staticLibrary')).toEqual([]);
-  });
-
   it('a type-parameter receiver is not treated as a library type', () => {
     expect(callees('Holder', 'go')).toEqual(['p::Hook::fire']);
   });

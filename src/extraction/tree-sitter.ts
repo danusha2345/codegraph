@@ -402,17 +402,19 @@ const LITERAL_RECEIVER_TYPES = new Set([
   'dictionary', 'dict_literal', 'object', 'tuple', 'set',
 ]);
 
+/** A Kotlin receiver chain the resolver can type: `a.b`, `this.a`, up to four segments. */
+const KOTLIN_RECEIVER_CHAIN = /^(?:this|[A-Za-z_]\w*)(?:\.[A-Za-z_]\w*){1,3}$/;
 /**
  * Languages whose member calls go through the TS/JS grammars.
  */
-/** A Kotlin receiver chain the resolver can type: `a.b`, `this.a`, up to four segments. */
-const KOTLIN_RECEIVER_CHAIN = /^(?:this|[A-Za-z_]\w*)(?:\.[A-Za-z_]\w*){1,3}$/;
 const TS_JS_CHAIN_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx']);
 
 /** Receiver node types (TS/JS grammars) that continue a member chain downward. */
 const TS_JS_CHAIN_RECEIVER_TYPES = new Set(['member_expression', 'subscript_expression']);
 /** The field of a `this.<field>.<method>()` receiver: public or ES private (#1496, #1987). */
 const THIS_FIELD_PROPERTY_TYPES = new Set(['property_identifier', 'private_property_identifier']);
+/** A Swift receiver that is a path of types, `API.PackageController.GetRoute` — two segments or more, each capitalized. */
+const SWIFT_TYPE_PATH_RECEIVER = /^(?!Self\.)[A-Z]\w*(?:\.[A-Z]\w*)+$/;
 
 /**
  * Identifier-rooted member chains have no inferred property type (#1566),
@@ -545,7 +547,6 @@ export class TreeSitterExtractor {
   // point (this instance is the wasm fallback for a kernel-deferred file) —
   // don't blank it a second time.
   private sourceIsPreParsed = false;
-  private kotlinObjectScopeDepth = 0;
 
   constructor(
     filePath: string,
@@ -1422,6 +1423,9 @@ export class TreeSitterExtractor {
     else if (this.extractor.callTypes.includes(nodeType)) {
       this.extractCall(node);
     }
+    else if (this.language === 'kotlin' && nodeType === 'infix_expression') {
+      this.extractKotlinInfixCall(node);
+    }
     // `new Foo(...)` / `Foo::new(...)` / object_creation_expression —
     // produce an `instantiates` reference. Children still walked so
     // nested calls inside the constructor args (`new Foo(bar())`) get
@@ -1439,14 +1443,6 @@ export class TreeSitterExtractor {
         this.extractAnonymousClass(node, anonBody);
         skipChildren = true;
       }
-    }
-    // Kotlin `object : IFoo.Stub() { ... }` — structurally distinct from
-    // INSTANTIATION_KINDS (multiple repeatable `delegation_specifier`
-    // supertypes, no single constructor/type field), so it gets its own
-    // dedicated extraction rather than being folded into extractInstantiation.
-    else if (nodeType === 'object_literal') {
-      this.extractKotlinObjectLiteral(node);
-      skipChildren = true;
     }
     // (Decorator handling lives inside the symbol-creating extractors
     // — extractClass / extractFunction / extractProperty — because the
@@ -1493,12 +1489,7 @@ export class TreeSitterExtractor {
       return null;
     }
 
-    // Members in different Kotlin anonymous objects can share both name and
-    // line. Bind their identity to the enclosing owner as well.
-    const identityName = this.kotlinObjectScopeDepth > 0
-      ? `${this.nodeStack[this.nodeStack.length - 1]}::${name}`
-      : name;
-    const id = this.nodeIds.generate(this.filePath, kind, identityName, node.startPosition.row + 1, node.startPosition.column);
+    const id = this.nodeIds.generate(this.filePath, kind, name, node.startPosition.row + 1, node.startPosition.column);
 
     // Some grammars (e.g. Dart) model a function/method body as a *sibling* of
     // the signature node, so the declaration node's own range is just the
@@ -4086,6 +4077,31 @@ export class TreeSitterExtractor {
     return this.erlangAtomMacros.get(macroName) ?? null;
   }
 
+  /**
+   * A Kotlin infix call — `Users.id eq id1`, `a to b`, `x shouldBe y` — is a
+   * call of the infix function in the middle: `receiver.fn` when the left
+   * operand is a plain name (as `receiver.fn(arg)` would be), else the bare
+   * name. Nothing records it otherwise, so a project's infix DSL had no
+   * callers. Mirrored in the kernel's extract_infix_call (kotlin.rs).
+   */
+  private extractKotlinInfixCall(node: SyntaxNode): void {
+    if (this.nodeStack.length === 0 || node.namedChildCount !== 3) return;
+    const lhs = node.namedChild(0);
+    const fn = node.namedChild(1);
+    if (!lhs || !fn || fn.type !== 'simple_identifier' || LITERAL_RECEIVER_TYPES.has(lhs.type)) return;
+    const callerId = this.nodeStack[this.nodeStack.length - 1];
+    if (!callerId) return;
+    const name = getNodeText(fn, this.source);
+    const receiver = lhs.type === 'simple_identifier' ? getNodeText(lhs, this.source) : '';
+    this.unresolvedReferences.push({
+      fromNodeId: callerId,
+      referenceName: receiver && receiver !== 'this' && receiver !== 'super' ? `${receiver}.${name}` : name,
+      referenceKind: 'calls',
+      line: node.startPosition.row + 1,
+      column: node.startPosition.column,
+    });
+  }
+
   private extractCall(node: SyntaxNode): void {
     if (this.nodeStack.length === 0) return;
 
@@ -4927,6 +4943,21 @@ export class TreeSitterExtractor {
               }
               calleeName = reencode ? `${innerCallee}().${methodName}` : methodName;
             } else if (
+              this.language === 'swift' &&
+              receiver &&
+              receiver.type === 'navigation_expression' &&
+              SWIFT_TYPE_PATH_RECEIVER.test(getNodeText(receiver, this.source).replace(/\s+/g, ''))
+            ) {
+              // Swift call through a type path — `API.PackageController.GetRoute.query(on:)`,
+              // on one line or split before the `.query`. Keep the path: the
+              // bare method name this used to emit exact-matched whichever
+              // type's `query` came first (every route in a Vapor app has one).
+              // The resolver finds the member on the type the path names, or
+              // leaves the call unresolved. An instance chain (`self.store.load()`,
+              // `viewModel.state.reset()`) is not a type path and stays bare.
+              // Mirrored in the kernel's extract_call (swift.rs).
+              calleeName = `${getNodeText(receiver, this.source).replace(/\s+/g, '')}.${methodName}`;
+            } else if (
               this.language === 'cfscript' &&
               receiver &&
               receiver.type === 'member_expression' &&
@@ -5458,22 +5489,16 @@ export class TreeSitterExtractor {
     if (!this.extractor) return;
 
     // The instantiated type sits in the same field/position that
-    // extractInstantiation reads from.
+    // extractInstantiation reads from. Use the same lookup so the anon
+    // class's `extends` target matches the `instantiates` edge.
     const typeNode =
       getChildByField(node, 'constructor') ||
       getChildByField(node, 'type') ||
       getChildByField(node, 'name') ||
       node.namedChild(0);
-    let fullTypeName = typeNode ? getNodeText(typeNode, this.source) : 'Object';
-    const ltIdx = fullTypeName.indexOf('<');
-    if (ltIdx > 0) fullTypeName = fullTypeName.slice(0, ltIdx);
-    fullTypeName = fullTypeName.trim() || 'Object';
-
-    // The anon class's own (cosmetic) name is deliberately the short, bare
-    // form — matching extractInstantiation's `instantiates` truncation, since
-    // that edge resolves by bare class name (a real in-project nested type's
-    // own node is named by its last segment too).
-    let typeName = fullTypeName;
+    let typeName = typeNode ? getNodeText(typeNode, this.source) : 'Object';
+    const ltIdx = typeName.indexOf('<');
+    if (ltIdx > 0) typeName = typeName.slice(0, ltIdx);
     const lastDot = Math.max(typeName.lastIndexOf('.'), typeName.lastIndexOf('::'));
     if (lastDot >= 0) typeName = typeName.slice(lastDot + 1).replace(/^[:.]/, '');
     typeName = typeName.trim() || 'Object';
@@ -5482,19 +5507,14 @@ export class TreeSitterExtractor {
     const classNode = this.createNode('class', anonName, node, {});
     if (!classNode) return;
 
-    // The anonymous class implicitly extends/implements the named type. The
-    // `extends` reference itself must NOT be truncated to the bare last
-    // segment the way the anon class's own name and the `instantiates` edge
-    // are: a NAMED class's real `extends IFoo.Stub` clause is extracted
-    // verbatim (untruncated) so qualified-name resolution can find the
-    // nested type. Truncating this to "Stub" loses the enclosing interface.
+    // The anonymous class implicitly extends/implements the named type.
     // We can't tell at extraction time whether T is a class or an interface,
     // so emit `extends`. Resolution will still bind T to whatever it is, and
     // Phase 5.5 (which already handles both `extends` and `implements`) will
     // bridge T's methods to the override names found in the anon body.
     this.unresolvedReferences.push({
       fromNodeId: classNode.id,
-      referenceName: fullTypeName,
+      referenceName: typeName,
       referenceKind: 'extends',
       line: typeNode?.startPosition.row ?? node.startPosition.row,
       column: typeNode?.startPosition.column ?? node.startPosition.column,
@@ -5508,128 +5528,6 @@ export class TreeSitterExtractor {
       if (child) this.visitNode(child);
     }
     this.nodeStack.pop();
-  }
-
-  /**
-   * Extract a Kotlin anonymous object expression — `object : IFoo.Stub() { ... }`
-   * — a common AIDL Stub implementation idiom. This has a different AST shape from Java/C#'s
-   * `object_creation_expression`, so it cannot reuse `extractAnonymousClass`:
-   *
-   *   object_literal
-   *     delegation_specifier            (one per supertype, repeatable —
-   *       constructor_invocation          Kotlin allows `object : Base(), I1, I2 { }`)
-   *         user_type
-   *           type_identifier ...         (dotted segments, e.g. IFoo, Stub)
-   *       -- OR, for an interface with no constructor call --
-   *       user_type
-   *         type_identifier ...
-   *     class_body
-   *
-   * Before this function existed, `object_literal` was not in
-   * INSTANTIATION_KINDS and had no anonymous-class handling at all, so this
-   * idiom produced neither an `instantiates` nor an `extends` reference —
-   * the interface→impl synthesizer cannot see these implementations.
-   */
-  private extractKotlinObjectLiteral(node: SyntaxNode): void {
-    if (!this.extractor) return;
-    const body = this.findAnonymousClassBody(node);
-    if (!body) return;
-
-    const delegationSpecifiers: SyntaxNode[] = [];
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
-      if (child && child.type === 'delegation_specifier') delegationSpecifiers.push(child);
-    }
-
-    // A specifier contains a constructor invocation, an explicit `by`
-    // delegation, or a bare interface type. Only the first constructs a
-    // supertype; a call in a delegate expression does not. Preserve all
-    // dotted name segments for qualified lookup, excluding type arguments.
-    const superTypes: { fullName: string; userType: SyntaxNode; hasCall: boolean }[] = [];
-    for (const spec of delegationSpecifiers) {
-      let userType: SyntaxNode | null = null;
-      let hasCall = false;
-      for (let i = 0; i < spec.namedChildCount; i++) {
-        const child = spec.namedChild(i);
-        if (!child) continue;
-        if (child.type === 'constructor_invocation' || child.type === 'explicit_delegation') {
-          hasCall = child.type === 'constructor_invocation';
-          for (let j = 0; j < child.namedChildCount; j++) {
-            const grandchild = child.namedChild(j);
-            if (grandchild && grandchild.type === 'user_type') {
-              userType = grandchild;
-              break;
-            }
-          }
-          break;
-        }
-        if (child.type === 'user_type') {
-          userType = child;
-          break;
-        }
-      }
-      if (!userType) continue;
-      // Read only direct name segments: Outer<T>.Inner<U> is Outer.Inner,
-      // and types nested in type_arguments are never supertypes themselves.
-      const fullName = userType.namedChildren
-        .filter((child) => child.type === 'type_identifier')
-        .map((child) => getNodeText(child, this.source).trim())
-        .join('.');
-      if (fullName) superTypes.push({ fullName, userType, hasCall });
-    }
-    // Header expressions execute in the enclosing scope, not as members of
-    // the new class. Visit each spec once so constructor arguments, delegates,
-    // and objects nested in either retain their calls and structure.
-    for (const spec of delegationSpecifiers) this.visitNode(spec);
-
-    if (this.nodeStack.length > 0) {
-      const fromId = this.nodeStack[this.nodeStack.length - 1];
-      const primaryCtor = superTypes.find((s) => s.hasCall);
-      if (fromId && primaryCtor) {
-        this.unresolvedReferences.push({
-          fromNodeId: fromId,
-          referenceName: primaryCtor.fullName,
-          referenceKind: 'instantiates',
-          line: node.startPosition.row + 1,
-          column: node.startPosition.column,
-        });
-      }
-    }
-
-    // The anon class's own (cosmetic) name uses the first supertype's bare
-    // last segment, matching extractAnonymousClass's convention.
-    let typeName = superTypes[0]?.fullName ?? 'Object';
-    const lastDot = typeName.lastIndexOf('.');
-    if (lastDot >= 0) typeName = typeName.slice(lastDot + 1);
-    typeName = typeName.trim() || 'Object';
-
-    // createNode IDs use name + line; include the column to distinguish
-    // same-type literals nested or adjacent on the same source line.
-    const anonName = `<${typeName}$anon@${node.startPosition.row + 1}:${node.startPosition.column}>`;
-    const classNode = this.createNode('class', anonName, node, {});
-    if (!classNode) return;
-
-    for (const { fullName, userType } of superTypes) {
-      this.unresolvedReferences.push({
-        fromNodeId: classNode.id,
-        referenceName: fullName,
-        referenceKind: 'extends',
-        line: userType.startPosition.row,
-        column: userType.startPosition.column,
-      });
-    }
-
-    this.nodeStack.push(classNode.id);
-    this.kotlinObjectScopeDepth++;
-    try {
-      for (let i = 0; i < body.namedChildCount; i++) {
-        const child = body.namedChild(i);
-        if (child) this.visitNode(child);
-      }
-    } finally {
-      this.kotlinObjectScopeDepth--;
-      this.nodeStack.pop();
-    }
   }
 
   /**
@@ -6074,11 +5972,8 @@ export class TreeSitterExtractor {
           this.extractAnonymousClass(node, anonBody);
           return;
         }
-      } else if (nodeType === 'object_literal') {
-        // Kotlin `object : IFoo.Stub() { ... }` inside a function body —
-        // same rationale and structure as the visitNode branch above.
-        this.extractKotlinObjectLiteral(node);
-        return;
+      } else if (this.language === 'kotlin' && nodeType === 'infix_expression') {
+        this.extractKotlinInfixCall(node);
       } else if (this.extractor!.extractBareCall) {
         const calleeName = this.extractor!.extractBareCall(node, this.source);
         if (calleeName && this.nodeStack.length > 0) {
@@ -6315,6 +6210,25 @@ export class TreeSitterExtractor {
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
       if (!child) continue;
+
+      // Dart: `class A = B with M implements I;` keeps its supertypes in a
+      // `mixin_application` — the same shapes as a class body's clauses.
+      if (this.language === 'dart' && child.type === 'mixin_application_class') {
+        const application = child.namedChildren.find((c: SyntaxNode) => c.type === 'mixin_application');
+        for (const t of application?.namedChildren ?? []) {
+          const targets = t.type === 'type_identifier' ? [t] : t.type === 'mixins' ? t.namedChildren.filter((m: SyntaxNode) => m.type === 'type_identifier') : t.type === 'interfaces' ? t.namedChildren : [];
+          for (const target of targets) {
+            this.unresolvedReferences.push({
+              fromNodeId: classId,
+              referenceName: getNodeText(target, this.source),
+              referenceKind: t.type === 'type_identifier' ? 'extends' : 'implements',
+              line: target.startPosition.row + 1,
+              column: target.startPosition.column,
+            });
+          }
+        }
+        continue;
+      }
 
       if (
         child.type === 'extends_clause' ||

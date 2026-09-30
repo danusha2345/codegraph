@@ -264,54 +264,6 @@ public class Consumer {
         c.node.qualifiedName === 'r::Impl::run' && c.edge.metadata?.synthesizedBy === 'interface-impl')).toBe(true);
     });
 
-    it('does not match a Kotlin local anonymous-object method from a sibling function', () => {
-      const node = (id: string, kind: Node['kind'], name: string, qualifiedName: string, filePath: string, startLine: number, endLine: number): Node => ({
-        id, kind, name, qualifiedName, filePath, language: 'kotlin',
-        startLine, endLine, startColumn: 0, endColumn: 0, updatedAt: 0,
-      });
-      const outer = node('outer', 'method', 'otherTest', 'ProbeTest::otherTest', 'ProbeTest.kt', 10, 20);
-      const anon = node('anon', 'class', '<Probe$anon@12:8>', 'ProbeTest::otherTest::<Probe$anon@12:8>', 'ProbeTest.kt', 12, 18);
-      const localMethod = node('local', 'method', 'probe', `${anon.qualifiedName}::probe`, 'ProbeTest.kt', 13, 17);
-      const interfaceMethod = node('interface', 'method', 'probe', 'Probe::probe', 'Probe.kt', 1, 2);
-      const nodes = [outer, anon, localMethod, interfaceMethod];
-      const context = {
-        getNodesByName: (name: string) => nodes.filter((n) => n.name === name),
-        getNodesByQualifiedName: (name: string) => nodes.filter((n) => n.qualifiedName === name),
-        getNodesInFile: (filePath: string) => nodes.filter((n) => n.filePath === filePath),
-        getNodesByKind: (kind: Node['kind']) => nodes.filter((n) => n.kind === kind),
-        fileExists: () => true, readFile: () => null,
-        getProjectRoot: () => tempDir, getAllFiles: () => ['ProbeTest.kt', 'Probe.kt'],
-      } as ResolutionContext;
-      const ref: UnresolvedRef = {
-        fromNodeId: 'testA', referenceName: 'probe.probe', referenceKind: 'calls',
-        filePath: 'ProbeTest.kt', language: 'kotlin', line: 5, column: 0,
-      };
-
-      expect(matchMethodCall(ref, context)?.targetNodeId).toBe(interfaceMethod.id);
-      expect(matchMethodCall({ ...ref, fromNodeId: outer.id, line: 15 }, context)?.targetNodeId).toBe(localMethod.id);
-    });
-
-    it('accepts every supported supertype kind in exact-name inheritance matching', () => {
-      for (const kind of ['component', 'namespace'] as const) {
-        const target: Node = {
-          id: `${kind}:base`, kind, name: 'Base', qualifiedName: 'Base',
-          filePath: 'model.ts', language: 'typescript', startLine: 1, endLine: 1,
-          startColumn: 0, endColumn: 0, updatedAt: 0,
-        };
-        const context = {
-          getNodesByName: () => [target], getNodesInFile: () => [target],
-          getNodesByQualifiedName: () => [], getNodesByKind: () => [],
-          fileExists: () => true, readFile: () => null,
-          getProjectRoot: () => tempDir, getAllFiles: () => ['model.ts'],
-        } as ResolutionContext;
-        const ref: UnresolvedRef = {
-          fromNodeId: 'class:derived', referenceName: 'Base', referenceKind: 'extends',
-          filePath: 'model.ts', language: 'typescript', line: 2, column: 0,
-        };
-        expect(matchByExactName(ref, context)?.targetNodeId).toBe(target.id);
-      }
-    });
-
     it('should match exact name references', () => {
       // Create a mock context
       const mockNodes: Node[] = [
@@ -1742,12 +1694,9 @@ impl<T> Source for BufSource<T> {
       // The two ways this could overreach. `self.missing()` names nothing on
       // the owner, so it must not fall back to some other type's `missing`.
       //
-      // The receiver-less half is pinned as it BEHAVES, not as it should: a
-      // bare `reset()` is a free-function call, and it already resolved to
-      // `Target::reset` before this change — the mirror image of #1861, where
-      // a call with no receiver is given one. That is a separate defect in the
-      // bare-name strategy, measured on this branch's parent; the cell is here
-      // so this change is pinned to not make it worse.
+      // And a bare `reset()` is a free-function call: Rust reaches a method
+      // only through `self.` or `Type::`, so it is the free `reset`, never
+      // `Target::reset` (it used to be — the mirror image of #1861).
       writeRustCrate(tempDir, {
         'lib.rs':
           'pub fn reset() {}\n\n' +
@@ -1758,8 +1707,7 @@ impl<T> Source for BufSource<T> {
       });
       cg = await CodeGraph.init(tempDir, { index: true });
 
-      // Unchanged by this commit — see the note above.
-      expect(callsFrom('Target::free').map((c) => c.target)).toEqual(['Target::reset']);
+      expect(callsFrom('Target::free').map((c) => c.target)).toEqual(['reset']);
       // Nothing on the owner is named `missing`, so no edge at all.
       expect(callsFrom('Target::absent')).toEqual([]);
     });
@@ -5653,16 +5601,6 @@ class Use {
         expect(out).toContainEqual({ kind: 'instantiates', qn: 'WebSocket::Accepted', lang: 'scala' });
       });
 
-      it('does not guess a Java constructor for a Scala Outer.Inner(...) call by receiver words alone', async () => {
-        write('scala/app/Use.scala', `package app
-class Use {
-  def accept(): Unit = { WebSocket.Accepted("f") }
-}
-`);
-        cg = await CodeGraph.init(tempDir, { index: true });
-        expect(edgesFrom('accept').filter((e) => e.qn.endsWith('::Accepted::Accepted'))).toEqual([]);
-      });
-
       it('still resolves a Scala call to a real Java static method', async () => {
         write('scala/app/Use.scala', `package app
 class Use {
@@ -6567,54 +6505,6 @@ in
     });
   });
 
-  describe('A dotted qualified extends/implements reference resolves to a real nested type', () => {
-    it('resolves `extends Outer.Inner` (named class) and `new Outer.Inner() { ... }` (anonymous class) to the SAME real, indexed nested type', async () => {
-      // Every qualifiedName the engine builds joins scope with `::`
-      // (buildQualifiedName), but a Java/C# extends clause or anonymous-class
-      // constructor type is recorded verbatim with a dot (`Outer.Inner`). A
-      // real in-project nested type must still resolve — this is not an
-      // AOSP-specific concern (an absent AIDL Stub staying unresolved is
-      // correct there), it's the general case where the target genuinely
-      // exists in the index.
-      fs.writeFileSync(
-        path.join(tempDir, 'Host.java'),
-        `package p;
-class Outer { static class Inner { public void run() {} } }
-class Named extends Outer.Inner {}
-class Host {
-    Object field = new Outer.Inner() { public void run() {} };
-}
-`
-      );
-
-      cg = await CodeGraph.init(tempDir, { index: true });
-      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
-      const innerId = db
-        .getDb()
-        .prepare("select id from nodes where kind = 'class' and name = 'Inner'")
-        .get() as { id: string } | undefined;
-      expect(innerId, 'the real Outer.Inner class should be indexed').toBeDefined();
-
-      const extendsTargets = db
-        .getDb()
-        .prepare(
-          `select src.name as sourceName, dst.id as targetId
-             from edges e
-             join nodes src on src.id = e.source
-             join nodes dst on dst.id = e.target
-            where e.kind = 'extends' and dst.id = ?`
-        )
-        .all(innerId!.id) as Array<{ sourceName: string; targetId: string }>;
-
-      const sourceNames = extendsTargets.map((r) => r.sourceName).sort();
-      // `Named` (a real named class) and the anonymous class inside `Host`
-      // (named `<Inner$anon@...>`) must BOTH resolve their extends edge to
-      // the real `Inner` node — neither should stay in unresolved_refs.
-      expect(sourceNames.some((n) => n === 'Named')).toBe(true);
-      expect(sourceNames.some((n) => /Inner\$anon@/.test(n))).toBe(true);
-    });
-  });
-
   describe('Bindings in a module that exports nothing (#1719)', () => {
     it('does not treat documentation headings as package imports', () => {
       // Inject the planned Markdown node shape without depending on its extractor.
@@ -6888,27 +6778,6 @@ bracketed()
           .filter((e) => e.kind === 'calls' && e.target === n.id)
           .map(() => n.name));
 
-    it('drops `other.m()` -> enclosing `m` (Java: word-overlap and single-candidate)', async () => {
-      fs.writeFileSync(path.join(tempDir, 'AhcWSRequest.java'), `
-import play.shaded.ahc.StandaloneAhcWSRequest;
-import com.github.benmanes.caffeine.cache.Cache;
-public class AhcWSRequest {
-  private final StandaloneAhcWSRequest request;
-  private final Cache cache;
-  public String getHeaders() { return request.getHeaders(); }
-  public Object getIfPresent(String key) { return cache.getIfPresent(key); }
-}
-`);
-      fs.writeFileSync(path.join(tempDir, 'Response.java'), `
-public class Response {
-  public String getHeaders() { return ""; }
-}
-`);
-      cg = await CodeGraph.init(tempDir, { index: true });
-      cg.resolveReferences();
-      expect(selfLoops(cg, 'AhcWSRequest.java')).toEqual([]);
-    }, 30000);
-
     it('drops the self-loop for a Scala delegating wrapper', async () => {
       fs.writeFileSync(path.join(tempDir, 'Form.scala'), `
 package play.api.data
@@ -6921,17 +6790,32 @@ class WrappedMapping(wrapped: Mapping) {
       expect(selfLoops(cg, 'Form.scala')).toEqual([]);
     }, 30000);
 
-    it('drops the self-loop for a TypeScript delegating wrapper', async () => {
-      fs.writeFileSync(path.join(tempDir, 'proxy.ts'), `
-import { Loader } from 'external-lib';
-export class LoaderProxy {
-  constructor(private inner: Loader) {}
-  loadAll(inner: Loader) { return inner.loadAll(); }
+    it('drops the self-loop when the receiver word-overlaps the enclosing class (Scala)', async () => {
+      fs.writeFileSync(path.join(tempDir, 'Cache.scala'), `
+package p
+class CacheWrapper(cache: Cache) {
+  def get(k: String): String = cache.get(k)
+}
+class Store {
+  def get(k: String): String = k
 }
 `);
       cg = await CodeGraph.init(tempDir, { index: true });
       cg.resolveReferences();
-      expect(selfLoops(cg, 'proxy.ts')).toEqual([]);
+      expect(selfLoops(cg, 'Cache.scala')).toEqual([]);
+    }, 30000);
+
+    it('drops the self-loop for a Swift delegating wrapper', async () => {
+      fs.writeFileSync(path.join(tempDir, 'Wrapped.swift'), `
+class Wrapped {
+  let inner: Mapping
+  init(inner: Mapping) { self.inner = inner }
+  func unbind(_ v: String) -> String { return inner.unbind(v) }
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      expect(selfLoops(cg, 'Wrapped.swift')).toEqual([]);
     }, 30000);
 
     it('keeps real recursion through this./bare calls and a Go named receiver', async () => {
@@ -6956,114 +6840,5 @@ func (r *relayClient) sendBatchAttempt(retry bool) error {
       expect(selfLoops(cg, 'Tree.java').sort()).toEqual(['depth', 'size']);
       expect(selfLoops(cg, 'relay.go')).toEqual(['sendBatchAttempt']);
     }, 30000);
-  });
-
-  describe('Inheritance references never use method-call resolution', () => {
-    it('does not resolve bare extends/implements names to same-named methods', async () => {
-      fs.writeFileSync(
-        path.join(tempDir, 'Hierarchy.java'),
-        `class Child extends Missing {}
-class Implementer implements Missing {}
-class Other {
-  void Missing() {}
-}
-`
-      );
-
-      cg = await CodeGraph.init(tempDir, { index: true });
-      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
-      const rows = db
-        .getDb()
-        .prepare(
-          `select src.name as sourceName, dst.kind as targetKind
-             from edges e
-             join nodes src on src.id = e.source
-             join nodes dst on dst.id = e.target
-            where e.kind in ('extends', 'implements')
-              and src.name in ('Child', 'Implementer')`
-        )
-        .all() as Array<{ sourceName: string; targetKind: string }>;
-
-      expect(rows.filter((row) => row.targetKind === 'method')).toEqual([]);
-    });
-
-    it('does not resolve Java extends IBar.Stub to an unrelated Stub constructor', async () => {
-      // IBar intentionally has no in-project declaration: this mirrors generated
-      // AIDL Stub bases that are absent from a sparse source checkout. An explicit
-      // constructor is required because implicit Java constructors are not nodes.
-      fs.writeFileSync(
-        path.join(tempDir, 'AService.java'),
-        `package com.example;
-class AService {
-  final class BinderService extends IBar.Stub {}
-}
-`
-      );
-      fs.writeFileSync(
-        path.join(tempDir, 'UiModeManagerService.java'),
-        `package com.example;
-class UiModeManagerService {
-  class Stub { Stub() {} }
-}
-`
-      );
-
-      cg = await CodeGraph.init(tempDir, { index: true });
-      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
-      const rows = db
-        .getDb()
-        .prepare(
-          `select dst.kind as targetKind, dst.qualified_name as targetQualifiedName,
-                  e.metadata as metadata
-             from edges e
-             join nodes src on src.id = e.source
-             join nodes dst on dst.id = e.target
-            where e.kind = 'extends' and src.name = 'BinderService'`
-        )
-        .all() as Array<{ targetKind: string; targetQualifiedName: string; metadata: string }>;
-
-      // An inheritance reference is a type reference, never a receiver.method()
-      // call. In particular, an absent IBar must not make `Stub` fall through to
-      // the sole same-named constructor elsewhere in the project.
-      expect(rows.filter((row) => row.targetKind === 'method')).toEqual([]);
-    });
-
-    it('resolves a nested Java supertype to the closest source tree', async () => {
-      for (const tree of ['framework', 'androidx']) {
-        const dir = path.join(tempDir, tree);
-        fs.mkdirSync(dir);
-        fs.writeFileSync(path.join(dir, 'RecyclerView.java'),
-          `package ${tree}; class RecyclerView { static class LayoutManager {} }`);
-      }
-      fs.writeFileSync(path.join(tempDir, 'androidx', 'LinearLayoutManager.java'),
-        'package androidx; class LinearLayoutManager extends RecyclerView.LayoutManager {}');
-
-      cg = await CodeGraph.init(tempDir, { index: true });
-      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
-      const rows = db.getDb().prepare(
-        `select dst.file_path as targetPath from edges e
-         join nodes src on src.id = e.source
-         join nodes dst on dst.id = e.target
-         where e.kind = 'extends' and src.name = 'LinearLayoutManager'`
-      ).all() as Array<{ targetPath: string }>;
-      expect(rows.map((row) => row.targetPath)).toEqual(['androidx/RecyclerView.java']);
-    });
-
-    it('does not let Spring naming conventions invent an inheritance edge', async () => {
-      fs.writeFileSync(path.join(tempDir, 'Service.java'),
-        '@Service class Service {} class Child implements View.OnClickListener {}');
-      fs.writeFileSync(path.join(tempDir, 'OnClickListener.java'),
-        'package unrelated; class OnClickListener {}');
-
-      cg = await CodeGraph.init(tempDir, { index: true });
-      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
-      const rows = db.getDb().prepare(
-        `select dst.qualified_name as target from edges e
-         join nodes src on src.id = e.source
-         join nodes dst on dst.id = e.target
-         where e.kind = 'implements' and src.name = 'Child'`
-      ).all() as Array<{ target: string }>;
-      expect(rows).toEqual([]);
-    });
   });
 });

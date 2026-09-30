@@ -1098,9 +1098,11 @@ export default app;
 /**
  * The acceptance bar from the issue, against the engine's OWN index rather than
  * a fixture. The symbol is whichever one the index itself ranks busiest, not a
- * name: the issue's `LRUCache.get` had 545 callers when this was written and 46
- * after later resolution changes, which turned a performance check into a
- * fan-in assertion that failed on every indexed checkout.
+ * name: the issue's `LRUCache.get` had 545 callers when the bar was set, 496
+ * when #2183 lowered it to the 300-row cap, and a fan-in of 22 (5 callers) on
+ * a fresh index since, as sharper resolution stops linking `get` calls on maps
+ * and caches that were never LRUCache's. A fixed name turns a performance check
+ * into a fan-in assertion that fails on every freshly indexed checkout.
  *
  * `.codegraph/` is gitignored, so this only runs on a machine that has indexed
  * this repository. The fixture test above covers the same properties in CI; this

@@ -1,7 +1,7 @@
 /**
  * A call that means a member of the class it is written in — a receiver-less
- * `render()` in Java / Kotlin / C# / Scala / Swift / C++ / Dart / Ruby, or
- * `this.render()` / `self.render()` / `$this->render()` — binds to that class's
+ * `render()` in Java / Scala / C++, or `this.render()` / `self.render()` in
+ * TypeScript / Python — binds to that class's
  * member (then what it inherits, then an enclosing class), not to whichever
  * same-named method is declared nearest the call. Each fixture puts the
  * caller's own `render` far above the call and a sibling class's `render`
@@ -43,33 +43,6 @@ async function callees(file: string, source: string, from: string): Promise<stri
 }
 
 const OWN_CLASS: Array<[string, string, string, string]> = [
-  ['Java', 'A.java', `class A {
-  String render() { return "a"; }
-${filler('  //')}
-  String show() { return render(); }
-}
-class B {
-  String render() { return "b"; }
-}
-`, 'A::show'],
-  ['Kotlin', 'A.kt', `class A {
-  fun render(): String = "a"
-${filler('  //')}
-  fun show(): String = render()
-}
-class B {
-  fun render(): String = "b"
-}
-`, 'A::show'],
-  ['C#', 'A.cs', `class A {
-  string render() { return "a"; }
-${filler('  //')}
-  string Show() { return render(); }
-}
-class B {
-  string render() { return "b"; }
-}
-`, 'A::Show'],
   ['Scala', 'A.scala', `class A {
   def render(): String = "a"
 ${filler('  //')}
@@ -77,15 +50,6 @@ ${filler('  //')}
 }
 class B {
   def render(): String = "b"
-}
-`, 'A::show'],
-  ['Swift', 'A.swift', `class A {
-  func render() -> String { return "a" }
-${filler('  //')}
-  func show() -> String { return render() }
-}
-class B {
-  func render() -> String { return "b" }
 }
 `, 'A::show'],
   ['C++ (inline members)', 'a.cpp', `class A {
@@ -105,40 +69,6 @@ int A::render() { return 1; }
 ${filler('//')}
 int A::show() { return render(); }
 int B::render() { return 2; }
-`, 'A::show'],
-  ['Dart', 'a.dart', `class A {
-  String render() => "a";
-${filler('  //')}
-  String show() { return render(); }
-}
-class B {
-  String render() => "b";
-}
-`, 'A::show'],
-  ['Ruby', 'a.rb', `class A
-  def render
-    "a"
-  end
-${filler('  #')}
-  def show
-    render
-  end
-end
-class B
-  def render
-    "b"
-  end
-end
-`, 'A::show'],
-  ['PHP ($this->)', 'a.php', `<?php
-class A {
-  function render() { return "a"; }
-${filler('  //')}
-  function show() { return $this->render(); }
-}
-class B {
-  function render() { return "b"; }
-}
 `, 'A::show'],
   ['Python (self.)', 'a.py', `class A:
     def render(self):
@@ -168,36 +98,6 @@ describe('a call meaning a member of the enclosing class', () => {
     expect(out.map((q) => q.toLowerCase())).not.toContain('b::render');
   });
 
-  it('Java: a non-static inner class reaches the outer class member', async () => {
-    const out = await callees('O.java', `class Outer {
-  String render() { return "o"; }
-${filler('  //')}
-  class Inner {
-    String show() { return render(); }
-  }
-}
-class B {
-  String render() { return "b"; }
-}
-`, 'Outer::Inner::show');
-    expect(out).toEqual(['Outer::render']);
-  });
-
-  it('Java: an inherited member wins over a nearer sibling class', async () => {
-    const out = await callees('P.java', `class Base {
-  String render() { return "base"; }
-}
-${filler('//')}
-class Kid extends Base {
-  String show() { return render(); }
-}
-class B {
-  String render() { return "b"; }
-}
-`, 'Kid::show');
-    expect(out).toEqual(['Base::render']);
-  });
-
   it('Java: `super.render()` skips the overriding method itself', async () => {
     const out = await callees('S.java', `class Base {
   String render() { return "base"; }
@@ -208,54 +108,6 @@ class Kid extends Base {
 }
 `, 'Kid::render');
     expect(out).toEqual(['Base::render']);
-  });
-
-  it('Kotlin: the member shadows a same-named top-level function', async () => {
-    const out = await callees('T.kt', `fun render(): String = "top"
-class A {
-  fun render(): String = "a"
-${filler('  //')}
-  fun show(): String = render()
-}
-`, 'A::show');
-    expect(out).toEqual(['A::render']);
-  });
-
-  it('Kotlin: a class without that member still reaches the top-level function', async () => {
-    const out = await callees('U.kt', `fun helper(): String = "top"
-class A {
-  fun render(): String = "a"
-  fun show(): String = helper()
-}
-`, 'A::show');
-    expect(out).toEqual(['helper']);
-  });
-
-  it('Java: an inner class with a supertype outside the index does not claim the outer member', async () => {
-    // `View` may declare `render` itself, and it would win over `Outer`'s.
-    const out = await callees('V.java', `class Outer {
-  String render() { return "o"; }
-${filler('  //')}
-  class Inner extends android.view.View {
-    String show() { return render(); }
-  }
-}
-class B {
-  String render() { return "b"; }
-}
-`, 'Outer::Inner::show');
-    expect(out).not.toContain('Outer::render');
-  });
-
-  it('Java: `super.render()` never lands on an interface declaration', async () => {
-    const out = await callees('I.java', `interface Renderer {
-  String render();
-}
-class Kid extends android.view.View implements Renderer {
-  public String render() { return super.render(); }
-}
-`, 'Kid::render');
-    expect(out).not.toContain('Renderer::render');
   });
 
   it('Java: same-named nested types only inherit from what their own header names', async () => {
