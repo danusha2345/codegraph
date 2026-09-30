@@ -3408,14 +3408,16 @@ export function matchByExactName(
       /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) && isOutOfRepoBinding(ref.referenceName, ref, context)) {
     return null;
   }
+  // `import { useQuery } from '@tanstack/react-query'`: the call means the
+  // package's, and no other file's same-named symbol. A declaration of the
+  // name in this file's inner scope still shadows the import.
+  let outOfRepoCall = false;
   if (bareJs) {
     const storeAction = matchJsStoreBindingCall(ref, context);
     if (storeAction) return storeAction;
     const returned = matchDestructuredCallResult(ref, context);
     if (returned) return returned;
-    // `import { useQuery } from '@tanstack/react-query'`: the call means the
-    // package's, and no same-named project symbol.
-    if (isOutOfRepoBinding(ref.referenceName, ref, context)) return null;
+    outOfRepoCall = isOutOfRepoBinding(ref.referenceName, ref, context);
   }
   // Every rule below judges one candidate on its own, so they run as ONE pass,
   // the kind/language checks before the ones that read source: a common name
@@ -3424,7 +3426,9 @@ export function matchByExactName(
   const valueRef = ref.referenceKind === 'references' || ref.referenceKind === 'function_ref';
   const importRef = ref.referenceKind === 'imports';
   const inheritanceRef = isInheritanceRef(ref);
-  const sameName = context.getNodesByName(ref.referenceName);
+  const sameName = outOfRepoCall
+    ? context.getNodesByName(ref.referenceName).filter((n) => n.filePath === ref.filePath)
+    : context.getNodesByName(ref.referenceName);
   // `NAME(...)` where NAME is a function-like macro somewhere in the project is
   // an expansion or a call to a same-named function — never the macro itself
   // (#1839), and never a type that happens to share the name (#2070: expat's
