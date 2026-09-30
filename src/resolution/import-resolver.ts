@@ -240,7 +240,7 @@ function resolveImportPathUncached(
   }
 
   // Handle absolute/aliased imports (like @/ or src/)
-  const aliased = resolveAliasedImport(importPath, projectRoot, language, context);
+  const aliased = resolveAliasedImport(importPath, projectRoot, language, context, fromFile);
   if (aliased) return aliased;
 
   // C/C++ include directory search: when neither relative nor aliased
@@ -390,7 +390,7 @@ const RUST_STDLIB_ROOTS = new Set(['std', 'core', 'alloc', 'proc_macro']);
  * like `@components/*` would fail the bare-specifier heuristic and
  * be classified as external before alias resolution can run.
  */
-function isExternalImport(
+export function isExternalImport(
   importPath: string,
   language: Language,
   context?: ResolutionContext
@@ -576,7 +576,8 @@ function resolveAliasedImport(
   importPath: string,
   projectRoot: string,
   language: Language,
-  context: ResolutionContext
+  context: ResolutionContext,
+  fromFile?: string
 ): string | null {
   const extensions = EXTENSION_RESOLUTION[language] || [];
   const tryWithExt = (basePath: string): string | null => {
@@ -588,9 +589,12 @@ function resolveAliasedImport(
     return findSourceForEmittedSpecifier(basePath, language, context);
   };
 
-  // 1. Project tsconfig/jsconfig paths.
-  const aliasMap = context.getProjectAliases?.();
-  if (aliasMap) {
+  // 1. tsconfig/jsconfig paths: the config nearest the importing file (an
+  //    app of a monorepo keeps its own `@/*`), then the project root's.
+  const nearest = fromFile ? context.getNearestAliases?.(fromFile) : null;
+  const rootMap = context.getProjectAliases?.();
+  for (const aliasMap of nearest && nearest !== rootMap ? [nearest, rootMap] : [rootMap]) {
+    if (!aliasMap) continue;
     const candidates = applyAliases(importPath, aliasMap, projectRoot);
     for (const c of candidates) {
       const hit = tryWithExt(c);
@@ -933,8 +937,11 @@ export function extractImportMappings(
 function extractJSImports(content: string): ImportMapping[] {
   const mappings: ImportMapping[] = [];
 
-  // ES6 imports
-  const importRegex = /import\s+(?:(\w+)\s*,?\s*)?(?:\{([^}]+)\})?\s*(?:(\*)\s+as\s+(\w+))?\s*from\s*['"]([^'"]+)['"]/g;
+  // ES6 imports. `import type { X }` / `import type * as ns` is TypeScript's
+  // type-only form, not a default import named `type` — which every such
+  // line used to add, making `type.innerType()` a call on an import.
+  // (`import type from './x'` still binds `type`: backtracking gives it back.)
+  const importRegex = /import\s+(?:type\s+(?=[{*]|(?!from\b)\w))?(?:(\w+)\s*,?\s*)?(?:\{([^}]+)\})?\s*(?:(\*)\s+as\s+(\w+))?\s*from\s*['"]([^'"]+)['"]/g;
 
   let match;
   while ((match = importRegex.exec(content)) !== null) {
@@ -953,7 +960,8 @@ function extractJSImports(content: string): ImportMapping[] {
 
     // Named imports
     if (namedImports) {
-      const names = namedImports.split(',').map((s) => s.trim());
+      // `{ util, type objectUtil }`: an inline `type` modifier is not part of the name.
+      const names = namedImports.split(',').map((s) => s.trim().replace(/^type\s+(?=\w)/, ''));
       for (const name of names) {
         const aliasMatch = name.match(/(\w+)\s+as\s+(\w+)/);
         if (aliasMatch) {
