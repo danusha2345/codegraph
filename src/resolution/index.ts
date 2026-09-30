@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead } from './name-matcher';
+import { matchKotlinReceiverChain, isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
@@ -1136,6 +1136,19 @@ export class ReferenceResolver {
     // A Dart member read (`x.area`) links the getter the receiver's type
     // reaches, as a call, or nothing — never a guess by name (#2338).
     if (isDartMemberRead(ref)) return matchDartMemberRead(ref, this.context);
+
+    // A Kotlin call through a receiver chain (`engine.pump.drain()`) resolves
+    // on the chain's declared type, or gets no edge when that type is a
+    // library one. An untyped chain resolves as the bare method name, the ref
+    // the extractor emitted before it kept the chain.
+    if (ref.language === 'kotlin' && ref.referenceKind === 'calls') {
+      const chain = matchKotlinReceiverChain(ref, this.context);
+      if (chain && 'method' in chain) {
+        const bare = this.resolveOneInner({ ...ref, referenceName: chain.method });
+        return bare ? { ...bare, original: ref } : null;
+      }
+      if (chain !== undefined) return this.gateLanguage(chain, ref);
+    }
 
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {
