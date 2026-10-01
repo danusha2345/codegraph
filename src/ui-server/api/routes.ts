@@ -90,9 +90,6 @@ export function splitRouteName(url: string): { method: string | null; path: stri
  */
 const MIN_LIMIT = 3;
 
-/** Manifest rows fetched per route shown, so folding repeats still fills the page. */
-const ROWS_PER_ROUTE = 4;
-
 type ManifestRow = NonNullable<ReturnType<CodeGraph['getRoutingManifest']>>['entries'][number];
 
 /**
@@ -128,10 +125,12 @@ function oneRowPerRoute(cg: CodeGraph, entries: readonly ManifestRow[]): Array<M
       });
       continue;
     }
-    const named = root
-      ? list.find((e) => e.handlerFile === root.node.filePath && e.handlerLine === root.node.startLine && e.handler === root.node.name)
-      : undefined;
-    out.push({ ...(named ?? list[0]!), inline: false });
+    out.push({ ...list[0]!, ...(root ? {
+      handler: root.node.name,
+      handlerKind: root.node.kind,
+      handlerFile: root.node.filePath,
+      handlerLine: root.node.startLine,
+    } : {}), inline: false });
   }
   return out;
 }
@@ -139,13 +138,10 @@ function oneRowPerRoute(cg: CodeGraph, entries: readonly ManifestRow[]): Array<M
 export function buildRoutes(cg: CodeGraph, query: URLSearchParams): WireRoutes {
   const limit = intParam(query, 'limit', { min: MIN_LIMIT, max: 500, default: 200 });
 
-  // The engine's manifest is a row per (route, edge): a route bound to two
-  // symbols, or an inline handler whose every call reads as a "handler"
-  // (hono's `GET /stream/text` came back three times, as `streamText`,
-  // `writeln` and `sleep`), repeats. A route has ONE answer to "what serves
-  // this" — route-roots.ts's — so rows are over-fetched and folded onto it.
-  const fetched = limit * ROWS_PER_ROUTE + 1;
-  const manifest = cg.getRoutingManifest(fetched);
+  // Limit distinct routes in SQL: a handler's many calls must not consume
+  // another route's place. route-roots.ts supplies the actual handler below.
+  const fetched = limit + 1;
+  const manifest = cg.getRoutingManifest(fetched, true);
   const routeCount = cg.getStats().nodesByKind.route ?? 0;
 
   if (!manifest) {

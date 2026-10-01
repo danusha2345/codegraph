@@ -332,6 +332,7 @@ export class QueryBuilder {
     getChangeStamp?: SqliteStatement;
     getTopRouteFile?: SqliteStatement;
     getRoutingManifest?: SqliteStatement;
+    getRoutingManifestByRoute?: SqliteStatement;
     insertNameSegment?: SqliteStatement;
   } = {};
 
@@ -1218,7 +1219,7 @@ export class QueryBuilder {
    * "top handler file" to inline source for, so the agent has both the
    * mapping AND the handler implementations.
    */
-  getRoutingManifest(limit: number = 40): {
+  getRoutingManifest(limit: number = 40, distinctRoutes: boolean = false): {
     entries: Array<{
       url: string;
       handler: string;
@@ -1234,11 +1235,12 @@ export class QueryBuilder {
     topHandlerFileCount: number;
     totalRoutes: number;
   } | null {
-    if (!this.stmts.getRoutingManifest) {
+    const key = distinctRoutes ? 'getRoutingManifestByRoute' : 'getRoutingManifest';
+    if (!this.stmts[key]) {
       // Edge kind varies across framework resolvers: Spring/Rails/
       // Laravel/Drupal emit `references`, Express emits `calls`. Accept
       // both — the semantic is the same (route → its handler).
-      this.stmts.getRoutingManifest = this.db.prepare(`
+      this.stmts[key] = this.db.prepare(`
         SELECT
           r.name AS url,
           r.id AS route_id,
@@ -1254,18 +1256,25 @@ export class QueryBuilder {
         WHERE r.kind = 'route'
           AND e.kind IN ('references', 'calls')
           AND h.kind IN ('function', 'method', 'class', 'constant', 'variable')
+          ${distinctRoutes ? `AND e.id = (
+            SELECT MIN(e2.id) FROM edges e2 JOIN nodes h2 ON h2.id = e2.target
+            WHERE e2.source = r.id AND e2.kind IN ('references', 'calls')
+              AND h2.kind IN ('function', 'method', 'class', 'constant', 'variable')
+          )` : ''}
         ORDER BY r.file_path, r.start_line
         LIMIT ?
       `);
     }
-    const rows = this.stmts.getRoutingManifest.all(limit) as Array<{
+    const rows = this.stmts[key]!.all(limit) as Array<{
       url: string; route_id: string; route_file: string; route_line: number;
       handler: string; handler_file: string; handler_line: number; handler_kind: string;
     }>;
     // Drop test/generated handlers — same hygiene as elsewhere.
     const generated = this.getGeneratedPathsAmong(rows.map(r => r.handler_file));
     const filtered = rows.filter(r => !isLowValueFile(r.handler_file, generated));
-    if (filtered.length < 3) return null;
+    // Keep the legacy routing-confidence gate when one route supplies several
+    // qualifying edges; limiting distinct routes must not turn that app off.
+    if (filtered.length < 3 && (!distinctRoutes || !this.getRoutingManifest(3))) return null;
     // Identify the file holding the most handlers (the "primary handler file").
     const fileCounts = new Map<string, number>();
     for (const r of filtered) {

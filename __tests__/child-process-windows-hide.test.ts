@@ -94,6 +94,7 @@ function optionsArg(call: ts.CallExpression, spawner: string): ts.Expression | u
   const [, second, third] = call.arguments;
   if (SPAWNERS[spawner] === 'command') return second;
   // (file, options) is allowed when the args array is omitted.
+  if (call.arguments.length === 2) return second;
   if (second && ts.isObjectLiteralExpression(second)) return second;
   return third;
 }
@@ -140,33 +141,49 @@ function callSitesOf(param: ts.ParameterDeclaration, sf: ts.SourceFile): ts.Expr
   return args.length > 0 ? args : null;
 }
 
-/** True when `expr` provably evaluates to options with `windowsHide: true`. */
-function hidesWindow(expr: ts.Expression | undefined, sf: ts.SourceFile, seen = new Set<ts.Node>()): boolean {
-  if (!expr) return false;
+type HideSetting = boolean | 'missing' | 'unknown';
+
+/** Preserve an absent property across spreads, but never trust an unknown override. */
+function hideSetting(expr: ts.Expression | undefined, sf: ts.SourceFile, seen = new Set<ts.Node>()): HideSetting {
+  if (!expr) return 'unknown';
   const e = unwrap(expr);
-  if (seen.has(e)) return false;
-  seen.add(e);
+  if (seen.has(e)) return 'unknown';
+  // Cycle detection is per path: two call sites may share a safe initializer.
+  const branch = new Set(seen);
+  branch.add(e);
   if (ts.isObjectLiteralExpression(e)) {
-    let hidden = false;
+    let hidden: HideSetting = 'missing';
     for (const prop of e.properties) {
-      if (ts.isPropertyAssignment(prop) && prop.name.getText(sf) === 'windowsHide') {
-        hidden = unwrap(prop.initializer).kind === ts.SyntaxKind.TrueKeyword;
+      if (ts.isPropertyAssignment(prop) &&
+          (ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name)) && prop.name.text === 'windowsHide') {
+        const value = unwrap(prop.initializer).kind;
+        hidden = value === ts.SyntaxKind.TrueKeyword ? true : value === ts.SyntaxKind.FalseKeyword ? false : 'unknown';
       } else if (ts.isShorthandPropertyAssignment(prop) && prop.name.text === 'windowsHide') {
-        hidden = false; // not provable statically
-      } else if (ts.isSpreadAssignment(prop) && hidesWindow(prop.expression, sf, seen)) {
-        hidden = true;
+        hidden = 'unknown';
+      } else if (ts.isSpreadAssignment(prop)) {
+        const spread = hideSetting(prop.expression, sf, branch);
+        if (spread !== 'missing') hidden = spread;
+      } else if (prop.name && ts.isComputedPropertyName(prop.name)) {
+        hidden = 'unknown';
       }
     }
     return hidden; // last write wins, matching object-literal semantics
   }
   if (ts.isIdentifier(e)) {
     const binding = resolveBinding(e.text, e);
-    if (!binding) return false;
-    if (ts.isVariableDeclaration(binding)) return hidesWindow(binding.initializer, sf, seen);
+    if (!binding) return 'unknown';
+    if (ts.isVariableDeclaration(binding)) return hideSetting(binding.initializer, sf, branch);
     const sites = callSitesOf(binding, sf);
-    return sites !== null && sites.every((arg) => hidesWindow(arg, sf, seen));
+    if (!sites) return 'unknown';
+    const values = sites.map(arg => hideSetting(arg, sf, branch));
+    return values.every(value => value === values[0]) ? values[0]! : 'unknown';
   }
-  return false;
+  return 'unknown';
+}
+
+/** True when `expr` provably evaluates to options with `windowsHide: true`. */
+function hidesWindow(expr: ts.Expression | undefined, sf: ts.SourceFile): boolean {
+  return hideSetting(expr, sf) === true;
 }
 
 function commandLabel(call: ts.CallExpression, sf: ts.SourceFile): string {
@@ -177,6 +194,32 @@ function commandLabel(call: ts.CallExpression, sf: ts.SourceFile): string {
 }
 
 describe('child processes set windowsHide (#1092, #2094)', () => {
+  const hiddenIn = (source: string): boolean => {
+    const sf = ts.createSourceFile('guard.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    let call: ts.CallExpression | undefined;
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && node.expression.getText(sf) === 'spawn') call = node;
+      ts.forEachChild(node, visit);
+    };
+    visit(sf);
+    return !!call && hidesWindow(optionsArg(call, 'spawn'), sf);
+  };
+
+  it('rejects a spread that overrides windowsHide with false', () => {
+    expect(hiddenIn("spawn('git', [], { windowsHide: true, ...{ windowsHide: false } });")).toBe(false);
+    expect(hiddenIn("spawn('git', [], { windowsHide: true, ...unknown });")).toBe(false);
+    expect(hiddenIn("spawn('git', [], { windowsHide: true, ...{ cwd: '.' } });")).toBe(true);
+  });
+
+  it('checks each call site independently when they share an options initializer', () => {
+    expect(hiddenIn(`function run(opts: object) { spawn('git', [], opts); }
+      const safe = { windowsHide: true }; run(safe); run(safe);`)).toBe(true);
+  });
+
+  it('accepts a named options argument without an args array', () => {
+    expect(hiddenIn("const opts = { windowsHide: true }; spawn('git', opts);")).toBe(true);
+  });
+
   it('every child_process spawn under src/ sets windowsHide: true', () => {
     const offenders: string[] = [];
     let seen = 0;

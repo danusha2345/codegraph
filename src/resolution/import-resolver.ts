@@ -1664,9 +1664,14 @@ export function resolvePhpNamespaceAliasInstantiation(
   const separator = ref.referenceName.indexOf('\\');
   if (separator <= 0) return undefined;
   const alias = ref.referenceName.slice(0, separator);
-  const imp = context.getImportMappings(ref.filePath, ref.language)
-    .find((i) => i.localName === alias);
-  if (!imp) return undefined;
+  const imports = context.getImportMappings(ref.filePath, ref.language)
+    .filter((i) => i.localName.toLowerCase() === alias.toLowerCase());
+  if (imports.length === 0) return undefined;
+  // The file-wide mapping has no namespace-scope locations. If separate
+  // namespace blocks reuse an alias, choosing the first fabricates an edge.
+  // Leave the target unknown until a scoped import table is available.
+  if (new Set(imports.map(i => i.source.toLowerCase())).size !== 1) return null;
+  const imp = imports[0]!;
 
   const fqn = imp.source.replace(/^\\/, '') + ref.referenceName.slice(separator);
   const cut = fqn.lastIndexOf('\\');

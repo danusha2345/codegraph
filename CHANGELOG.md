@@ -23,6 +23,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- В PHP namespace alias сопоставляется без учёта регистра; при неоднозначных импортах из разных namespace одного файла resolver оставляет ссылку неизвестной вместо подстановки первого класса.
+- В viewer насыщенный inline-handler больше не занимает места других маршрутов: лимит списка применяется к уникальным маршрутам.
+- Для Windows включено подавление консольного окна при запуске HDL semantic frontend.
 - Installing or removing CodeGraph in Codex now preserves TOML examples in your instructions and recognizes server tables with spaces or quoted names, keeping your configuration readable.
 - In Kotlin, a call on a library type you import, like Jetpack Compose's `Modifier.pad()`, now links to the extension your project declares on that type (`fun Modifier.pad()`), when the calling file can see it: same package, or imported by name or with `.*`. The library type's own methods, like `Modifier.fillMaxSize()`, still never link to a project method that shares the name.
 - In Rust, a call written through a module path, like `crate::util::take(…)`, `super::util::take(…)` or `util::take(…)`, now links to the free function that module declares, and a `use crate::util::take;` now links to it too. Before, a same-named method in an `impl` block above the function, or a function nested inside another one in that file, took the call, and the `use` often linked to nothing.
