@@ -181,6 +181,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - When a project keeps copies of the same code in several modules, a call now links to the copy in the caller's own module, even in deeply nested trees where it could previously land on another module's copy.
 - In TypeScript and JavaScript, a method called on a freshly constructed object, such as `new RegExp(p).exec(s)` or `new URL(u).toString()`, now links only to that class's own (or inherited) method and no longer to an unrelated project method of the same name.
 - In JavaScript and TypeScript, a function declared inside another function now takes calls to its name even when the file also imports that name from a package, such as `resolve` from `node:path`. Such calls used to link to nothing. (#1715)
+- A call like `Logger.log()` now links to `Logger`'s own method instead of the same-named method of a class whose name merely contains it, such as `FileLogger`.
 
 ## [1.6.1] - 2026-09-29
 
