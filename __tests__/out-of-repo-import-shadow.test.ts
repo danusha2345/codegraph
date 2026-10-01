@@ -58,4 +58,12 @@ describe('a name imported from outside the repository', () => {
     });
     expect(await callTargets('configure')).toEqual([]);
   });
+
+  it('is not shadowed by its own top-level require binding', async () => {
+    project({
+      'package.json': JSON.stringify({ name: 'app', devDependencies: { supertest: '^6' } }),
+      'app.js': "var request = require('supertest');\nfunction run(app) { return request(app); }\nmodule.exports = run;\n",
+    });
+    expect(await callTargets('run')).toEqual([]);
+  });
 });

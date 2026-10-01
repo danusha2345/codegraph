@@ -5668,6 +5668,23 @@ function matchEnclosingScopeMember(
 }
 
 /**
+ * The calling file's declarations of an out-of-repo imported name that sit
+ * inside a function or method — only those can shadow the import. A top-level
+ * one is the import's own binding (`request = require('supertest')`), not a
+ * shadow of it.
+ */
+function innerScopeShadows(nodes: Node[], ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  const local = nodes.filter((n) => n.filePath === ref.filePath);
+  if (local.length === 0) return local;
+  const scopes = context.getNodesInFile(ref.filePath).filter((n) => n.kind === 'function' || n.kind === 'method');
+  return local.filter((n) => scopes.some((s) =>
+    s.id !== n.id &&
+    s.startLine <= n.startLine &&
+    (s.endLine ?? s.startLine) >= (n.endLine ?? n.startLine) &&
+    (s.startLine < n.startLine || (s.endLine ?? s.startLine) > (n.endLine ?? n.startLine))));
+}
+
+/**
  * Try to resolve a reference by exact name match
  */
 export function matchByExactName(
@@ -5713,7 +5730,7 @@ export function matchByExactName(
   const importRef = ref.referenceKind === 'imports';
   const inheritanceRef = isInheritanceRef(ref);
   const sameName = outOfRepoCall
-    ? context.getNodesByName(ref.referenceName).filter((n) => n.filePath === ref.filePath)
+    ? innerScopeShadows(context.getNodesByName(ref.referenceName), ref, context)
     : context.getNodesByName(ref.referenceName);
   // `NAME(...)` where NAME is a function-like macro somewhere in the project is
   // an expansion or a call to a same-named function — never the macro itself
