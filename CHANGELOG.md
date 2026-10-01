@@ -191,6 +191,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A call like `Logger.log()` now links to `Logger`'s own method instead of the same-named method of a class whose name merely contains it, such as `FileLogger`.
 - A TypeScript type re-exported through a barrel (`export type { Foo } from`, `export { type Foo } from`, `export type * from`) now links to its real declaration instead of a same-named type elsewhere in the project, and import lists with comments, string names, or a JSDoc `@import` are read correctly. Re-index to update an existing project.
 - `codegraph_explore` and the Claude Code prompt hook are much faster on long prompts, such as a pasted report several thousand characters long, which could run past the hook's 30-second timeout. The results are unchanged. (#2184)
+- Claude Code now shows the model the full text of `codegraph_status` and of explore's stale-index refusal. Both results also carried `structuredContent`, and Claude Code shows a result's `structuredContent` in place of its text, so the model saw only a freshness JSON object: no refusal message, no retry guidance and no status report. Both results are now text only, and the refusal's text lists every file whose freshness it could not verify, where it used to stop at 20. (#2088)
 
 ## [1.6.1] - 2026-09-29
 
