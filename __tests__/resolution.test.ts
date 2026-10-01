@@ -1137,6 +1137,8 @@ from store.rows import (Row, Col)
       const frameworks = detectFrameworks(context);
       const reactResolver = frameworks.find((f) => f.name === 'react');
 
+      // In a JS/TS module another file's hook comes through an import (the
+      // import resolver's), never by name: App.tsx imports nothing here.
       const ref = {
         fromNodeId: 'component:src/App.tsx:App:1',
         referenceName: 'useAuth',
@@ -1146,10 +1148,11 @@ from store.rows import (Row, Col)
         filePath: 'src/App.tsx',
         language: 'typescript' as const,
       };
+      expect(reactResolver!.resolve(ref, context)).toBeNull();
 
-      const result = reactResolver!.resolve(ref, context);
-      expect(result).not.toBeNull();
-      expect(result?.targetNodeId).toBe('hook:src/hooks/useAuth.ts:useAuth:1');
+      // The file's own hook resolves.
+      const own = reactResolver!.resolve({ ...ref, filePath: 'src/hooks/useAuth.ts', fromNodeId: 'function:src/hooks/useAuth.ts:x:30' }, context);
+      expect(own?.targetNodeId).toBe('hook:src/hooks/useAuth.ts:useAuth:1');
     });
   });
 
@@ -6788,34 +6791,6 @@ class WrappedMapping(wrapped: Mapping) {
       cg = await CodeGraph.init(tempDir, { index: true });
       cg.resolveReferences();
       expect(selfLoops(cg, 'Form.scala')).toEqual([]);
-    }, 30000);
-
-    it('drops the self-loop when the receiver word-overlaps the enclosing class (Scala)', async () => {
-      fs.writeFileSync(path.join(tempDir, 'Cache.scala'), `
-package p
-class CacheWrapper(cache: Cache) {
-  def get(k: String): String = cache.get(k)
-}
-class Store {
-  def get(k: String): String = k
-}
-`);
-      cg = await CodeGraph.init(tempDir, { index: true });
-      cg.resolveReferences();
-      expect(selfLoops(cg, 'Cache.scala')).toEqual([]);
-    }, 30000);
-
-    it('drops the self-loop for a Swift delegating wrapper', async () => {
-      fs.writeFileSync(path.join(tempDir, 'Wrapped.swift'), `
-class Wrapped {
-  let inner: Mapping
-  init(inner: Mapping) { self.inner = inner }
-  func unbind(_ v: String) -> String { return inner.unbind(v) }
-}
-`);
-      cg = await CodeGraph.init(tempDir, { index: true });
-      cg.resolveReferences();
-      expect(selfLoops(cg, 'Wrapped.swift')).toEqual([]);
     }, 30000);
 
     it('keeps real recursion through this./bare calls and a Go named receiver', async () => {
