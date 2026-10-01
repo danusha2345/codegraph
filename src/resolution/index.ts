@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { matchKotlinReceiverChain, matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, GO_STDLIB_PACKAGES } from './name-matcher';
+import { matchKotlinReceiverChain, matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, GO_STDLIB_PACKAGES, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
@@ -1239,7 +1239,17 @@ export class ReferenceResolver {
       CHAIN_SHAPE.test(ref.referenceName) &&
       (ref.language === 'typescript' || ref.language === 'javascript' || ref.language === 'tsx' || ref.language === 'jsx' || ref.language === 'python')
     ) {
-      return this.gateLanguage(matchReference(ref, this.context), ref);
+      const chainResult = this.gateLanguage(matchReference(ref, this.context), ref);
+      // `new Sub().inherited()`: the method may live on a supertype of a
+      // project class, resolvable once extends edges exist — defer to the
+      // conformance pass like the other chained calls.
+      if (!chainResult && NEW_RECEIVER_SHAPE.test(ref.referenceName)) {
+        const cls = newReceiverClass(ref, this.context);
+        if (cls && this.context.getNodesByName(cls).some((n) => n.kind === 'class' && sameLanguageFamily(n.language, ref.language))) {
+          this.deferReference(ref, this.deferredChainRefs);
+        }
+      }
+      return chainResult;
     }
 
     const tImp = this.profileStages ? process.hrtime.bigint() : 0n;
@@ -1644,6 +1654,8 @@ export class ReferenceResolver {
       // dotted-receiver languages on `.` (matchDottedCallChain).
       const chainMatch = (ref.language === 'php' && PHP_PROP_SHAPE.test(ref.referenceName))
         ? matchMethodCall(ref, this.context)
+        : NEW_RECEIVER_SHAPE.test(ref.referenceName)
+        ? matchNewReceiverCall(ref, this.context)
         : SCOPED_CHAIN_LANGUAGES.has(ref.language)
         ? matchScopedCallChain(ref, this.context)
         : matchDottedCallChain(ref, this.context);
