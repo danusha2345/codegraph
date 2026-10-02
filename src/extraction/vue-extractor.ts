@@ -3,6 +3,7 @@ import { generateNodeId } from './tree-sitter-helpers';
 import { TreeSitterExtractor } from './tree-sitter';
 import { isLanguageSupported } from './grammars';
 import { vueOptionsMembers } from './vue-options-api';
+import { offsetJsObjectMetadata } from './js-object-bindings';
 
 /**
  * Vue built-in components — skipped so a `<Transition>` / `<KeepAlive>` in the
@@ -254,6 +255,9 @@ export class VueExtractor {
     // part of the file. Name each one, and hand it the calls written inside it.
     if (!block.isSetup) this.addOptionsMembers(block, result, componentNodeId);
 
+    const jsObjectMetadata = new Map(result.edges.filter(edge => edge.kind === 'contains' && edge.metadata?.jsObject)
+      .map(edge => [edge.target, offsetJsObjectMetadata(edge.metadata, block.startLine)]));
+
     // Offset line numbers from script block back to .vue file positions
     for (const node of result.nodes) {
       node.startLine += block.startLine;
@@ -267,11 +271,13 @@ export class VueExtractor {
         source: componentNodeId,
         target: node.id,
         kind: 'contains',
+        metadata: jsObjectMetadata.get(node.id),
       });
     }
 
     // Offset edges (they reference line numbers)
     for (const edge of result.edges) {
+      edge.metadata = offsetJsObjectMetadata(edge.metadata, block.startLine);
       if (edge.line) {
         edge.line += block.startLine;
       }

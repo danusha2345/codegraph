@@ -98,6 +98,33 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
 
   it.each([
     ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('named literal owners, source scopes and qualified candidates: %s (#2300)', (ext, language) => {
+    const source = `/* русский 😀 */ const Api={read(){helper()},close:()=>helper()};
+function helper(){}
+function use(){Api.read()}
+(function(){const Local={read(){helper()}};Local.read();window.A={run(){Local.read()}}})();
+function global(){window.A.run()}
+function shadow(window){window.A.run()}
+function varScope(){if(flag){var Local={read(){helper()}}}Local.read()}
+function mixed(){const Members={run(){helper()}}, data${language === 'typescript' || language === 'tsx' ? ': Foo' : ''}={x:1};Members.run()}
+const Rename={read:function recur(){recur()},opaque:function recur(recur){recur()}};
+const Mutable={run(){helper()}};Mutable.run=external;function changed(){Mutable.run()}
+`;
+    const result = assertParity(`literal.${ext}`, source, language);
+    expect(result.nodes.some(node => node.qualifiedName === 'Api::read')).toBe(true);
+    expect(result.edges.some(edge => edge.metadata?.jsObjectMember === true)).toBe(true);
+    expect(result.unresolvedReferences.some(ref => ref.referenceName === 'window.A.run' && ref.candidates?.includes('window.A::run'))).toBe(true);
+    expect(result.unresolvedReferences.some(ref => ref.candidates?.length === 0)).toBe(true);
+    expect(result.nodes.some(node => node.name === 'data')).toBe(false);
+    expect(result.nodes.find(node => node.qualifiedName === 'mixed::Members::run')?.kind).toBe('function');
+    if (language === 'typescript' || language === 'tsx') {
+      const mixed = result.nodes.find(node => node.qualifiedName === 'mixed')!;
+      expect(result.unresolvedReferences.filter(ref => ref.referenceName === 'Foo').map(ref => ref.fromNodeId)).toEqual([mixed.id]);
+    }
+  });
+
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
   ] as const)('same-line accessors retain distinct identities after Unicode: %s (#1349)', (ext, language) => {
     const source = 'class Point { /* é😀 */ get x() { return read(); } set x(v) { write(v); } }';
     const result = assertParity(`point.${ext}`, source, language);
@@ -187,7 +214,7 @@ async function exprReceivers(x, y) {
       .map((r) => r.referenceName)).toEqual([
         'list().map', 'list', 'x.run',
         ...(typed ? ['x.run', 'y.run', 'x.stop', 'getTarget().install', 'getTarget', 'has'] : []),
-        'f', 'run', 'stop', 'new Runner().go', 'new ns.Widget().draw', 'pick', 'start',
+        'f', 'run', 'stop', 'new Runner().go', 'new ns.Widget().draw', 'pick', 'window.Api.start',
       ]);
   });
 

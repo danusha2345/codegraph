@@ -1775,13 +1775,12 @@ function resurrectRefFromDroppedEdge(
     fromNodeId: e.source,
     referenceName: refName,
     referenceKind: refKind,
-    ...(e.sourceLanguage === 'verilog' && Array.isArray(e.metadata?.refCandidates)
-      && e.metadata.refCandidates.every((c: unknown) => typeof c === 'string')
-      ? { candidates: e.metadata.refCandidates as string[] } : {}),
     line: e.line ?? 0,
     column: e.column ?? 0,
     filePath: e.sourceFilePath,
     language: e.sourceLanguage,
+    ...(Array.isArray(e.metadata?.refCandidates) && e.metadata.refCandidates.every(candidate => typeof candidate === 'string')
+      ? { candidates: e.metadata.refCandidates as string[] } : {}),
   };
 }
 
@@ -3149,9 +3148,9 @@ export class ExtractionOrchestrator {
     const resurrected: UnresolvedReference[] = [];
     for (const e of crossFileIncomingEdges) {
       const name = e.metadata?.refName;
-      // HDL members and ports often share short names within one file.
-      // Replay their qualified reference instead of reattaching by kind/name.
-      if (e.sourceLanguage === 'verilog' && typeof name === 'string') {
+      // Owned/qualified candidates cannot be reattached by a shared short name.
+      // Replay their original reference, including JS literal owners and HDL ports.
+      if ((e.sourceLanguage === 'verilog' || Array.isArray(e.metadata?.refCandidates)) && typeof name === 'string') {
         const ref = resurrectRefFromDroppedEdge(e);
         if (ref) resurrected.push(ref);
         continue;

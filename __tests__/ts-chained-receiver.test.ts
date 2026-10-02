@@ -4,8 +4,9 @@
  * the bare method name for it let every such call exact-match whatever project
  * symbol shared the name, so a storage wrapper's `get` called itself (#1707).
  * Those calls stay unresolved, as do untyped identifier chains (#1566);
- * their qualified source references remain available for effect reporting. The existing
- * `window.MyNs.run()` and `this.<field>.m()` paths remain outside that guard.
+ * their qualified source references remain available for effect reporting.
+ * A proven `window.Known = { ping }` alias and `this.<field>.m()` keep their
+ * project targets; an unknown window namespace does not borrow a free function.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
@@ -41,9 +42,11 @@ beforeAll(async () => {
     'service.ts',
     'declare const window: any;\n' +
       'export function ping(): string { return "pong"; }\n' +
+      'window.Known = { ping };\n' +
       'export function viaGlobal(): string {\n' +
       '  return window.MyNs.ping();\n' +
       '}\n' +
+      'export function viaKnown(): string { return window.Known.ping(); }\n' +
       'export class PingService { ping(): string { return "service"; } }\n' +
       'export class Runner {\n' +
       '  constructor(private svc: PingService) {}\n' +
@@ -89,9 +92,10 @@ describe('TS/JS call through a host-global chain (#1707)', () => {
     );
   });
 
-  it('keeps a chain rooted at a project value — window.MyNs.m() and this.<field>.m()', () => {
+  it('keeps proven global aliases and typed fields, without borrowing from an unknown namespace', () => {
     const ping = fn('ping', 'service.ts').id;
-    expect(callTargets(fn('viaGlobal', 'service.ts').id)).toContain(ping);
+    expect(callTargets(fn('viaGlobal', 'service.ts').id)).toEqual([]);
+    expect(callTargets(fn('viaKnown', 'service.ts').id)).toEqual([ping]);
     expect(callTargets(method('Runner::run').id)).toEqual([method('PingService::ping').id]);
   });
 
