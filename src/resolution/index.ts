@@ -26,7 +26,7 @@ import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibili
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpNamespaceAliasInstantiation, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
+import { resolveViaImport, resolveRustImportedCall, resolvePhpImportedStaticCall, resolvePhpNamespaceAliasInstantiation, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
 import { isVerilogMemberRef, matchVerilogMember } from './verilog-members';
 import { isVerilogPortRef, matchVerilogPort } from './verilog-ports';
 import { isVerilogWildcardRef, matchVerilogWildcard } from './verilog-wildcard';
@@ -1115,6 +1115,11 @@ export class ReferenceResolver {
     // before any import strategy ran; resolve it first.
     const phpAliasInstance = resolvePhpNamespaceAliasInstantiation(ref, this.context);
     if (phpAliasInstance !== undefined) return this.gateLanguage(phpAliasInstance, ref);
+
+    // Rust `use …::take as consume; consume()` can have no node named
+    // `consume`. Its explicit binding takes precedence over name heuristics.
+    const rustImportedCall = resolveRustImportedCall(ref, this.context);
+    if (rustImportedCall !== undefined) return this.gateLanguage(rustImportedCall, ref);
 
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
