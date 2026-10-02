@@ -124,3 +124,11 @@ qualified JS function calls. Отдельный final-candidate guard запре
 passed, 2 expected fail, 32 skipped**. Expected failures — уже существующие
 Python nested-class controls в `method-call-owner-class.test.ts`. Финальный
 полный прогон после уточнений требуется отдельно.
+
+Финальное review ограничило lookup literal metadata целями из JS/TS/SFC
+family и refs с candidates или dotted calls. Это сохраняет missing-member
+guard и не заполняет JS containment/null cache результатами других языков.
+После этой оптимизации проводится финальный полный прогон той же source
+версии. В предыдущем параллельном прогоне тест упаковки Windows archive
+упёрся в 5 s timeout; отдельный `cli-ui-command` + `bundle-launcher` запуск
+прошёл: **17 passed, 2 skipped**. Код упаковки не изменялся.

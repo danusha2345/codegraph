@@ -32,7 +32,7 @@ import { isVerilogPortRef, matchVerilogPort } from './verilog-ports';
 import { isVerilogWildcardRef, matchVerilogWildcard } from './verilog-wildcard';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
-import { resolveJsObjectCall } from './js-object-members';
+import { JS_OBJECT_LANGUAGES, resolveJsObjectCall } from './js-object-members';
 import type { JsObjectInfo } from '../extraction/js-object-bindings';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -1076,7 +1076,9 @@ export class ReferenceResolver {
       ref,
       this.context,
     );
-    const objectInfo = candidate ? this.jsObjectInfo(candidate.targetNodeId) : null;
+    const literalRef = ref.candidates !== undefined || (ref.referenceKind === 'calls' && ref.referenceName.includes('.'));
+    const objectInfo = candidate && literalRef && JS_OBJECT_LANGUAGES.has(this.nodeById(candidate.targetNodeId)?.language ?? '')
+      ? this.jsObjectInfo(candidate.targetNodeId) : null;
     // A missing literal member cannot turn its imported holder into a callable.
     const missingLiteralMember = objectInfo && !objectInfo.ownerId && ref.referenceKind === 'calls' && ref.referenceName.includes('.');
     const wrongLiteralOwner = candidate && ref.candidates !== undefined && objectInfo?.ownerId &&

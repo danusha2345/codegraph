@@ -2,11 +2,11 @@ import type { Node } from '../types';
 import type { ResolutionContext, UnresolvedRef, ResolvedRef } from './types';
 import { resolveObjectLiteralMember, resolveObjectLiteralBinding } from './name-matcher';
 
-const LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx', 'vue', 'svelte', 'astro']);
+export const JS_OBJECT_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx', 'vue', 'svelte', 'astro']);
 
 /** These definitions are value members, never unrelated free/bare function candidates. */
 export function isJsObjectMember(node: Node, context: ResolutionContext): boolean {
-  return LANGUAGES.has(node.language) && !!context.getJsObjectInfo?.(node.id)?.ownerId;
+  return JS_OBJECT_LANGUAGES.has(node.language) && !!context.getJsObjectInfo?.(node.id)?.ownerId;
 }
 
 function contains(scope: [number, number, number, number], ref: UnresolvedRef): boolean {
@@ -17,7 +17,7 @@ function contains(scope: [number, number, number, number], ref: UnresolvedRef): 
 
 /** Resolve only AST-derived qualified candidates; an owned missing member closes fallback. */
 export function resolveJsObjectCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
-  if (!LANGUAGES.has(ref.language) || ref.referenceKind !== 'calls' || ref.candidates === undefined) return undefined;
+  if (!JS_OBJECT_LANGUAGES.has(ref.language) || ref.referenceKind !== 'calls' || ref.candidates === undefined) return undefined;
   const dot = ref.referenceName.lastIndexOf('.');
   if (dot < 0) {
     if (ref.candidates.length === 0) return null; // an AST-proven parameter is an opaque callable value.
