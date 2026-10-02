@@ -132,3 +132,27 @@ guard и не заполняет JS containment/null cache результата�
 версии. В предыдущем параллельном прогоне тест упаковки Windows archive
 упёрся в 5 s timeout; отдельный `cli-ui-command` + `bundle-launcher` запуск
 прошёл: **17 passed, 2 skipped**. Код упаковки не изменялся.
+
+## Финальный локальный результат перед push
+
+Source revision: `97141f900d370352a50094abbd17b45f0a690cbf`.
+Проверены все **492 файла**: полный native набор, кроме CLI viewer, запущен
+параллельно с upstream validation; `cli-ui-command.test.ts` проверен отдельно
+из-за фиксированного default port. Два 5-second timeout Windows archive
+controls из `bundle-launcher.test.ts` повторены вместе с CLI в последовательном
+запуске и прошли. Итог по уникальным тестам: **6288 passed, 2 expected fail,
+32 skipped**. Код архиватора и постоянная test config не изменялись.
+
+- Основной финальный лог: `integration-published-full-native.log`.
+- Отдельный CLI/archive запуск: `integration-published-cli-bundle.log`,
+  **17 passed, 2 skipped**; повторные тесты не суммируются с общим итогом.
+- Fresh root `npm run build` и dist public smoke после performance guard:
+  native/WASM plain object, IIFE, namespace caller, same-line sync/reopen —
+  успешно (`integration-published-build.log`, `integration-published-runtime-*.log`).
+- Установленный CLI указывает на root `dist/bin/codegraph.js`. Собственный
+  индекс CodeGraph синхронизирован: stamp **38**, state **complete**,
+  pending refs/changes **0**, reindexRecommended **false**; evidence
+  `integration-published-index-status.json`.
+
+Пользовательские проекты не переиндексировались. Проверки выполнены на Linux;
+реальные Windows/macOS runtime и GUI A/B не проводились.
