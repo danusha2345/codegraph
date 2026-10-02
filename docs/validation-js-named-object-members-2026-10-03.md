@@ -108,3 +108,19 @@ Rust imported-call, Kotlin receiver-chain, PHP namespace-alias и Verilog/HDL
 `integration-sync-regression.log` и `integration-sfc-{native,wasm}.json`
 в указанном validation directory. Полная интеграционная проверка и индекс
 будут зафиксированы после завершения.
+
+Дополнительная проверка импортированного literal выявила границу старого
+локального reattachment: импортный `A.read()` не имеет AST candidates,
+поэтому одинаковые короткие имена тоже должны быть разрешены заново.
+Перенос теперь повторяет исходные refs при ambiguous kind/name и при
+qualified JS function calls. Отдельный final-candidate guard запрещает
+подменять отсутствующий member его direct literal holder; прежние factory
+и typed-class targets этого marker не имеют. Строгий контроль проверяет
+перестановку, reopen, удаление `A.read` при сохранённом `B.read` и возвращение
+метода. Финальный связанный набор: **283/283**, 5 файлов; оба extractor modes
+проверены public-graph suite.
+
+Первый полный локальный прогон до этих двух уточнений: **492 файла, 6286
+passed, 2 expected fail, 32 skipped**. Expected failures — уже существующие
+Python nested-class controls в `method-call-owner-class.test.ts`. Финальный
+полный прогон после уточнений требуется отдельно.

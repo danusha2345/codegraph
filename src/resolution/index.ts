@@ -1076,8 +1076,12 @@ export class ReferenceResolver {
       ref,
       this.context,
     );
-    const literal = candidate && ref.candidates !== undefined && this.jsObjectInfo(candidate.targetNodeId)?.ownerId &&
-      !ref.candidates.includes(this.nodeById(candidate.targetNodeId)?.qualifiedName ?? '') ? null : candidate;
+    const objectInfo = candidate ? this.jsObjectInfo(candidate.targetNodeId) : null;
+    // A missing literal member cannot turn its imported holder into a callable.
+    const missingLiteralMember = objectInfo && !objectInfo.ownerId && ref.referenceKind === 'calls' && ref.referenceName.includes('.');
+    const wrongLiteralOwner = candidate && ref.candidates !== undefined && objectInfo?.ownerId &&
+      !ref.candidates.includes(this.nodeById(candidate.targetNodeId)?.qualifiedName ?? '');
+    const literal = missingLiteralMember || wrongLiteralOwner ? null : candidate;
     const scoped = this.gateRustScope(literal, ref);
     const resolved = this.gateSuperSelfCall(
       scoped?.resolvedBy === 'framework' ? this.gateFrameworkLanguage(scoped, ref) : this.gateLanguage(scoped, ref),

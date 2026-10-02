@@ -231,6 +231,29 @@ function nested(){const inner={read(){return 2}};inner.read()}
     expect(cg.getOutgoingEdgesFrom([symbol('consume').id]).find(e => e.kind === 'calls')?.metadata?.refCandidates).toEqual(['window.A::read']);
   });
 
+  it('same-line imported literal members keep their owner across target-only sync and reopen without candidates', async () => {
+    await index({
+      'api.js': 'export const B={read(){return 1}};export const A={read(){return 2}};',
+      'caller.js': "import {A} from './api';function importedCaller(){A.read()}",
+    });
+    expect(callees('importedCaller').map(node => node.id)).toEqual([symbol('A::read').id]);
+    const callEdge = cg!.getOutgoingEdgesFrom([symbol('importedCaller').id]).find(edge => edge.kind === 'calls')!;
+    expect(callEdge.metadata?.refCandidates).toBeUndefined(); // import strategy intentionally has no AST candidate array.
+    write('api.js', 'export const A={read(){return 3}};export const B={read(){return 4}};');
+    await cg!.sync();
+    expect(callees('importedCaller').map(node => node.id)).toEqual([symbol('A::read').id]);
+    cg!.close();
+    cg = CodeGraph.openSync(root);
+    expect(callees('importedCaller').map(node => node.id)).toEqual([symbol('A::read').id]);
+    expect(cg.getOutgoingEdgesFrom([symbol('importedCaller').id]).find(edge => edge.kind === 'calls')?.metadata?.refCandidates).toBeUndefined();
+    write('api.js', 'export const A={};export const B={read(){return 5}};');
+    await cg.sync();
+    expect(callees('importedCaller')).toEqual([]);
+    write('api.js', 'export const A={read(){return 6}};export const B={read(){return 7}};');
+    await cg.sync();
+    expect(callees('importedCaller').map(node => node.id)).toEqual([symbol('A::read').id]);
+  });
+
   it('parallel parse/store/resolution preserves ownership instead of borrowing a same-named file', async () => {
     vi.stubEnv('CODEGRAPH_PARSE_WORKERS', '2');
     vi.stubEnv('CODEGRAPH_PARALLEL_RESOLVE_MIN', '0');

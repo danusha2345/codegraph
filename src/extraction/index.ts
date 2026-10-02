@@ -3141,21 +3141,27 @@ export class ExtractionOrchestrator {
     validNodes: Node[]
   ): void {
     const newNodesByKindName = new Map<string, string>();
+    const ambiguousKindNames = new Set<string>();
     for (const n of validNodes) {
-      newNodesByKindName.set(`${n.kind}\0${n.name}`, n.id);
+      const key = `${n.kind}\0${n.name}`;
+      if (newNodesByKindName.has(key)) ambiguousKindNames.add(key);
+      newNodesByKindName.set(key, n.id);
     }
     const reinserted: Edge[] = [];
     const resurrected: UnresolvedReference[] = [];
     for (const e of crossFileIncomingEdges) {
       const name = e.metadata?.refName;
-      // Owned/qualified candidates cannot be reattached by a shared short name.
-      // Replay their original reference, including JS literal owners and HDL ports.
-      if ((e.sourceLanguage === 'verilog' || Array.isArray(e.metadata?.refCandidates)) && typeof name === 'string') {
+      // Owned/qualified candidates and duplicate short names require the original ref.
+      // Imported literals can share a member name without AST-local candidates.
+      const key = `${e.targetKind}\0${e.targetName}`;
+      const qualifiedJsFunction = e.targetKind === 'function' && typeof name === 'string' && name.includes('.') &&
+        ['typescript', 'tsx', 'javascript', 'jsx', 'arkts', 'vue', 'svelte', 'astro'].includes(e.sourceLanguage);
+      if ((e.sourceLanguage === 'verilog' || Array.isArray(e.metadata?.refCandidates) || ambiguousKindNames.has(key) || qualifiedJsFunction) && typeof name === 'string') {
         const ref = resurrectRefFromDroppedEdge(e);
         if (ref) resurrected.push(ref);
         continue;
       }
-      const newTargetId = newNodesByKindName.get(`${e.targetKind}\0${e.targetName}`);
+      const newTargetId = newNodesByKindName.get(key);
       if (newTargetId) {
         reinserted.push({ source: e.source, target: newTargetId, kind: e.kind, metadata: e.metadata, line: e.line, column: e.column, provenance: e.provenance });
       } else {
