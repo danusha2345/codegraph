@@ -1,6 +1,6 @@
 /** Exact named Rust `use` bindings at a source location; globs stay unsupported. */
 export interface RustUseBindings {
-  /** 1-based line, 0-based UTF-8 byte column, as in tree-sitter references. */
+  /** 1-based line, 0-based UTF-16 column, as in CodeGraph nodes and references. */
   get(name: string, line: number, column: number): string | null | undefined;
   /** Whether a declaration lies within the nearest binding's lexical scope. */
   isInBindingScope(name: string, line: number, column: number, declarationLine: number, declarationColumn: number): boolean;
@@ -179,16 +179,7 @@ export function parseRustUseBindings(content: string): RustUseBindings {
     if (!Number.isInteger(line) || line < 1 || line > lines.length || !Number.isInteger(column) || column < 0) return null;
     const start = lines[line - 1]!;
     const text = content.slice(start, (lines[line] ?? content.length + 1) - 1);
-    let offset = start;
-    let bytes = 0;
-    for (const char of text) {
-      if (bytes >= column) break;
-      const size = Buffer.byteLength(char);
-      if (bytes + size > column) return null;
-      bytes += size;
-      offset += char.length;
-    }
-    return bytes === column ? offset : null;
+    return column <= text.length ? start + column : null;
   };
   const scopeAt = (offset: number): Scope | null => {
     let lo = 0;

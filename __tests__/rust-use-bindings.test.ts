@@ -6,7 +6,7 @@ function at(source: string, marker: string, name: string) {
   expect(offset).toBeGreaterThanOrEqual(0);
   const before = source.slice(0, offset);
   const line = before.split('\n').length;
-  const column = Buffer.byteLength(before.slice(before.lastIndexOf('\n') + 1));
+  const column = before.slice(before.lastIndexOf('\n') + 1).length;
   return parseRustUseBindings(source).get(name, line, column);
 }
 
@@ -15,7 +15,7 @@ function inBindingScope(source: string, call: string, declaration: string) {
     const offset = source.indexOf(marker);
     expect(offset).toBeGreaterThanOrEqual(0);
     const before = source.slice(0, offset);
-    return [before.split('\n').length, Buffer.byteLength(before.slice(before.lastIndexOf('\n') + 1))] as const;
+    return [before.split('\n').length, before.slice(before.lastIndexOf('\n') + 1).length] as const;
   };
   const site = position(call);
   const decl = position(declaration);
@@ -117,13 +117,14 @@ fn call() { take(); /* root */ }
     expect(at(source, 'write(); /* child */', 'write')).toBe('::external::write');
   });
 
-  it('accepts UTF-8 byte columns and CRLF, rejecting invalid source positions', () => {
+  it('accepts UTF-16 columns and CRLF, rejecting invalid source positions', () => {
     const source = 'use crate::real::take;\r\nfn call() { let crab = "🦀"; take(); }\r\n';
     expect(at(source, 'take();', 'take')).toBe('crate::real::take');
     const index = parseRustUseBindings(source);
     expect(index.get('take', 0, 0)).toBeUndefined();
     expect(index.get('take', 2, 1000)).toBeUndefined();
-    expect(index.get('take', 2, 25)).toBeUndefined(); // inside the crab's UTF-8 bytes.
+    const column = source.split('\n')[1]!.indexOf('take();');
+    expect(index.get('take', 2, column)).toBe('crate::real::take');
   });
   it('a root import can be shadowed by a nested function declaration', () => {
     const source = `use crate::util::take;

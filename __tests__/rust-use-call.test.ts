@@ -100,6 +100,8 @@ pub fn ambiguous() { take(); }
     'tests/bad_inline.rs': 'mod hidden { mod support { pub mod panic; } }\nuse support::panic::test_panic;\npub fn bad_inline() { test_panic(); }\n',
     'tests/support/panic.rs': 'pub fn test_panic() {}\n',
     'src/sync.rs': 'use crate::a::take;\npub fn synced() { take(); }\n',
+    'src/unicode.rs': 'use crate::util::take;\npub fn unicode() { let crab = "🦀Я"; take(); }\n',
+    'src/unicode_scoped.rs': 'pub fn unicode_scoped() { let crab = "🦀Я"; { use crate::util::take as consume; consume(); } }\n',
     'crates/one/Cargo.toml': '[package]\nname = "one"\nversion = "0.1.0"\n',
     'crates/one/src/lib.rs': 'pub mod util;\n',
     'crates/one/src/util.rs': 'pub fn take() {}\n',
@@ -190,6 +192,11 @@ describe('Rust bare calls bound by use', () => {
   it('binds crate-root functions and same-file aliases', () => {
     expect(calls('src/root_call.rs', 'root_call')).toEqual(['function root_take src/lib.rs:7']);
     expect(calls('src/same_file.rs', 'same_file')).toEqual(['function same_take src/same_file.rs:1']);
+  });
+
+  it('uses UTF-16 source columns after Cyrillic and emoji on the call line', () => {
+    expect(calls('src/unicode.rs', 'unicode')).toEqual([take]);
+    expect(calls('src/unicode_scoped.rs', 'unicode_scoped')).toEqual([take]);
   });
 
   it('resolves crate relative to the caller rather than another package', () => {

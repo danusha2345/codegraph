@@ -2406,7 +2406,7 @@ export function resolveRustImportedCall(ref: UnresolvedRef, context: ResolutionC
   if (ref.language !== 'rust' || ref.referenceKind !== 'calls' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return undefined;
   const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
   if (line === undefined) return undefined;
-  const column = Buffer.from(line).subarray(0, ref.column).toString('utf8').length;
+  const column = ref.column;
   // Chained leaf refs point at the receiver/head. Never substitute another
   // occurrence of the same name on the line for this call's recorded start.
   if (!line.startsWith(ref.referenceName, column) || /(?:\.|::)\s*$/.test(line.slice(0, column))) return undefined;
