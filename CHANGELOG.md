@@ -20,6 +20,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Path search between two symbols no longer slows down sharply or grows its memory use on densely connected graphs. (#1583)
 - Java `record` declarations are now indexed as classes, with their methods, constructors, components and implicit accessors, so calls on a record-typed value like `info.remoteAddress()` resolve and records show up in callers, impact and implementations; re-index Java projects after upgrading.
 - Play projects no longer send `Class.method` calls to another class's method in the same file. In a Play app, a route handler or a call like `MediaType.parse(...)` went to the first method with that name anywhere in the class's file — often a nested or sibling class's — and now goes only to a method of the class it names.
+- Go method calls now resolve through the receiver's declared type — an unexported or package-qualified parameter, a constructor's result, or a variable named like a standard-library package (`ring`, `token`) — and a receiver typed outside the project (`net.Conn`, `*bytes.Buffer`, `error`) no longer links to an unrelated project method of the same name; re-index to pick this up.
 
 ## [1.6.2] - 2026-10-03
 
