@@ -1783,13 +1783,12 @@ function resurrectRefFromDroppedEdge(
     fromNodeId: e.source,
     referenceName: refName,
     referenceKind: refKind,
-    ...(e.sourceLanguage === 'verilog' && Array.isArray(e.metadata?.refCandidates)
-      && e.metadata.refCandidates.every((c: unknown) => typeof c === 'string')
-      ? { candidates: e.metadata.refCandidates as string[] } : {}),
     line: e.line ?? 0,
     column: e.column ?? 0,
     filePath: e.sourceFilePath,
     language: e.sourceLanguage,
+    ...(Array.isArray(e.metadata?.refCandidates) && e.metadata.refCandidates.every(candidate => typeof candidate === 'string')
+      ? { candidates: e.metadata.refCandidates as string[] } : {}),
   };
 }
 
@@ -3243,6 +3242,15 @@ export class ExtractionOrchestrator {
         const ref = resurrectRefFromDroppedEdge(e);
         if (ref) resurrected.push(ref);
         continue;
+      }
+      // Literal ownership candidates must be replayed against the edited file;
+      // retaining a definition identity alone does not retain its value proof.
+      if (Array.isArray(e.metadata?.refCandidates)) {
+        const ref = resurrectRefFromDroppedEdge(e);
+        if (ref) {
+          resurrected.push(ref);
+          continue;
+        }
       }
       const newTargetId = replacementOf.get(e.target);
       if (newTargetId) {
