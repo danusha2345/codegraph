@@ -1871,9 +1871,8 @@ function isGoExternalQualified(ref: UnresolvedRef, context: ResolutionContext): 
   if (before) {
     const imported = context.getImportMappings(ref.filePath, 'go').find((m) => m.localName === before);
     if (imported) {
-      const mod = context.getGoModule?.();
       const local = imported.source.startsWith('.') || imported.source.includes('/internal/') ||
-        (mod !== undefined && mod !== null && (imported.source === mod.modulePath || imported.source.startsWith(`${mod.modulePath}/`)));
+        !!context.getGoModuleForImport?.(imported.source);
       external = !local;
     }
   }
@@ -9921,9 +9920,13 @@ function goImportedPackageDirs(
 ): ((dir: string) => boolean) | null {
   const imp = context.getImportMappings(filePath, 'go').find((i) => i.localName === pkg);
   if (!imp) return null;
-  const mod = context.getGoModule?.();
-  if (mod && (imp.source === mod.modulePath || imp.source.startsWith(mod.modulePath + '/'))) {
-    const pkgDir = imp.source === mod.modulePath ? '' : imp.source.slice(mod.modulePath.length + 1);
+  const mod = context.getGoModuleForImport?.(imp.source, filePath);
+  if (mod) {
+    // The module's own directory (the project root, or wherever its go.mod
+    // sits — #2322) followed by the rest of the import path.
+    const modDir = path.relative(context.getProjectRoot(), mod.rootDir).replace(/\\/g, '/');
+    const subDir = imp.source === mod.modulePath ? '' : imp.source.slice(mod.modulePath.length + 1);
+    const pkgDir = modDir && subDir ? `${modDir}/${subDir}` : modDir || subDir;
     return (dir) => dir === pkgDir;
   }
   const src = '/' + imp.source;
@@ -9981,8 +9984,8 @@ function goInferredTypeName(raw: string, filePath: string, context: ResolutionCo
 function goIsExternalImport(pkg: string, filePath: string, context: ResolutionContext): boolean {
   const imp = context.getImportMappings(filePath, 'go').find((i) => i.localName === pkg);
   if (!imp) return false;
-  const mod = context.getGoModule?.();
-  if (mod) return imp.source !== mod.modulePath && !imp.source.startsWith(mod.modulePath + '/');
+  if (context.getGoModuleForImport?.(imp.source, filePath)) return false;
+  if (context.getGoModuleOfFile?.(filePath)) return true;
   return !imp.source.split('/')[0]!.includes('.');
 }
 
@@ -10151,14 +10154,10 @@ function matchGoFieldChainCall(
       // fabrication this matcher exists to prevent (#1276).
       if (rawType.includes('.')) {
         const pkg = rawType.split('.')[0]!;
-        const mod = context.getGoModule?.();
         const imp = context
           .getImportMappings(s.filePath, 'go')
           .find((i) => i.localName === pkg);
-        const inModule =
-          !!mod &&
-          !!imp &&
-          (imp.source === mod.modulePath || imp.source.startsWith(mod.modulePath + '/'));
+        const inModule = !!imp && !!context.getGoModuleForImport?.(imp.source);
         if (!inModule) continue;
       }
       // Unexported (lowercase) types are idiomatic Go and stay eligible —
