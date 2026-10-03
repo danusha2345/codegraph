@@ -63,6 +63,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Claude Code, agents now receive all of CodeGraph's guidance. Claude Code cuts each MCP server's instructions at 2,048 characters, so agents never saw the rules for stale-index warnings or for a project that isn't indexed; the guidance now fits, with those rules first. Thanks @inth3shadows. (#1529)
 - In PHP, a class written through a namespace alias now resolves whatever case the alias is written in (`new field\FirstName()` after `use App\Fields as Field;`), and a file whose `namespace { }` blocks bind the same alias to different namespaces no longer links every use of it to the first one. (#2256)
 - In Go, calls between the packages of a module whose `go.mod` sits in a subdirectory instead of the project root, like a `server/` backend next to a `web/` frontend or several modules side by side, now resolve, so a package-qualified call such as `store.New()` or a call through a struct field such as `s.db.CreateItem()` finds its target; re-index after upgrading. Thanks @GoDiao for the report. (#2322)
+- An Axum or Actix route whose handler rustfmt wrapped onto a line below the route call now links to that handler, and a call inside a closure handler, or the next route after an Actix resource, is no longer taken for a route's handler (#2326). Thanks @mg-mg-mg.
 
 
 ## [1.6.2] - 2026-10-03
