@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- `codegraph serve --mcp --no-telemetry` turns telemetry off for one MCP server entry, so a shared MCP config can opt out without an environment variable. (#1908)
 - **Verilog and SystemVerilog are indexed.** Modules, packages, interfaces and modports, named instances, ports and signals, always/assign blocks and generate scopes are searchable, and `codegraph_explore` surfaces the instantiation path from a top module down to a nested one; based on the extractor contributed in #402 by @FHYQ-Dong. Re-index projects that contain Verilog files.
 - **HDL port bindings resolve to their formal ports.** Named, positional and wildcard (`.*`) connections link an instance's local signals to the instantiated module's ports, and bit or part selects keep their base signal.
 - **Signal readers and writers on request.** `codegraph_explore` with `hdlAccess` (CLI: `codegraph explore --hdl-access`) lists where a signal is read, written, used as a control condition or as a clock/reset event, including the direction of arguments passed to known functions and tasks.
@@ -23,10 +24,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- **Go methods now record whether they are exported.** A method on a Go type (`func (w *writer) Close()`) was always indexed as unexported, whatever the case of its name; only plain functions carried the flag. Both the native kernel and the WebAssembly path now apply Go's rule — an uppercase first letter — to methods too, so a tool asking "can another package call this?" gets the right answer. Re-index after upgrading.
 - Indexing and sync on large projects, especially C and C++ codebases with huge generated headers, now keep cached source text and preprocessor data within a fixed memory budget, so the final resolution pass no longer runs out of memory. (#1583)
 - `codegraph_impact` on a heavily referenced symbol now stops at a safety limit and says the answer was truncated, instead of exhausting the MCP server's memory; narrow it with `file` or a smaller `depth`. (#1583)
 - The MCP server now recycles its query workers after they sit idle, releasing the memory a burst of large queries left behind while keeping one worker warm for the next call. (#1583)
 - Path search between two symbols no longer slows down sharply or grows its memory use on densely connected graphs. (#1583)
+- **A C `#if` group whose branches are not whole statements no longer produces phantom functions.** An `else if (…) { … }` arm kept behind `#ifdef`, an `if (…)` header whose body sits after the `#endif` (the ST HAL's per-device latency tables), or a function signature that differs per configuration all read to the C grammar as a function *named* `if` — and every real function after it in the file was then filed underneath it, or dropped. Such a group is now collapsed to its first live branch before parsing, offsets kept, and block macros written in capitals (`ATOMIC_BLOCK(…) { … }`) are recognized like their lowercase cousins. On a betaflight tree 265 phantom nested functions became 5, and whole functions that had been missing (`spiInternalStartDMA`, `processSmartPortTelemetry`, the CMSIS matrix routines) are back with their callers at exact-match confidence. Re-index after upgrading.
 - Java `record` declarations are now indexed as classes, with their methods, constructors, components and implicit accessors, so calls on a record-typed value like `info.remoteAddress()` resolve and records show up in callers, impact and implementations; re-index Java projects after upgrading.
 - Play projects no longer send `Class.method` calls to another class's method in the same file. In a Play app, a route handler or a call like `MediaType.parse(...)` went to the first method with that name anywhere in the class's file — often a nested or sibling class's — and now goes only to a method of the class it names.
 - Go method calls now resolve through the receiver's declared type — an unexported or package-qualified parameter, a constructor's result, or a variable named like a standard-library package (`ring`, `token`) — and a receiver typed outside the project (`net.Conn`, `*bytes.Buffer`, `error`) no longer links to an unrelated project method of the same name; re-index to pick this up.
@@ -45,10 +48,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In JavaScript and TypeScript, the methods of a named object literal now get their own symbols even when the object isn't exported: a plain `const api = { load() {…} }`, an object declared inside an IIFE, or a namespace hung off the page like `window.App = { load() {…} }`. A call like `api.load()` or `window.App.load()` now reaches that method, and the calls made inside it are its own instead of the object's, so script-tag apps no longer lose most of their code from callers and impact. Re-index JavaScript and TypeScript projects after upgrading. (#2300)
 - `codegraph_explore` and the Claude Code prompt hook are much faster on long prompts, such as a pasted report several thousand characters long, which could run past the hook's 30-second timeout. The results are unchanged. (#2184)
 - In Rust, a call to a function brought in by `use`, like `take(3)` after `use crate::util::take;` (also through an `as` alias, a nested group or a `use` inside a function), and a call written as a module path, like `crate::util::take(3)` or `super::util::take(3)`, now link to the function that module declares. Before, they could land on a same-named function of another module, or on a same-named method declared above the function. (#2308)
+- C function-pointer calls no longer link to a Python or Rust function that happens to share the handler's name, and such a function no longer hides the real C handler.
 - Indexing a project that vendors tree-sitter grammars is faster: the C function-pointer pass now skips generated C files, and a tree-sitter `parser.c` counts as generated even when it carries no banner (releases before 0.25 print none).
 - Linking callbacks and events is faster on files with many registrations: line numbers come from a newline index instead of re-splitting the file for every match.
 - In TypeScript, `this.field.method()` on a type declared in two equally near apps now picks the same target on every machine. The tie used to be broken by locale-dependent string comparison, so indexes built with different system locales could disagree.
 - A call like `Logger.log()` now links to `Logger`'s own method instead of the same-named method of a class whose name merely contains it, such as `FileLogger`.
+- Java calls through static fields now follow the correct nested type, inherited field, or concrete initializer without linking external library calls to unrelated project methods. (#1949)
 - Installing or removing CodeGraph in Codex now preserves TOML examples in your instructions and recognizes server tables with spaces or quoted names, keeping your configuration readable. (#2250) Thanks @rudycelekli.
 - Searches with `path:` or `name:` filters now find matching symbols before unrelated results consume the limit, including typo searches and queries containing only filters.
 - A TypeScript type re-exported through a barrel (`export type { Foo } from`, `export { type Foo } from`, `export type * from`) now links to its real declaration instead of a same-named type elsewhere in the project, and import lists with comments, string names, or a JSDoc `@import` are read correctly. Re-index to update an existing project.
@@ -57,6 +62,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Kotlin calls through imported types now avoid unrelated same-named methods while retaining inherited members and project extension functions. (#1948)
 - In Claude Code, agents now receive all of CodeGraph's guidance. Claude Code cuts each MCP server's instructions at 2,048 characters, so agents never saw the rules for stale-index warnings or for a project that isn't indexed; the guidance now fits, with those rules first. Thanks @inth3shadows. (#1529)
 - In PHP, a class written through a namespace alias now resolves whatever case the alias is written in (`new field\FirstName()` after `use App\Fields as Field;`), and a file whose `namespace { }` blocks bind the same alias to different namespaces no longer links every use of it to the first one. (#2256)
+
 
 ## [1.6.2] - 2026-10-03
 
@@ -270,7 +276,6 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - PHP calls on `$this`, `self`, `static` and `parent` now reach the method of the class they're written in, a class it extends, or a trait any of them uses, with parent classes and traits found through the file's `namespace` and `use` imports. On Drupal core, `$this->assertEquals()` (PHPUnit's) used to link to an unrelated comparator class 8,832 times, `$this->assertSession()` to a JavaScript-test base class, and `$this->t()` to `Views::t`. They now reach `UiHelperTrait` and `StringTranslationTrait`, or nothing when the method lives in a package outside the repository. A call inside a trait, and a base class calling a method its subclass defines, keep their links. Re-index PHP projects after upgrading.
 - A PHP function call written after `=>` in an array, like `'count' => count($items)`, `'by' => user()->id` or `'label' => trans('…')`, is now read as a plain function call. It used to be taken for a method call and linked to whichever class had a method of that name. On BookStack, that meant 166 wrong links.
 - A PHP call written without a receiver, such as `redirect($url)`, `view('books.show')`, `auth()` or `basename($path)`, is a function call, and no longer links to a same-named method, field or class elsewhere in the project. These wrong links showed up in callers, impact and `codegraph_explore` answers wherever a Laravel helper or PHP built-in shared its name with a project member. Re-index PHP projects after upgrading.
-- **A C `#if` group whose branches are not whole statements no longer produces phantom functions.** An `else if (…) { … }` arm kept behind `#ifdef`, an `if (…)` header whose body sits after the `#endif` (the ST HAL's per-device latency tables), or a function signature that differs per configuration all read to the C grammar as a function *named* `if` — and every real function after it in the file was then filed underneath it, or dropped. Such a group is now collapsed to its first live branch before parsing, offsets kept, and block macros written in capitals (`ATOMIC_BLOCK(…) { … }`) are recognized like their lowercase cousins. On a betaflight tree 265 phantom nested functions became 5, and whole functions that had been missing (`spiInternalStartDMA`, `processSmartPortTelemetry`, the CMSIS matrix routines) are back with their callers at exact-match confidence. Re-index after upgrading.
 
 ## [1.6.1] - 2026-09-29
 
@@ -285,8 +290,6 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Upgrading:** re-index your projects after this release — several fixes and the new navigation links are written while indexing.
 
 ### New Features
-
-- `codegraph serve --mcp --no-telemetry` turns telemetry off for one MCP server entry, so a shared MCP config can opt out without an environment variable. (#1908)
 
 - **Codex and Astra read project guidance from `AGENTS.md`.** The canonical agent guide now lives in `AGENTS.md` (with a nested `docs/AGENTS.md` for long validation notes); `CLAUDE.md` is a thin `@AGENTS.md` wrapper for Claude Code. Codex/Astra no longer miss the old CLAUDE-only instructions.
 
@@ -310,8 +313,6 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The Claude Code prompt hook no longer runs on the task-notification messages Claude Code injects when a background agent finishes, removing a multi-second stall on every such turn. (#1832)
 
-- C function-pointer calls no longer link to a Python or Rust function that happens to share the handler's name, and such a function no longer hides the real C handler.
-
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)
@@ -320,7 +321,6 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Zustand actions keep their callers when read through typed stores, destructured from store state, or selected by a hook.
 - Direct React Native bridge calls retain their native implementations and cross-platform relationships.
 - Dart extension-type getters remain searchable when using the WebAssembly parser.
-- Java calls through static fields now follow the correct nested type, inherited field, or concrete initializer without linking external library calls to unrelated project methods. (#1949)
 
 - Calling a built-in method on an awaited value no longer records a call into an unrelated class that happens to declare a method of the same name, and a variable bound to an awaited call now resolves methods on the type that call returns. Thanks @maxmilian. (#1840)
 - Spring mappings now include every declared path combination and resolve constants declared in the same file, while unresolved paths no longer appear as false root routes. (#1461)
@@ -485,7 +485,6 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A bare call inside a JavaScript or TypeScript method no longer resolves to the method itself.** When a method and a module-scope function share a name, `serialize(this.raw)` written inside `Record.serialize` means the function, but the nearest same-named definition won the tie and the graph recorded the method calling itself. A call written without a receiver can never reach a method in JS/TS, so methods are no longer candidates for it; `this.serialize()` and `other.serialize()` resolve as before. (#1714)
 - **Fuzzy matching no longer lands on a closure it cannot reach.** A function nested inside another function is only callable from inside its container, and exact-name matching already declined such candidates; the fuzzy fallback did not, so a builtin method call (`res.text()`, `items.push()`) whose only same-named project symbol was some file's closure resolved onto that closure. The fallback now checks that the one candidate it would commit to is reachable, and declines otherwise — it does not filter the candidate list first, which would turn a crowd of same-named definitions into a single "unique" survivor and hand it every call of that name. On vite that removes the 12 edges onto nested functions and adds none. Re-index after upgrading. Thanks @bompus. (#1708, #1709)
 - **An import that names the emitted extension resolves to its source.** Under `moduleResolution: node16 | nodenext | bundler` TypeScript requires `import { x } from './util.js'` for `util.ts`, and no file of that name exists, so the import resolver returned nothing and every name imported that way fell through to bare-name matching: a method wrapping the same-named helper it imports (`renderDockStyles() { return renderDockStyles(); }`) resolved to itself, and cross-module edges in such projects were name guesses. `.js` / `.jsx` / `.mjs` / `.cjs` specifiers now retry with the source extensions TypeScript compiles from when the emitted file is absent; a real `.js` beside the `.ts` still wins. On a 582-file repo whose `.ts` files import this way, import-backed `calls`/`imports` edges went from 4,002 to 7,312 and the eight wrapper-method self-edges disappeared. Re-index after upgrading. Thanks @bompus. (#1705, #1706)
-- **Go methods now record whether they are exported.** A method on a Go type (`func (w *writer) Close()`) was always indexed as unexported, whatever the case of its name; only plain functions carried the flag. Both the native kernel and the WebAssembly path now apply Go's rule — an uppercase first letter — to methods too, so a tool asking "can another package call this?" gets the right answer. Re-index after upgrading.
 
 - Files under an `e2e/` directory now count as tests.
 
