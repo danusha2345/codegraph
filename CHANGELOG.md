@@ -46,6 +46,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph_explore` and the Claude Code prompt hook are much faster on long prompts, such as a pasted report several thousand characters long, which could run past the hook's 30-second timeout. The results are unchanged. (#2184)
 - In Rust, a call to a function brought in by `use`, like `take(3)` after `use crate::util::take;` (also through an `as` alias, a nested group or a `use` inside a function), and a call written as a module path, like `crate::util::take(3)` or `super::util::take(3)`, now link to the function that module declares. Before, they could land on a same-named function of another module, or on a same-named method declared above the function. (#2308)
 - Indexing a project that vendors tree-sitter grammars is faster: the C function-pointer pass now skips generated C files, and a tree-sitter `parser.c` counts as generated even when it carries no banner (releases before 0.25 print none).
+- Linking callbacks and events is faster on files with many registrations: line numbers come from a newline index instead of re-splitting the file for every match.
 
 ## [1.6.2] - 2026-10-03
 
