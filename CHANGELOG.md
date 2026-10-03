@@ -48,6 +48,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Indexing a project that vendors tree-sitter grammars is faster: the C function-pointer pass now skips generated C files, and a tree-sitter `parser.c` counts as generated even when it carries no banner (releases before 0.25 print none).
 - Linking callbacks and events is faster on files with many registrations: line numbers come from a newline index instead of re-splitting the file for every match.
 - In TypeScript, `this.field.method()` on a type declared in two equally near apps now picks the same target on every machine. The tie used to be broken by locale-dependent string comparison, so indexes built with different system locales could disagree.
+- A call like `Logger.log()` now links to `Logger`'s own method instead of the same-named method of a class whose name merely contains it, such as `FileLogger`.
 
 ## [1.6.2] - 2026-10-03
 
