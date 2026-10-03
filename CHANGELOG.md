@@ -18,6 +18,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph_impact` on a heavily referenced symbol now stops at a safety limit and says the answer was truncated, instead of exhausting the MCP server's memory; narrow it with `file` or a smaller `depth`. (#1583)
 - The MCP server now recycles its query workers after they sit idle, releasing the memory a burst of large queries left behind while keeping one worker warm for the next call. (#1583)
 - Path search between two symbols no longer slows down sharply or grows its memory use on densely connected graphs. (#1583)
+- Java `record` declarations are now indexed as classes, with their methods, constructors, components and implicit accessors, so calls on a record-typed value like `info.remoteAddress()` resolve and records show up in callers, impact and implementations; re-index Java projects after upgrading.
 
 ## [1.6.2] - 2026-10-03
 
