@@ -45,6 +45,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In JavaScript and TypeScript, the methods of a named object literal now get their own symbols even when the object isn't exported: a plain `const api = { load() {…} }`, an object declared inside an IIFE, or a namespace hung off the page like `window.App = { load() {…} }`. A call like `api.load()` or `window.App.load()` now reaches that method, and the calls made inside it are its own instead of the object's, so script-tag apps no longer lose most of their code from callers and impact. Re-index JavaScript and TypeScript projects after upgrading. (#2300)
 - `codegraph_explore` and the Claude Code prompt hook are much faster on long prompts, such as a pasted report several thousand characters long, which could run past the hook's 30-second timeout. The results are unchanged. (#2184)
 - In Rust, a call to a function brought in by `use`, like `take(3)` after `use crate::util::take;` (also through an `as` alias, a nested group or a `use` inside a function), and a call written as a module path, like `crate::util::take(3)` or `super::util::take(3)`, now link to the function that module declares. Before, they could land on a same-named function of another module, or on a same-named method declared above the function. (#2308)
+- Indexing a project that vendors tree-sitter grammars is faster: the C function-pointer pass now skips generated C files, and a tree-sitter `parser.c` counts as generated even when it carries no banner (releases before 0.25 print none).
 
 ## [1.6.2] - 2026-10-03
 
