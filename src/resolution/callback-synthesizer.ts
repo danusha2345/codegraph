@@ -1439,7 +1439,7 @@ async function pythonOverrideEdges(queries: QueryBuilder, ctx: ResolutionContext
     if (PYTHON_NON_VIRTUAL.has(m.name) || m.isStatic) return false;
     const lines = ctx.getFileLines?.(m.filePath) ?? ctx.readFile(m.filePath)?.split('\n') ?? [];
     for (let i = m.startLine - 2; i >= 0; i--) {
-      const line = lines[i]!.trim();
+      const line = (lines[i] ?? '').trim();
       if (line === '' || line.startsWith('#')) continue;
       if (!line.startsWith('@')) break;
       if (PYTHON_NON_DISPATCH_DECORATOR.test(line)) return false;
