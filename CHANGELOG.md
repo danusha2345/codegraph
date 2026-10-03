@@ -55,6 +55,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Type hierarchy queries and context results now include subclasses and implementations alongside parent types, retaining every inheritance relationship in diamonds and cycles.
 - Repeating a full index through the library keeps unchanged symbols discoverable by the words in their names, and cancelling a re-index preserves those matches.
 - Kotlin calls through imported types now avoid unrelated same-named methods while retaining inherited members and project extension functions. (#1948)
+- In Claude Code, agents now receive all of CodeGraph's guidance. Claude Code cuts each MCP server's instructions at 2,048 characters, so agents never saw the rules for stale-index warnings or for a project that isn't indexed; the guidance now fits, with those rules first. Thanks @inth3shadows. (#1529)
 
 ## [1.6.2] - 2026-10-03
 
