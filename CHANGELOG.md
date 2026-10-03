@@ -52,6 +52,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Installing or removing CodeGraph in Codex now preserves TOML examples in your instructions and recognizes server tables with spaces or quoted names, keeping your configuration readable. (#2250) Thanks @rudycelekli.
 - Searches with `path:` or `name:` filters now find matching symbols before unrelated results consume the limit, including typo searches and queries containing only filters.
 - A TypeScript type re-exported through a barrel (`export type { Foo } from`, `export { type Foo } from`, `export type * from`) now links to its real declaration instead of a same-named type elsewhere in the project, and import lists with comments, string names, or a JSDoc `@import` are read correctly. Re-index to update an existing project.
+- Type hierarchy queries and context results now include subclasses and implementations alongside parent types, retaining every inheritance relationship in diamonds and cycles.
 
 ## [1.6.2] - 2026-10-03
 
