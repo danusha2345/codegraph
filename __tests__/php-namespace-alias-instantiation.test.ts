@@ -194,4 +194,29 @@ class Personal extends L\\Base
 `);
     expect(await edgesFrom('app/Personal.php')).toEqual([]);
   });
+
+  it('matches the namespace alias without regard to its case', async () => {
+    write('app/Blocks/Personal/Fields/FirstName.php', firstName('App\\Blocks\\Personal\\Fields'));
+    write('app/Blocks/Personal/Personal.php',
+      consumer('use App\\Blocks\\Personal\\Fields as Field;', 'new field\\FirstName()'));
+    expect(await instantiated()).toEqual(['App\\Blocks\\Personal\\Fields::FirstName']);
+  });
+
+  it('does not guess the first target when different namespace scopes reuse an alias', async () => {
+    write('one.php', firstName('App\\Fields'));
+    write('two.php', firstName('App\\Other'));
+    write('app/Blocks/Personal/Personal.php', `<?php
+namespace One {
+  use App\\Fields as Field;
+  class Personal { public function fields() { return new Field\\FirstName(); } }
+}
+namespace Two {
+  use App\\Other as Field;
+  class Another { public function fields() { return new Field\\FirstName(); } }
+}
+`);
+    cg = await CodeGraph.init(dir, { index: true });
+    const ids = cg.getNodesInFile('app/Blocks/Personal/Personal.php').map(n => n.id);
+    expect(cg.getOutgoingEdgesFrom(ids).filter(e => e.kind === 'instantiates')).toEqual([]);
+  });
 });
