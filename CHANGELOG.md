@@ -43,6 +43,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In JavaScript and TypeScript, a function declared inside another function now takes calls to its name even when the file also imports that name from a package, such as `resolve` from `node:path`. Such calls used to link to nothing. (#1715)
 - In Kotlin, a call on a library type you import, like Jetpack Compose's `Modifier.pad()`, now links to the extension your project declares on that type (`fun Modifier.pad()`), when the calling file can see it: same package, or imported by name or with `.*`. The library type's own methods, like `Modifier.fillMaxSize()`, still never link to a project method that shares the name.
 - In JavaScript and TypeScript, the methods of a named object literal now get their own symbols even when the object isn't exported: a plain `const api = { load() {…} }`, an object declared inside an IIFE, or a namespace hung off the page like `window.App = { load() {…} }`. A call like `api.load()` or `window.App.load()` now reaches that method, and the calls made inside it are its own instead of the object's, so script-tag apps no longer lose most of their code from callers and impact. Re-index JavaScript and TypeScript projects after upgrading. (#2300)
+- `codegraph_explore` and the Claude Code prompt hook are much faster on long prompts, such as a pasted report several thousand characters long, which could run past the hook's 30-second timeout. The results are unchanged. (#2184)
 
 ## [1.6.2] - 2026-10-03
 
