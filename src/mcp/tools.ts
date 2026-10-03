@@ -28,8 +28,10 @@ export function __setLoadCodeGraphForTests(cls: typeof import('../index').defaul
 }
 import {
   detectWorktreeIndexMismatch,
+  nestedRepositoryBelow,
   worktreeMismatchWarning,
   worktreeMismatchNotice,
+  type NestedRepository,
   type WorktreeIndexMismatch,
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
@@ -238,6 +240,16 @@ export function getExploreBudget(fileCount: number): number {
   if (fileCount < 15000) return 3;
   if (fileCount < 25000) return 4;
   return 5;
+}
+
+/**
+ * Per-project suffix appended to `codegraph_explore`'s description by
+ * `getTools()`. Claude Code truncates each tool description at 2,048 chars
+ * by default, so the static description plus this suffix must fit —
+ * `__tests__/server-instructions.test.ts` pins it.
+ */
+export function exploreGuidanceSuffix(fileCount: number): string {
+  return ` Exploration guidance — advisory only, NOT a quota: ~${getExploreBudget(fileCount)} focused calls usually cover this project (${fileCount.toLocaleString()} files indexed), and extra calls are never rejected or rate-limited.`;
 }
 
 /**
@@ -1540,7 +1552,6 @@ export interface ToolResult {
   _cgExploreEmission?: ExploreEmission;
   /** Internal structured provenance, preserved by query workers and stripped by execute. */
   _cgAnswerFiles?: AnswerFile[];
-  structuredContent?: Record<string, unknown>;
 }
 
 /**
@@ -1724,7 +1735,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_explore',
-    description: 'PRIMARY TOOL — call FIRST for almost any question OR before an edit: how does X work, architecture, a bug, where/what is X, surveying an area, or the symbols you are about to change. Returns the verbatim source of the relevant symbols grouped by file in ONE capped call (Read-equivalent — treat the shown source as already Read; do NOT re-open those files), plus the call path among them. Query can be a natural-language question OR a bag of symbol/file names. Usually the ONLY call you need — more accurate context, in far fewer tokens and round-trips than a search/Read/Grep loop.',
+    description: 'PRIMARY TOOL — call FIRST for almost any question OR before an edit: how does X work, architecture, a bug, where/what is X, surveying an area, or the symbols you are about to change. Returns the verbatim source of the relevant symbols grouped by file in ONE capped call (Read-equivalent — treat the shown source as already Read; do NOT re-open those files), plus the call path among them. Query can be a natural-language question OR a bag of symbol/file names. Usually the ONLY call you need — more accurate context, in far fewer tokens and round-trips than a search/Read/Grep loop. Named flow endpoints must match exactly (never fuzzy-substituted): query a did-you-mean suggestion explicitly. Matching is lexical, not semantic; an empty result suggests indexed names to retry. Qualified names take `.`, `::` or `/`; an overloaded name returns every definition.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1948,6 +1959,10 @@ export class ToolHandler {
   // once and every later tool call reuses the result — never shelling out to
   // git on the hot path. `undefined` = not computed yet; `null` = no mismatch.
   private worktreeMismatchCache: Map<string, WorktreeIndexMismatch | null> = new Map();
+  // Per-(projectPath, index root) cache of the different git repository the
+  // path sits in below that root, if any (#2110) — the git half of
+  // `uncoveredNestedRepo`, memoized like the mismatch above.
+  private nestedRepoCache: Map<string, NestedRepository | null> = new Map();
   // Gate that the MCP engine pokes after `cg.open()` so the first tool call
   // blocks on the post-open filesystem reconcile (catch-up sync). Without
   // this, a tool call that races past `catchUpSync()` serves rows for files
@@ -2149,7 +2164,6 @@ export class ToolHandler {
 
     try {
       const stats = this.cg.getStats();
-      const budget = getExploreBudget(stats.fileCount);
 
       // Tiny-repo tool gating: on projects under TINY_REPO_FILE_THRESHOLD
       // files, only expose the core trio (search, node, explore) — one
@@ -2188,7 +2202,7 @@ export class ToolHandler {
         if (tool.name === 'codegraph_explore') {
           return {
             ...tool,
-            description: `${tool.description} Exploration guidance — advisory only, NOT a quota: ~${budget} focused calls usually cover this project (${stats.fileCount.toLocaleString()} files indexed), and extra calls are never rejected or rate-limited.`,
+            description: `${tool.description}${exploreGuidanceSuffix(stats.fileCount)}`,
           };
         }
         return tool;
@@ -2267,6 +2281,30 @@ export class ToolHandler {
       );
     }
 
+    const cg = this.openProjectRoot(resolvedRoot, canonicalRoot);
+    // The walk above crosses git boundaries. A nested repository the ancestor
+    // index leaves out (typically gitignored) would otherwise be answered from
+    // the ancestor's code, looking like an answer about the requested project
+    // (#2110) — so it gets the same guidance as a project with no index at all.
+    const nested = this.uncoveredNestedRepo(projectPath, canonicalRoot, cg);
+    if (nested) {
+      throw new NotIndexedError(
+        `The project at ${projectPath} isn't indexed with codegraph: it is its own git repository ` +
+        `(${nested.root}), and the nearest index, at ${canonicalRoot}, holds none of its files ` +
+        '(that repository is excluded from it, e.g. by a .gitignore), so codegraph cannot query it. ' +
+        "Use your built-in tools (Read/Grep/Glob) for that codebase instead, and don't call codegraph " +
+        "for it again this session. Indexing is the user's decision — they can run 'codegraph init' " +
+        `in ${nested.root} to enable it.`
+      );
+    }
+    return cg;
+  }
+
+  /**
+   * The open CodeGraph for an index root the up-walk resolved: the default
+   * instance, a cached one, or a newly opened (and cached) one.
+   */
+  private openProjectRoot(resolvedRoot: string, canonicalRoot: string): CodeGraph {
     // If the path resolves to the default project, reuse the already-open
     // default instance rather than opening a SECOND connection to the same DB.
     // A duplicate connection serializes reads against the watcher's auto-sync
@@ -2308,6 +2346,34 @@ export class ToolHandler {
     this.projectUsedAt.set(canonicalRoot, Date.now());
     this.trimProjects();
     return cg;
+  }
+
+  /**
+   * The nested git repository `projectPath` lives in when the index the
+   * up-walk reached (`indexRoot`'s, open as `cg`) holds none of its files; null
+   * when that index covers it — an ordinary subdirectory, a submodule or
+   * embedded clone the ancestor indexes, a linked worktree (#155) — or when git
+   * can't tell (#2110).
+   *
+   * The git half is memoized per (projectPath, index root), keyed on both for
+   * the reason `worktreeMismatchCache` is (#926). The index half is one
+   * primary-key probe per call, so a sync that brings the repository into the
+   * index is honored without a restart.
+   */
+  private uncoveredNestedRepo(projectPath: string, indexRoot: string, cg: CodeGraph): NestedRepository | null {
+    const cacheKey = `${projectPath}\u0000${indexRoot}`;
+    let nested = this.nestedRepoCache.get(cacheKey);
+    if (nested === undefined) {
+      nested = nestedRepositoryBelow(projectPath, indexRoot);
+      this.nestedRepoCache.set(cacheKey, nested);
+    }
+    if (!nested) return null;
+    try {
+      return cg.hasFilesUnder(nested.relPath) ? null : nested;
+    } catch {
+      // An index we can't read is no evidence the repository is excluded.
+      return null;
+    }
   }
 
   private async awaitProjectGate(projectPath: string): Promise<void> {
@@ -2358,9 +2424,13 @@ export class ToolHandler {
    * Arm one unref'd timer for the oldest project a trim could release. A
    * project whose catch-up is still running is trimmed when that settles; the
    * 1s floor keeps a project a trim must skip from re-arming in a tight loop.
+   * Each call replaces the armed timer, so an older project whose catch-up
+   * settles after a newer one armed the timer keeps its own deadline.
    */
   private scheduleIdleRelease(idleMs: number): void {
-    if (this.idleReleaseTimer || this.closing || idleMs <= 0) return;
+    if (this.idleReleaseTimer) clearTimeout(this.idleReleaseTimer);
+    this.idleReleaseTimer = null;
+    if (this.closing || idleMs <= 0) return;
     for (const [root, cg] of this.projectCache) {
       if (this.projectGates.has(cg)) continue;
       const due = (this.projectUsedAt.get(root) ?? Date.now()) + idleMs - Date.now();
@@ -2407,6 +2477,7 @@ export class ToolHandler {
     this.worktreeMismatchCache.clear();
     if (this.idleReleaseTimer) clearTimeout(this.idleReleaseTimer);
     this.idleReleaseTimer = null;
+    this.nestedRepoCache.clear();
     this.trimProjects();
     if (this.projectCache.size === 0 && this.activeCalls === 0 && this.pendingCloses === 0) return Promise.resolve();
     return new Promise((resolve) => this.closeWaiters.push(resolve));
@@ -2817,7 +2888,10 @@ export class ToolHandler {
             if (validation.unchecked.length > 20) lines.push(`- … ${validation.unchecked.length - 20} more (narrow the query)`);
           }
           lines.push('Retry after a successful codegraph sync, or narrow the query.');
-          return { ...this.textResult(lines.join('\n')), structuredContent: { freshness: validation } };
+          // Text only: Claude Code shows the model a result's structuredContent
+          // in place of its text (#2088). The text names every stale file and
+          // the first unchecked ones; the rest only need a narrower query.
+          return this.textResult(lines.join('\n'));
         }
       }
       // Record + STRIP before anything else touches the result: the emission is
@@ -8106,9 +8180,8 @@ export class ToolHandler {
       }
     }
 
-    return { ...this.textResult(lines.join('\n')), structuredContent: {
-      freshness: { lastIndexedAt, changes, complete: changes !== null },
-    } };
+    // Text only, for the same reason as the stale-answer path (#2088).
+    return this.textResult(lines.join('\n'));
   }
 
   /**

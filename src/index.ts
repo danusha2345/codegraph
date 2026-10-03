@@ -579,10 +579,12 @@ export class CodeGraph {
         // marker behind, so `codegraph status` can tell a truncated index
         // from a completed one instead of silently serving partial results.
         try { this.queries.setMetadata('index_state', 'indexing'); } catch { /* metadata is advisory */ }
-        // Segment vocabulary starts empty and is repopulated by the node write
-        // path as every file (re-)indexes below — so a full index is also the
-        // orphan-cleanup pass for names deleted since the last one.
-        try { this.queries.clearNameSegmentVocab(); } catch { /* vocab is advisory — never fail an index over it */ }
+        // Fresh graphs populate the vocabulary through node writes. Existing
+        // graphs skip unchanged files at the store, so keep their vocabulary
+        // until this run succeeds and rebuild it from all surviving names below.
+        if (freshDb) {
+          try { this.queries.clearNameSegmentVocab(); } catch { /* vocab is advisory — never fail an index over it */ }
+        }
         // Bulk FTS mode for the mass-insert phase: drop the per-row FTS sync
         // triggers, rebuild nodes_fts once from the nodes table afterwards.
         // Crash inside the window is healed on the next DatabaseConnection.open.
@@ -788,6 +790,13 @@ export class CodeGraph {
         } catch { /* metadata is advisory — never fail an index over it */ }
 
         if (result.success && result.filesErrored === 0) this.orchestrator.commitHdlProfile();
+        if (result.success && !freshDb) {
+          try {
+            this.queries.clearNameSegmentVocab();
+            await this.rebuildNameSegmentVocab();
+          } catch { /* vocab is advisory — never fail an index over it */ }
+        }
+
         return result;
       } finally {
         // Restore the auto-checkpoint interval AFTER the fold-up above so the
@@ -2031,7 +2040,7 @@ export class CodeGraph {
    * via the `references` edge that framework resolvers emit. Returns
    * null when fewer than 3 valid (non-test) routes exist.
    */
-  getRoutingManifest(limit?: number): {
+  getRoutingManifest(limit?: number, perRoute?: boolean): {
     entries: Array<{
       url: string;
       handler: string;
@@ -2046,7 +2055,7 @@ export class CodeGraph {
     topHandlerFileCount: number;
     totalRoutes: number;
   } | null {
-    return this.queries.getRoutingManifest(limit);
+    return this.queries.getRoutingManifest(limit, perRoute);
   }
 
   // ===========================================================================
@@ -2076,6 +2085,14 @@ export class CodeGraph {
    */
   getFile(filePath: string): FileRecord | null {
     return this.queries.getFileByPath(filePath);
+  }
+
+  /**
+   * Whether the index holds any file under `dir`, a project-relative POSIX
+   * directory (e.g. `packages/api`).
+   */
+  hasFilesUnder(dir: string): boolean {
+    return this.queries.hasFilesUnder(dir);
   }
 
   /**

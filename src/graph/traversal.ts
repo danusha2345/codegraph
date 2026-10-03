@@ -439,20 +439,31 @@ export class GraphTraverser {
 
     const nodes = new Map<string, Node>();
     const edges: Edge[] = [];
-    const visited = new Set<string>();
+    // Each direction must expand the focal node independently.
+    const visitedAncestors = new Set<string>();
+    const visitedDescendants = new Set<string>();
 
     // Add focal node
     nodes.set(focalNode.id, focalNode);
 
     // Get ancestors (what this extends/implements)
-    this.getTypeAncestors(nodeId, nodes, edges, visited);
+    this.getTypeAncestors(nodeId, nodes, edges, visitedAncestors);
 
     // Get descendants (what extends/implements this)
-    this.getTypeDescendants(nodeId, nodes, edges, visited);
+    this.getTypeDescendants(nodeId, nodes, edges, visitedDescendants);
+
+    // Cyclic hierarchies can expose an edge in both directional walks.
+    const seenEdges = new Set<string>();
+    const uniqueEdges = edges.filter((edge) => {
+      const key = JSON.stringify([edge.source, edge.target, edge.kind, edge.line, edge.column]);
+      if (seenEdges.has(key)) return false;
+      seenEdges.add(key);
+      return true;
+    });
 
     return {
       nodes,
-      edges,
+      edges: uniqueEdges,
       roots: [nodeId],
     };
   }
@@ -474,7 +485,7 @@ export class GraphTraverser {
 
     for (const edge of outgoingEdges) {
       const parentNode = parents.get(edge.target);
-      if (parentNode && !nodes.has(parentNode.id)) {
+      if (parentNode) {
         nodes.set(parentNode.id, parentNode);
         edges.push(edge);
         this.getTypeAncestors(parentNode.id, nodes, edges, visited);
@@ -499,7 +510,7 @@ export class GraphTraverser {
 
     for (const edge of incomingEdges) {
       const childNode = children.get(edge.source);
-      if (childNode && !nodes.has(childNode.id)) {
+      if (childNode) {
         nodes.set(childNode.id, childNode);
         edges.push(edge);
         this.getTypeDescendants(childNode.id, nodes, edges, visited);

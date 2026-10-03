@@ -24,6 +24,8 @@ mod only;
 mod a;
 mod caller;
 mod importer;
+mod handle;
+mod worker;
 
 pub fn via_self() -> usize {
     self::util::take(1)
@@ -74,6 +76,21 @@ pub fn get() -> usize {
 }
 `,
     'src/importer.rs': 'use crate::util::take;\n',
+    'src/handle.rs': 'pub struct Handle;\n',
+    'src/worker.rs': `pub use crate::handle::Handle;
+mod dump;
+
+pub trait Lock {
+    type Handle;
+}
+
+pub struct Guard;
+
+impl Lock for Guard {
+    type Handle = u8;
+}
+`,
+    'src/worker/dump.rs': 'use super::Handle;\n',
     'src/caller.rs': `use crate::util;
 
 pub fn via_crate() -> usize {
@@ -134,6 +151,13 @@ describe('Rust calls through a module path', () => {
     const targets = cg.getOutgoingEdgesFrom(ids).filter((e) => e.kind === 'imports')
       .map((e) => cg.getNode(e.target)!).map((t) => `${t.kind} ${t.qualifiedName} ${t.filePath}:${t.startLine}`);
     expect(targets).toEqual(['function take src/util.rs:20']);
+  });
+
+  it('never bind a use to an associated type of the module\'s impl or trait', () => {
+    const ids = cg.getNodesInFile('src/worker/dump.rs').map((n) => n.id);
+    const targets = cg.getOutgoingEdgesFrom(ids).filter((e) => e.kind === 'imports')
+      .map((e) => cg.getNode(e.target)!).map((t) => `${t.kind} ${t.qualifiedName} ${t.filePath}:${t.startLine}`);
+    expect(targets.filter((t) => t.includes('src/worker.rs'))).toEqual([]);
   });
 
   it('walk a nested module path to its file', () => {
