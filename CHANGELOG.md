@@ -69,6 +69,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixes
 
 - A call like `Logger.log()` now links to `Logger`'s own method instead of the same-named method of a class whose name merely contains it, such as `FileLogger`.
+### Fixes
+
+- Java calls through static fields now follow the correct nested type, inherited field, or concrete initializer without linking external library calls to unrelated project methods. (#1949)
+
 
 ## [1.6.2] - 2026-10-03
 
