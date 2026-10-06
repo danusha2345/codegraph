@@ -2570,6 +2570,16 @@ export class ReferenceResolver {
   }
 
   /**
+   * True when the Go file imports `qualifier` — by its last path segment or
+   * an alias — from a package of one of the project's own modules.
+   */
+  private isGoProjectPackage(ref: UnresolvedRef, qualifier: string): boolean {
+    return this.context
+      .getImportMappings(ref.filePath, ref.language)
+      .some((imp) => imp.localName === qualifier && this.context.getGoPackageDir?.(imp.source, ref.filePath) != null);
+  }
+
+  /**
    * Check if reference is to a built-in or external symbol
    */
   private isBuiltInOrExternal(ref: UnresolvedRef): boolean {
@@ -2663,7 +2673,9 @@ export class ReferenceResolver {
     // Go standard library packages — refs like "fmt.Println", "http.ListenAndServe", etc.
     if (ref.language === 'go') {
       const dotIdx = name.indexOf('.');
-      if (dotIdx > 0) {
+      // What the file imports decides before the name does: a project package
+      // may be called `errors`, `log` or `types` too.
+      if (dotIdx > 0 && !this.isGoProjectPackage(ref, name.substring(0, dotIdx))) {
         const pkg = name.substring(0, dotIdx);
         // Only when the file imports it: an unimported `ring` / `token` /
         // `url` is a local variable (`func flush(ring *ringLog) { ring.Write(b) }`).
