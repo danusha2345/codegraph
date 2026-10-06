@@ -64,6 +64,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Kotlin `fun interface` declarations are indexed, and no longer hide the declaration that follows them.
 - Kotlin calls through a class property, a primary-constructor property, or a variable set from a function call now resolve on the declared type, and a call on a library type (such as `Regex` or a JDK class) no longer links to an unrelated project method with the same name. Chained receivers such as `engine.pump.drain()`, `this.engine.drain()` and `Mode.ON.next()` resolve the same way, as do properties inherited from a project base class and variables of the enclosing function used inside an anonymous `object : …`. Re-index Kotlin projects to pick this up.
 - In TypeScript and JavaScript, a method called on a freshly constructed object, such as `new RegExp(p).exec(s)` or `new URL(u).toString()`, now links only to that class's own (or inherited) method and no longer to an unrelated project method of the same name. (#1945)
+- In Kotlin, a call on a library type you import, like Jetpack Compose's `Modifier.pad()`, now links to the extension your project declares on that type (`fun Modifier.pad()`), when the calling file can see it: same package, or imported by name or with `.*`. The library type's own methods, like `Modifier.fillMaxSize()`, still never link to a project method that shares the name.
 
 ## [1.6.2] - 2026-10-03
 
