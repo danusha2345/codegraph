@@ -48,6 +48,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph_impact` on a heavily referenced symbol now stops at a safety limit and says the answer was truncated, instead of exhausting the MCP server's memory; narrow it with `file` or a smaller `depth`. (#1583)
 - The MCP server now recycles its query workers after they sit idle, releasing the memory a burst of large queries left behind while keeping one worker warm for the next call. (#1583)
 - Path search between two symbols no longer slows down sharply or grows its memory use on densely connected graphs. (#1583)
+- In Go, more method calls now reach the right method: through a variable named like a standard-library package (`ring`, `token`, `parser`), a parameter whose type comes from another package (`s *store.Store`), the result of a function or a conversion (`r := newRing()`, `s := store.NewStore()`), and a type alias (`type Context = web.Context`). A call on a value whose type comes from outside your project, like `ctx.Done()` on a `context.Context` or `req.WithContext(…)` on an `*http.Request`, no longer links to an unrelated project method that happens to share the name. Re-index Go projects after upgrading. (#1954)
 
 ## [1.6.2] - 2026-10-03
 
