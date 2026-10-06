@@ -92,6 +92,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Kotlin calls through imported types now avoid unrelated same-named methods while retaining inherited members and project extension functions. (#1948)
 
+### Fixes
+
+- An Express route keeps its named handler when a middleware before it contains an arrow function. `rateLimit({ keyGenerator: (req) => req.ip })` or `(req, res, next) => next()` no longer hides the handler at the end of the route (re-index to update an existing project).
 
 ## [1.6.2] - 2026-10-03
 
