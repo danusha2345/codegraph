@@ -2,8 +2,10 @@
  * A Rust enum used only through its variants is a dependency of the code that
  * uses them (#2328). `mode::Mode::A` in an expression, `Mode::B => …` in a
  * `match`, a `Mode::C(x)` / `Mode::D { .. }` pattern and `Self::A` in the
- * enum's impl reference the enum the path names — the same `references` edge a
- * type annotation (`fn takes(_m: Mode)`) produces.
+ * enum's impl reference the enum that declares the variant — the same
+ * `references` edge a type annotation (`fn takes(_m: Mode)`) produces. Nothing
+ * else read through a path does: not an associated const or function
+ * (`Limits::MAX`, `Mode::new()`), not a standard-library enum's variant.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
@@ -223,14 +225,82 @@ pub fn color() -> u8 {
     expect(referencers(enumIn('user.rs', 'ColorChoice').id)).toEqual([]);
   });
 
-  it('an associated const read through its type references the type', async () => {
+  it('an associated const or function read through a type is not a variant path', async () => {
     await index({
-      'lib.rs': 'pub mod limits;\npub mod user;\n',
-      'limits.rs': 'pub struct Limits;\n\nimpl Limits {\n    pub const MAX: u8 = 3;\n}\n',
-      'user.rs': 'use crate::limits::Limits;\n\npub fn cap() -> u8 {\n    Limits::MAX\n}\n',
+      'lib.rs': 'pub mod mode;\npub mod limits;\npub mod user;\n',
+      'mode.rs': `${MODE}
+impl Mode {
+    pub const ALL: [u8; 2] = [0, 1];
+    pub fn count() -> usize { Self::ALL.len() }
+}
+`,
+      'limits.rs': 'pub struct Limits;\n\nimpl Limits {\n    pub const MAX: u8 = 3;\n    pub fn new() -> Self { Limits }\n}\n',
+      'user.rs': `use crate::limits::Limits;
+use crate::mode::Mode;
+
+pub fn cap() -> u8 {
+    Limits::MAX
+}
+
+pub fn all() -> usize {
+    Mode::ALL.len()
+}
+
+pub fn make() {
+    let _l = Limits::new();
+    let _f = Limits::new;
+}
+`,
     });
+    // Only variants: the enum's own `count` and every reader of `Mode::ALL` /
+    // `Limits::MAX` stay off, and `Limits::new` links the function, not the type.
+    expect(referencers(enumIn('mode.rs').id)).toEqual(['mode.rs:current', 'mode.rs:takes']);
     const limits = cg!.getNodesByKind('struct').find((n) => n.name === 'Limits')!;
-    expect(referencers(limits.id)).toEqual(['user.rs:cap']);
+    expect(referencers(limits.id)).toEqual([]);
+    const make = cg!.getNodesByKind('function').find((n) => n.name === 'make')!;
+    expect(cg!.getOutgoingEdges(make.id).map((e) => `${e.kind}:${cg!.getNode(e.target)!.qualifiedName}`)).toEqual(['calls:Limits::new']);
+  });
+
+  it('std and prelude enums never reach a same-named project enum', async () => {
+    await index({
+      'lib.rs': 'pub mod shapes;\npub mod user;\n',
+      'shapes.rs': `pub enum Ordering {
+    Less,
+    Greater,
+}
+
+pub enum Option {
+    Some,
+    None,
+}
+`,
+      'user.rs': `use std::cmp::{self, Ordering};
+
+pub fn sorted(a: u8, b: u8) -> bool {
+    a.cmp(&b) == Ordering::Less || b.cmp(&a) == cmp::Ordering::Greater || a.cmp(&b) != std::cmp::Ordering::Less
+}
+
+pub fn first(o: Option<u8>) -> u8 {
+    match o {
+        Option::Some(x) => x,
+        Option::None => 0,
+    }
+}
+
+pub fn bare(o: Option<u8>, r: Result<u8, ()>) -> u8 {
+    match (o, r) {
+        (Some(x), Ok(_)) => x,
+        (None, Err(())) => 0,
+        _ => 1,
+    }
+}
+`,
+    });
+    expect(referencers(enumIn('shapes.rs', 'Ordering').id)).toEqual([]);
+    expect(referencers(enumIn('shapes.rs', 'Option').id)).toEqual([]);
+    for (const variant of cg!.getNodesByKind('enum_member')) {
+      expect(cg!.getIncomingEdges(variant.id).filter((e) => e.kind !== 'contains'), variant.qualifiedName).toEqual([]);
+    }
   });
 
   it('a module path, an associated function and a same-named enum elsewhere are not references to the enum', async () => {

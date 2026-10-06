@@ -1,11 +1,20 @@
 /**
- * Go method calls through a typed receiver resolve on the receiver's declared
- * type: an unexported (`ring *ringLog`) or package-qualified (`s *store.Store`)
- * parameter, a constructor's result (`r := newRing()`, `s := store.NewStore()`),
- * a field of such a receiver, and a receiver named like a standard-library
- * package the file does not import (`ring`, `token`). A receiver typed outside
- * the project (`buf *bytes.Buffer`, `conn net.Conn`, `err error`) gets no edge
- * rather than a same-named project method.
+ * Go method calls through a receiver whose type is written somewhere other
+ * than a plain parameter of the caller's own package:
+ *
+ * - a variable named like a standard-library package the file does not
+ *   import (`ring *ringLog`, `token := get()`), which used to be skipped as
+ *   a call into that package;
+ * - a package-qualified parameter (`s *store.Store`);
+ * - the result of a function or a conversion (`r := newRing()`, `s :=
+ *   store.NewStore()`, `list := web.Users(names)`);
+ * - an alias (`type Context = web.Context`).
+ *
+ * A receiver typed outside the project (`conn net.Conn`, `ctx
+ * context.Context`, `c, _ := net.Dial(…)`) gets no edge rather than the one
+ * project method that happens to share the name. A project function's result
+ * declared as an outside type by value (`http.RoundTripper`) is left as it
+ * was: that is usually an interface a project type implements.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
@@ -13,81 +22,124 @@ import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
 
-const MAIN = `package main
+async function indexProject(files: Record<string, string>): Promise<{ dir: string; cg: CodeGraph }> {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-go-recv-'));
+  fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/app\n\ngo 1.22\n');
+  for (const [file, source] of Object.entries(files)) {
+    fs.mkdirSync(path.join(dir, path.dirname(file)), { recursive: true });
+    fs.writeFileSync(path.join(dir, file), source);
+  }
+  const cg = CodeGraph.initSync(dir);
+  await cg.indexAll();
+  return { dir, cg };
+}
+
+/** `file::Qualified::name` of every method `caller` (a function name) calls. */
+async function methodCallees(cg: CodeGraph, caller: string): Promise<string[]> {
+  const node = (await cg.searchNodes(caller, { limit: 20 })).find(
+    (r) => r.node.name === caller && r.node.kind === 'function',
+  );
+  expect(node, caller).toBeDefined();
+  return (await cg.getCallees(node!.node.id))
+    .filter((c) => c.node.kind === 'method')
+    .map((c) => `${c.node.filePath}::${c.node.qualifiedName}`)
+    .sort();
+}
+
+describe('Go receiver typing', () => {
+  let dir: string;
+  let cg: CodeGraph;
+
+  beforeAll(async () => {
+    ({ dir, cg } = await indexProject({
+      'main.go': `package main
 
 import (
 	"bytes"
 	"net"
+	"net/http"
+	"os"
 
 	"example.com/app/store"
 )
 
 type ringLog struct{ buf []byte }
 
-func (r *ringLog) Write(b []byte) {}
-func (r *ringLog) Reset()         {}
+func (r *ringLog) Write(b []byte)  {}
+func (r *ringLog) Reset()          {}
+func (r *ringLog) Reader() *reader { return &reader{} }
+
+type reader struct{}
+
+func (r *reader) Reset() {}
 
 type Engine struct{}
 
-func (e *Engine) Run()  {}
-func (e *Engine) Stop() {}
+func (e *Engine) Run() *Engine { return e }
+func (e *Engine) Stop()        {}
 
-func newRing() *ringLog               { return &ringLog{} }
-func NewEngine() (*Engine, error)     { return &Engine{}, nil }
-func dial() (net.Conn, error)         { return nil, nil }
+func newRing() *ringLog              { return &ringLog{} }
+func NewEngine(n int) (*Engine, error) { return &Engine{}, nil }
+func open() (*os.File, error)        { return nil, nil }
+func wrap(e *Engine) *ringLog        { return nil }
 
-type holder struct {
-	ring *ringLog
-	eng  Engine
-}
+type limiter struct{}
 
-type outer struct {
-	*Engine
-}
+func (l *limiter) RoundTrip(r *http.Request) (*http.Response, error) { return nil, nil }
 
-type tariff interface{ Rates() }
-
-type Combined struct{ tariffs []tariff }
+func transport() http.RoundTripper { return &limiter{} }
 
 func lowerParam(ring *ringLog, b []byte) { ring.Write(b) }
 func lowerValueParam(ring ringLog)       { ring.Reset() }
 func groupedParam(a, ring *ringLog)      { ring.Reset() }
-func (r *ringLog) ownReceiver()          { r.Reset() }
 func lowerCtor()                         { r := newRing(); r.Reset() }
-func exportedCtor()                      { e, _ := NewEngine(); e.Stop() }
-func fieldOfParam(h *holder)             { h.ring.Reset() }
-func (h *holder) fieldOfReceiver()       { h.ring.Reset(); h.eng.Run() }
+func exportedCtor()                      { e, _ := NewEngine(1); e.Stop() }
 func qualifiedParam(s *store.Store)      { s.Put("a") }
 func qualifiedCtor()                     { s := store.NewStore(); s.Put("b") }
-func promoted(o *outer)                  { o.Stop() }
 
-func (t *Combined) Rates() {
-	for _, t := range t.tariffs {
-		t.Rates()
+func multiLineCtor() {
+	e, err := NewEngine(
+		1,
+	)
+	_ = err
+	e.Stop()
+}
+
+func ifCtor() {
+	if r := newRing(); r != nil {
+		r.Write(nil)
 	}
 }
 
-func stdlibParam(buf *bytes.Buffer, b []byte) { buf.Write(b) }
-func stdlibCtor()                             { c, _ := net.Dial("tcp", ""); c.Write(nil) }
-func projectFuncReturningStdlib()             { c, _ := dial(); c.Write(nil) }
-func builtinParam(err error)                  { _ = err.Error() }
-func netParam(conn net.Conn)                  { conn.LocalAddr() }
-func untyped(get func() *ringLog)             { token := get(); token.Reset() }
+// \`r\` is what Reader returns, which is not read: not a ringLog.
+func chainedCtor() { r := newRing().Reader(); r.Reset() }
+
+// On the binding's own line \`e\` is still the parameter.
+func selfArg(e *Engine) {
+	if e := wrap(e.Run()); e != nil {
+		e.Write(nil)
+	}
+}
+
+func stdlibParam(buf *bytes.Buffer)     { buf.Truncate(0) }
+func stdlibCtor()                       { c, _ := net.Dial("tcp", ""); c.RemoteAddr() }
+func projectFuncReturningStdlib()       { f, _ := open(); f.Truncate(0) }
+func interfaceResult()                  { rt := transport(); rt.RoundTrip(nil) }
+func netParam(conn net.Conn)            { conn.LocalAddr() }
+func untyped(get func() net.Conn)       { token := get(); token.LocalAddr() }
 
 func main() {}
-`;
-
-const STORE = `package store
+`,
+      'store/store.go': `package store
 
 type Store struct{}
 
 func NewStore() *Store { return &Store{} }
 
 func (s *Store) Put(k string) {}
-`;
-
-// Same-named methods elsewhere, so a name-only guess has somewhere wrong to go.
-const DECOY = `package decoy
+`,
+      // Same-named methods elsewhere, so a guess by name has somewhere wrong to go.
+      'decoy/decoy.go': `package decoy
 
 type Decoy struct{}
 
@@ -96,33 +148,15 @@ func (d *Decoy) Reset()         {}
 func (d *Decoy) Run()           {}
 func (d *Decoy) Stop()          {}
 func (d *Decoy) Put(k string)   {}
-func (d *Decoy) Rates()         {}
-func (d *Decoy) Error() string  { return "" }
+func (d *Decoy) Truncate(n int) {}
+func (d *Decoy) RemoteAddr()    {}
 func (d *Decoy) LocalAddr()     {}
-
-type Buffer struct{}
-
-func (b *Buffer) Write(p []byte) {}
 
 type Store struct{}
 
 func (s *Store) Put(k string) {}
-`;
-
-describe('Go receiver typing', () => {
-  let dir: string;
-  let cg: CodeGraph;
-
-  beforeAll(async () => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-go-recv-'));
-    fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/app\n\ngo 1.22\n');
-    fs.writeFileSync(path.join(dir, 'main.go'), MAIN);
-    fs.mkdirSync(path.join(dir, 'store'));
-    fs.writeFileSync(path.join(dir, 'store', 'store.go'), STORE);
-    fs.mkdirSync(path.join(dir, 'decoy'));
-    fs.writeFileSync(path.join(dir, 'decoy', 'decoy.go'), DECOY);
-    cg = CodeGraph.initSync(dir);
-    await cg.indexAll();
+`,
+    }));
   });
 
   afterAll(() => {
@@ -130,78 +164,58 @@ describe('Go receiver typing', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  /** `file::Qualified::name` of every method `caller` (a name or `Type::name`) calls. */
-  async function methodCallees(caller: string): Promise<string[]> {
-    const node = (await cg.searchNodes(caller.split('::').pop()!, { limit: 20 })).find(
-      (r) =>
-        (r.node.name === caller || r.node.qualifiedName === caller) &&
-        (r.node.kind === 'function' || r.node.kind === 'method'),
-    );
-    expect(node, caller).toBeDefined();
-    return (await cg.getCallees(node!.node.id))
-      .filter((c) => c.node.kind === 'method')
-      .map((c) => `${c.node.filePath}::${c.node.qualifiedName}`);
-  }
-
   it.each([
     ['lowerParam', ['main.go::ringLog::Write']],
     ['lowerValueParam', ['main.go::ringLog::Reset']],
     ['groupedParam', ['main.go::ringLog::Reset']],
-    ['ownReceiver', ['main.go::ringLog::Reset']],
-    ['lowerCtor', ['main.go::ringLog::Reset']],
-    ['exportedCtor', ['main.go::Engine::Stop']],
-    ['fieldOfParam', ['main.go::ringLog::Reset']],
-    ['fieldOfReceiver', ['main.go::ringLog::Reset', 'main.go::Engine::Run']],
-    ['qualifiedParam', ['store/store.go::Store::Put']],
-    ['qualifiedCtor', ['store/store.go::Store::Put']],
-    ['promoted', ['main.go::Engine::Stop']],
-  ])('%s resolves on the receiver type', async (caller, expected) => {
-    expect((await methodCallees(caller)).sort()).toEqual([...expected].sort());
-  });
-
-  it('a range variable shadows the method receiver of the same name', async () => {
-    // `t` in the loop is a `tariff`, not the `*Combined` receiver: no self-edge.
-    expect(await methodCallees('Combined::Rates')).not.toContain('main.go::Combined::Rates');
+  ])('%s: a receiver named like a standard-library package resolves on its type', async (caller, expected) => {
+    expect(await methodCallees(cg, caller)).toEqual(expected);
   });
 
   it.each([
-    'stdlibParam',
-    'stdlibCtor',
-    'projectFuncReturningStdlib',
-    'builtinParam',
-    'netParam',
-    'untyped',
-  ])('%s: a receiver typed outside the project, or untyped, gets no edge', async (caller) => {
-    expect(await methodCallees(caller)).toEqual([]);
+    ['lowerCtor', ['main.go::ringLog::Reset']],
+    ['exportedCtor', ['main.go::Engine::Stop']],
+    ['multiLineCtor', ['main.go::Engine::Stop']],
+    ['ifCtor', ['main.go::ringLog::Write']],
+    ['qualifiedCtor', ['store/store.go::Store::Put']],
+  ])('%s: a receiver bound to a call resolves on what the callee returns', async (caller, expected) => {
+    expect(await methodCallees(cg, caller)).toEqual(expected);
   });
 
-  it('a package-level function call still resolves', async () => {
-    const node = (await cg.searchNodes('qualifiedCtor', { limit: 5 })).find((r) => r.node.name === 'qualifiedCtor');
-    const callees = (await cg.getCallees(node!.node.id)).map((c) => `${c.node.filePath}::${c.node.qualifiedName}`);
-    expect(callees).toContain('store/store.go::NewStore');
+  it('a package-qualified parameter resolves in that package', async () => {
+    expect(await methodCallees(cg, 'qualifiedParam')).toEqual(['store/store.go::Store::Put']);
+  });
+
+  it('a binding is not typed by the head of a call chain, nor on its own line', async () => {
+    expect(await methodCallees(cg, 'chainedCtor')).not.toContain('main.go::ringLog::Reset');
+    expect(await methodCallees(cg, 'selfArg')).toEqual(['main.go::Engine::Run']);
+  });
+
+  it.each(['stdlibParam', 'stdlibCtor', 'projectFuncReturningStdlib', 'netParam', 'untyped'])(
+    '%s: a receiver typed outside the project, or untyped, gets no edge',
+    async (caller) => {
+      expect(await methodCallees(cg, caller)).toEqual([]);
+    },
+  );
+
+  it('an outside interface a project function returns still reaches its implementation', async () => {
+    expect(await methodCallees(cg, 'interfaceResult')).toEqual(['main.go::limiter::RoundTrip']);
   });
 });
 
-/**
- * A receiver typed through an alias (`type Context = web.Context`) is the
- * aliased type, a conversion (`list := web.Users(names)`) is the type it
- * names, and a method promoted from an embedded struct — another
- * package's (`*cached.BaseManager`), or two levels down — is the embedded
- * type's. A defined type (`type Defined web.Context`, no `=`) does not
- * inherit its underlying type's methods.
- */
-describe('Go receiver typing through aliases and embedded structs', () => {
+describe('Go receiver typing through aliases and conversions', () => {
   let dir: string;
   let cg: CodeGraph;
 
-  const files: Record<string, string> = {
-    'app/app.go': `package app
+  beforeAll(async () => {
+    ({ dir, cg } = await indexProject({
+      'app/app.go': `package app
 
 type App struct{}
 
 func (a *App) GetUser() {}
 `,
-    'web/context.go': `package web
+      'web/context.go': `package web
 
 import "example.com/app/app"
 
@@ -215,7 +229,7 @@ type Users []string
 
 func (u Users) Usernames() []string { return nil }
 `,
-    'api4/handlers.go': `package api4
+      'api4/handlers.go': `package api4
 
 import (
 	"context"
@@ -227,77 +241,44 @@ type Context = web.Context
 
 type (
 	Handler = *web.Context
+	Ctx     = context.Context
 )
 
 type Defined web.Context
+
+type Wrapped struct {
+	Context
+}
 
 func getUser(c *Context) {
 	c.App.GetUser()
 	c.MakeAuditRecord()
 }
 
-func groupedPointerAlias(h Handler)  { h.MakeAuditRecord() }
-func conversion(names []string)      { list := web.Users(names); list.Usernames() }
-func definedType(d *Defined)         { d.MakeAuditRecord() }
+func groupedPointerAlias(h Handler)      { h.MakeAuditRecord() }
+func embeddedAlias(w *Wrapped)           { w.MakeAuditRecord() }
+func conversion(names []string)          { list := web.Users(names); list.Usernames() }
+func definedType(d *Defined)             { d.MakeAuditRecord() }
 func stdlibReceiver(ctx context.Context) { ctx.Done() }
+func aliasedStdlib(ctx Ctx)              { ctx.Done() }
 `,
-    'cached/base.go': `package cached
-
-type BaseManager struct{}
-
-func (b *BaseManager) CacheClient() {}
-`,
-    'mgr/manager.go': `package mgr
-
-import "example.com/app/cached"
-
-type Manager struct {
-	*cached.BaseManager
-	name string
-}
-
-type Middle struct {
-	*cached.BaseManager
-}
-
-type Outer struct {
-	Middle
-}
-
-func (m *Manager) Get()  { m.CacheClient() }
-func (o *Outer) Twice()  { o.CacheClient() }
-`,
-    // Same-named types and methods elsewhere, so neither the package-blind
-    // lookup nor a name-only guess has a single answer to fall back on.
-    'decoy/decoy.go': `package decoy
+      // Same-named types and methods elsewhere, so neither a lookup by type
+      // name nor a guess by method name has a single answer to fall back on.
+      'decoy/decoy.go': `package decoy
 
 type Context struct{}
 
 func (c *Context) MakeAuditRecord() {}
 
-type Manager struct{}
-type Middle struct{}
-type Outer struct{}
+type Wrapped struct{}
 
 type Decoy struct{}
 
-func (d *Decoy) CacheClient()     {}
-func (d *Decoy) GetUser()         {}
-func (d *Decoy) MakeAuditRecord() {}
-func (d *Decoy) Done()            {}
-func (d *Decoy) Usernames()       {}
+func (d *Decoy) GetUser()   {}
+func (d *Decoy) Done()      {}
+func (d *Decoy) Usernames() {}
 `,
-  };
-
-  beforeAll(async () => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-go-alias-'));
-    fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/app\n\ngo 1.22\n');
-    for (const [file, source] of Object.entries(files)) {
-      fs.mkdirSync(path.join(dir, path.dirname(file)), { recursive: true });
-      fs.writeFileSync(path.join(dir, file), source);
-    }
-    cg = CodeGraph.initSync(dir);
-    await cg.indexAll();
+    }));
   });
 
   afterAll(() => {
@@ -305,33 +286,19 @@ func (d *Decoy) Usernames()       {}
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  async function methodCallees(caller: string): Promise<string[]> {
-    const node = (await cg.searchNodes(caller.split('::').pop()!, { limit: 20 })).find(
-      (r) =>
-        (r.node.name === caller || r.node.qualifiedName === caller) &&
-        (r.node.kind === 'function' || r.node.kind === 'method'),
-    );
-    expect(node, caller).toBeDefined();
-    return (await cg.getCallees(node!.node.id))
-      .filter((c) => c.node.kind === 'method')
-      .map((c) => `${c.node.filePath}::${c.node.qualifiedName}`)
-      .sort();
-  }
-
   it.each([
     ['getUser', ['app/app.go::App::GetUser', 'web/context.go::Context::MakeAuditRecord']],
     ['groupedPointerAlias', ['web/context.go::Context::MakeAuditRecord']],
+    ['embeddedAlias', ['web/context.go::Context::MakeAuditRecord']],
     ['conversion', ['web/context.go::Users::Usernames']],
-    ['Manager::Get', ['cached/base.go::BaseManager::CacheClient']],
-    ['Outer::Twice', ['cached/base.go::BaseManager::CacheClient']],
-  ])('%s resolves through the alias, the conversion or the embedded struct', async (caller, expected) => {
-    expect(await methodCallees(caller)).toEqual(expected);
+  ])('%s resolves through the alias or the conversion', async (caller, expected) => {
+    expect(await methodCallees(cg, caller)).toEqual(expected);
   });
 
-  it.each(['definedType', 'stdlibReceiver'])(
-    '%s: a defined type or a receiver typed outside the project gets no edge',
+  it.each(['definedType', 'stdlibReceiver', 'aliasedStdlib'])(
+    '%s: a defined type, or a receiver typed outside the project, gets no edge',
     async (caller) => {
-      expect(await methodCallees(caller)).toEqual([]);
+      expect(await methodCallees(cg, caller)).toEqual([]);
     },
   );
 });

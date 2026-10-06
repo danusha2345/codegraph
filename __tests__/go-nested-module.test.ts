@@ -1,12 +1,15 @@
 /**
- * Go modules whose `go.mod` is below the project root (#2322).
+ * Go modules whose `go.mod` is not at the project root (#2322).
  *
- * A Go backend kept next to a frontend (`server/go.mod`, `web/package.json`)
- * or several modules side by side: each module's import paths start with its
- * own module path, and an in-module import names a directory under that
- * module's root. Only the project-root `go.mod` used to be read, so with the
- * module in `svc/` both `store.New()` and `s.db.CreateItem()` lost their
- * callers. A root-level `go.mod` resolves exactly as before.
+ * A Go backend kept next to a frontend (`server/go.mod`, `web/package.json`),
+ * or several modules side by side — etcd's root module beside `server/go.mod`
+ * and `client/v3/go.mod`: each module's import paths start with its own
+ * module path, and name a directory under that module's root. Only the
+ * project-root `go.mod` used to be read, so with the module in `svc/` both
+ * `store.New()` and `s.db.CreateItem()` lost their callers. An import path
+ * belongs to the module declaring the longest prefix of it, and a name
+ * written through a package is that package's — never a same-named symbol of
+ * another package. A root-level `go.mod` resolves exactly as before.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
@@ -28,7 +31,7 @@ const CLOCK = `package clock
 func Now() int { return 0 }
 `;
 
-// The issue's service, plus a call into a package outside \`internal/\`.
+// The issue's service, plus a call into a package outside `internal/`.
 const service = (mod: string) => `package domain
 
 import (
@@ -73,13 +76,13 @@ afterAll(() => {
   }
 });
 
-/** `file::qualifiedName` of every symbol the function `name` in `file` calls. */
-function callTargets(cg: CodeGraph, file: string, name: string): string[] {
+/** `file::qualifiedName` of every `kind` target of the symbol `name` in `file`. */
+function targets(cg: CodeGraph, file: string, name: string, kind = 'calls'): string[] {
   const fn = cg.getNodesInFile(file).find((n) => n.name === name);
   expect(fn, `${name} in ${file}`).toBeDefined();
   return cg
     .getOutgoingEdges(fn!.id)
-    .filter((e) => e.kind === 'calls')
+    .filter((e) => e.kind === kind)
     .map((e) => cg.getNode(e.target)!)
     .map((n) => `${n.filePath.replace(/\\/g, '/')}::${n.qualifiedName}`)
     .sort();
@@ -98,16 +101,16 @@ describe('Go module in a subdirectory (#2322)', () => {
   });
 
   it('resolves a package-qualified call into the module', () => {
-    expect(callTargets(cg, 'svc/internal/domain/service.go', 'NewService')).toEqual([
+    expect(targets(cg, 'svc/internal/domain/service.go', 'NewService')).toEqual([
       'svc/internal/store/store.go::New',
     ]);
-    expect(callTargets(cg, 'svc/internal/domain/service.go', 'Stamp')).toEqual([
+    expect(targets(cg, 'svc/internal/domain/service.go', 'Stamp')).toEqual([
       'svc/pkg/clock/clock.go::Now',
     ]);
   });
 
   it('resolves a call through a struct field typed with a package of the module', () => {
-    expect(callTargets(cg, 'svc/internal/domain/service.go', 'AddItem')).toEqual([
+    expect(targets(cg, 'svc/internal/domain/service.go', 'AddItem')).toEqual([
       'svc/internal/store/store.go::Manager::CreateItem',
     ]);
   });
@@ -117,12 +120,23 @@ describe('Go modules side by side (#2322)', () => {
   let cg: CodeGraph;
   beforeAll(async () => {
     cg = await indexProject({
-      'server/go.mod': 'module example.com/server\n\ngo 1.22\n',
+      // etcd's shape: a root module, and a sibling whose path is not under it.
+      'go.mod': 'module example.com/etcd/v3\n\ngo 1.22\n',
+      'etcdutl/main.go': `package main
+
+import "example.com/etcd/server/v3/storage/wal"
+
+func main() {
+	wal.OpenForRead("dir")
+}
+`,
+      'server/go.mod': 'module example.com/etcd/server/v3\n\ngo 1.22\n',
+      'server/storage/wal/wal.go': 'package wal\n\nfunc OpenForRead(dir string) error { return nil }\n',
       'server/api/api.go': 'package api\n\nfunc Start() int { return 1 }\n',
       'server/cmd/main.go': `package main
 
 import (
-	"example.com/server/api"
+	"example.com/etcd/server/v3/api"
 	"example.com/tools/lint"
 )
 
@@ -170,20 +184,104 @@ func generate() {
     });
   });
 
+  it('resolves an import of a sibling module whose path is not under the root module', () => {
+    expect(targets(cg, 'etcdutl/main.go', 'main')).toEqual(['server/storage/wal/wal.go::OpenForRead']);
+  });
+
   it("resolves each module's import into that module's own package", () => {
-    expect(callTargets(cg, 'tools/gen/gen.go', 'generate')).toEqual(['tools/api/api.go::Start']);
-    expect(callTargets(cg, 'server/cmd/main.go', 'main')).toEqual([
+    expect(targets(cg, 'tools/gen/gen.go', 'generate')).toEqual(['tools/api/api.go::Start']);
+    expect(targets(cg, 'server/cmd/main.go', 'main')).toEqual([
       'server/api/api.go::Start',
       'tools/lint/lint.go::Run',
     ]);
   });
 
-  it('follows a struct field typed with the other module\'s package', () => {
-    expect(callTargets(cg, 'server/cmd/main.go', 'check')).toEqual(['tools/lint/lint.go::Linter::Check']);
+  it("follows a struct field typed with the other module's package", () => {
+    expect(targets(cg, 'server/cmd/main.go', 'check')).toEqual(['tools/lint/lint.go::Linter::Check']);
   });
 
   it('leaves an import that only shares a prefix with a module path unresolved', () => {
-    expect(callTargets(cg, 'server/cmd/ext.go', 'external')).toEqual([]);
+    expect(targets(cg, 'server/cmd/ext.go', 'external')).toEqual([]);
+  });
+});
+
+describe('Names written through a package of a nested module (#2322)', () => {
+  let cg: CodeGraph;
+  beforeAll(async () => {
+    cg = await indexProject({
+      'src/go.mod': 'module example.com/harbor/src\n\ngo 1.22\n',
+      'src/jobservice/job/op.go': 'package job\n\ntype OPCommand string\n',
+      // A result type spelled like the method that returns it.
+      'src/jobservice/impl/context.go': `package impl
+
+import "example.com/harbor/src/jobservice/job"
+
+type Context struct{}
+
+func (c *Context) OPCommand() (job.OPCommand, bool) {
+	return "", false
+}
+`,
+      'src/pkg/artifact/manager.go': `package artifact
+
+type Manager interface {
+	Count() int64
+}
+`,
+      // A caching wrapper delegating to the same-named type of another package.
+      'src/pkg/cached/redis/manager.go': `package redis
+
+import "example.com/harbor/src/pkg/artifact"
+
+type Manager struct {
+	delegator artifact.Manager
+}
+
+func (m *Manager) Count() int64 {
+	return m.delegator.Count()
+}
+`,
+      // A test fixture claiming the real module's path. The go tool ignores
+      // testdata, so it never answers another module's import of that path.
+      'internal/testdata/stub/go.mod': 'module example.com/harbor/src\n\ngo 1.22\n',
+      'internal/testdata/stub/pkg/artifact/manager.go': `package artifact
+
+type Manager interface {
+	Count() int64
+}
+`,
+      'tools/go.mod': 'module example.com/harbor/tools\n\ngo 1.22\n',
+      'tools/report/report.go': `package report
+
+import "example.com/harbor/src/pkg/artifact"
+
+type Reporter struct {
+	mgr artifact.Manager
+}
+
+func (r *Reporter) Total() int64 {
+	return r.mgr.Count()
+}
+`,
+    });
+  });
+
+  it('a type reference lands on the named package’s type, not a same-named method', () => {
+    expect(targets(cg, 'src/jobservice/impl/context.go', 'OPCommand', 'references')).toEqual([
+      'src/jobservice/job/op.go::OPCommand',
+    ]);
+  });
+
+  it('a field typed with another package’s same-named type reaches that type, not the caller itself', () => {
+    expect(targets(cg, 'src/pkg/cached/redis/manager.go', 'Count')).toEqual([
+      'src/pkg/artifact/manager.go::Manager::Count',
+    ]);
+  });
+
+  it('a module under testdata never answers for the module it imitates', () => {
+    expect(targets(cg, 'tools/report/report.go', 'Total')).toEqual([
+      'src/pkg/artifact/manager.go::Manager::Count',
+    ]);
   });
 });
 
@@ -202,10 +300,10 @@ describe('Two Go modules declaring the same path (#2322)', () => {
 
   it("resolves each copy's imports into its own module", () => {
     for (const copy of ['v1', 'v2']) {
-      expect(callTargets(cg, `${copy}/internal/domain/service.go`, 'NewService')).toEqual([
+      expect(targets(cg, `${copy}/internal/domain/service.go`, 'NewService')).toEqual([
         `${copy}/internal/store/store.go::New`,
       ]);
-      expect(callTargets(cg, `${copy}/internal/domain/service.go`, 'Stamp')).toEqual([
+      expect(targets(cg, `${copy}/internal/domain/service.go`, 'Stamp')).toEqual([
         `${copy}/pkg/clock/clock.go::Now`,
       ]);
     }
@@ -224,9 +322,9 @@ describe('Go module at the project root', () => {
   });
 
   it('resolves exactly as before', () => {
-    expect(callTargets(cg, 'internal/domain/service.go', 'NewService')).toEqual(['internal/store/store.go::New']);
-    expect(callTargets(cg, 'internal/domain/service.go', 'Stamp')).toEqual(['pkg/clock/clock.go::Now']);
-    expect(callTargets(cg, 'internal/domain/service.go', 'AddItem')).toEqual([
+    expect(targets(cg, 'internal/domain/service.go', 'NewService')).toEqual(['internal/store/store.go::New']);
+    expect(targets(cg, 'internal/domain/service.go', 'Stamp')).toEqual(['pkg/clock/clock.go::Now']);
+    expect(targets(cg, 'internal/domain/service.go', 'AddItem')).toEqual([
       'internal/store/store.go::Manager::CreateItem',
     ]);
   });

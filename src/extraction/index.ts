@@ -27,7 +27,7 @@ import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
-import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
@@ -116,6 +116,12 @@ export interface IndexResult {
   nodesCreated: number;
   edgesCreated: number;
   errors: ExtractionError[];
+  /**
+   * Wall time in milliseconds. `CodeGraph.indexAll` reports the whole run —
+   * scanning, parsing and storing, then resolving references and linking —
+   * as it does the node and edge totals; the orchestrator's own result
+   * covers only the files' extraction.
+   */
   durationMs: number;
 }
 
@@ -134,6 +140,11 @@ export interface SyncResult {
   filesModified: number;
   filesRemoved: number;
   nodesUpdated: number;
+  /**
+   * Wall time in milliseconds. `CodeGraph.sync` reports the whole sync,
+   * resolution and linking included; the orchestrator's own result covers
+   * only reconciling and re-extracting the files.
+   */
   durationMs: number;
   changedFilePaths?: string[];
   /** Paths not absorbed because reading or extraction failed; retain for status/retry. */
@@ -1783,12 +1794,13 @@ function resurrectRefFromDroppedEdge(
     fromNodeId: e.source,
     referenceName: refName,
     referenceKind: refKind,
+    ...(e.sourceLanguage === 'verilog' && Array.isArray(e.metadata?.refCandidates)
+      && e.metadata.refCandidates.every((c: unknown) => typeof c === 'string')
+      ? { candidates: e.metadata.refCandidates as string[] } : {}),
     line: e.line ?? 0,
     column: e.column ?? 0,
     filePath: e.sourceFilePath,
     language: e.sourceLanguage,
-    ...(Array.isArray(e.metadata?.refCandidates) && e.metadata.refCandidates.every(candidate => typeof candidate === 'string')
-      ? { candidates: e.metadata.refCandidates as string[] } : {}),
   };
 }
 
@@ -1864,10 +1876,13 @@ export class ExtractionOrchestrator {
   private rootDir: string;
   private hdlContext: HdlIndexContext | null = null;
   private hdlForce = false;
+  /** A source the changed profile re-reads was not stored, so that profile is not the indexed one yet. */
+  private hdlForceUnstored = false;
   private hdlTouched = new Set<string>();
 
   private prepareHdlContext(): void {
     this.hdlTouched.clear();
+    this.hdlForceUnstored = false;
     const previous = this.queries.getMetadata('hdl_profile_fingerprint');
     this.hdlContext = new HdlIndexContext(this.rootDir, !!this.queries.getMetadata('hdl_profile_name'));
     this.hdlForce = previous !== this.hdlContext.fingerprint && (!!this.hdlContext.profile || !!this.queries.getMetadata('hdl_profile_name'));
@@ -1878,7 +1893,7 @@ export class ExtractionOrchestrator {
     return this.hdlContext!.source(file, content);
   }
   commitHdlProfile(): void {
-    if (!this.hdlContext) return;
+    if (!this.hdlContext || this.hdlForceUnstored) return;
     this.queries.setMetadata('hdl_profile_name', this.hdlContext.profile?.name ?? '');
     this.queries.setMetadata('hdl_profile_fingerprint', this.hdlContext.fingerprint);
     const context = JSON.parse(this.hdlContext.context());
@@ -2350,11 +2365,17 @@ export class ExtractionOrchestrator {
       const nodeCount = result.kernelCounts?.nodes ?? result.nodes.length;
       const edgeCount = result.kernelCounts?.edges ?? result.edges.length;
 
+      // A file whose grammar failed to load was never parsed (#2335).
+      const grammarUnavailable = hasGrammarLoadFailure(result.errors);
+
       // Store: on the writer thread when active (fresh DB — bundles applied
       // in the same file order this chain dispatches them), else on the main
       // thread (SQLite connections are per-thread).
       const language = detectLanguage(filePath, content, overrides);
-      if (storeWriter) {
+      if (grammarUnavailable) {
+        // Store nothing: a row from an earlier run keeps its data, and with no
+        // row (or an older hash) the next sync or index retries the file.
+      } else if (storeWriter) {
         if (result.kernelBuffers) {
           // Buffers go to the writer as-is; the worker decodes + finalizes.
           // The main thread's only per-file work stays O(1) + the content hash.
@@ -2382,7 +2403,9 @@ export class ExtractionOrchestrator {
         errors.push(...result.errors);
       }
 
-      if (nodeCount > 0) {
+      if (grammarUnavailable) {
+        filesErrored++;
+      } else if (nodeCount > 0) {
         filesIndexed++;
         totalNodes += nodeCount;
         totalEdges += edgeCount;
@@ -2804,7 +2827,9 @@ export class ExtractionOrchestrator {
         errors.push(...result.errors);
       }
 
-      if (result.nodes.length > 0) {
+      if (hasGrammarLoadFailure(result.errors)) {
+        filesErrored++; // nothing was stored (#2335)
+      } else if (result.nodes.length > 0) {
         filesIndexed++;
         totalNodes += result.nodes.length;
         totalEdges += result.edges.length;
@@ -2990,6 +3015,15 @@ export class ExtractionOrchestrator {
     result: ExtractionResult,
     onYield?: MaybeYield
   ): Promise<void> {
+    // The file was never parsed: its grammar failed to load (#2335). Storing
+    // this would replace the file's symbols with an empty row under the new
+    // content hash, which no hash-based sync revisits. Keep whatever the index
+    // has; the stale (or missing) row makes the next sync retry the file.
+    if (hasGrammarLoadFailure(result.errors)) {
+      if (this.forceHdlFile(filePath)) this.hdlForceUnstored = true;
+      return;
+    }
+
     // A kernel result can arrive as an undecoded buffer transport (empty
     // node/edge arrays, tables riding in kernelBuffers). Decode it before
     // storing — persisting the transport as-is records the file as having no
@@ -3017,7 +3051,10 @@ export class ExtractionOrchestrator {
       const existingIsMarker =
         existingFile.nodeCount === 0 && (existingFile.errors?.length ?? 0) > 0;
       const incomingHasContent = result.nodes.length > 0;
-      if (!existingIsMarker || !incomingHasContent) {
+      // A row an older engine stored while the grammar could not load
+      // (#2335) records no parse at all: any real result replaces it.
+      const existingNeverParsed = hasGrammarLoadFailure(existingFile.errors);
+      if (!existingNeverParsed && (!existingIsMarker || !incomingHasContent)) {
         return; // No changes
       }
     }
@@ -3243,15 +3280,6 @@ export class ExtractionOrchestrator {
         if (ref) resurrected.push(ref);
         continue;
       }
-      // Literal ownership candidates must be replayed against the edited file;
-      // retaining a definition identity alone does not retain its value proof.
-      if (Array.isArray(e.metadata?.refCandidates)) {
-        const ref = resurrectRefFromDroppedEdge(e);
-        if (ref) {
-          resurrected.push(ref);
-          continue;
-        }
-      }
       const newTargetId = replacementOf.get(e.target);
       if (newTargetId) {
         reinserted.push({ source: e.source, target: newTargetId, kind: e.kind, metadata: e.metadata, line: e.line, column: e.column, provenance: e.provenance });
@@ -3343,6 +3371,97 @@ export class ExtractionOrchestrator {
       if (ref) { ids.push(edge.edgeId); refs.push(ref); }
     }
     if (refs.length) this.queries.replaceResolutionEdgesWithUnresolvedRefs(ids, refs);
+    return refs.length;
+  }
+
+  /**
+   * Re-open every resolution a language made, for the sync's sweep to redo
+   * against the current graph — the answer when an input to that language's
+   * resolution changed project-wide rather than per definition. Python
+   * package roots are that kind of input: an added `__init__.py` or an edited
+   * `pyproject.toml` moves where modules start for importers in files the
+   * sync never touched, and CG-33's per-name rebind can't see it. Parked
+   * failures are re-queued too, since some of them now resolve. Same
+   * conservatism as {@link resurrectStaleResolutionEdges}: an edge without a
+   * refName stamp is never deleted.
+   */
+  resurrectResolutionEdgesForLanguage(language: Language): number {
+    return (
+      this.reopenEdges(this.queries.getResolutionEdgesBySourceLanguage(language)) +
+      this.queries.requeueFailedReferencesByLanguage(language)
+    );
+  }
+
+  /**
+   * The narrow form, for modules or packages that appeared or vanished below
+   * an unchanged set of roots: re-open the edges whose target lies in
+   * `targetFiles` or whose source lies under `sourceDirs`, and re-queue the
+   * parked failures naming one of `moduleLeaves`. Returns the files whose
+   * references were re-opened.
+   */
+  resurrectResolutionEdgesTouching(
+    language: Language,
+    scope: { targetFiles: string[]; sourceDirs: string[]; moduleLeaves: string[] }
+  ): string[] {
+    const files = new Set<string>();
+    const edges = this.queries.getResolutionEdgesTouchingFiles(language, scope.targetFiles, scope.sourceDirs, scope.moduleLeaves);
+    for (const e of edges) files.add(e.sourceFilePath);
+    this.reopenEdges(edges);
+    this.queries.requeueFailedReferencesByLanguage(language, scope.moduleLeaves, files);
+    return [...files];
+  }
+
+  /**
+   * Re-open what importers bound from a Python package whose `__init__.py`
+   * was edited: in each importing file, the edges and parked failures whose
+   * reference starts with a name bound from that package (`N`, `N.run`,
+   * `pkg.N`). A def or re-export added, removed or repointed there moves
+   * exactly those answers — `from pkg import N` prefers what `__init__.py`
+   * binds over a submodule `pkg/N` — and nothing in the importer's other
+   * references. A name whose import edge already lands where the package
+   * binds it now is left alone, so an edit that moves nothing re-resolves
+   * nothing. Returns the files whose references were re-opened.
+   */
+  resurrectPythonPackageImporters(bindings: Map<string, Map<string, string | null>>): string[] {
+    if (bindings.size === 0) return [];
+    const edges = this.queries.getResolutionEdgesFromFiles('python', [...bindings.keys()]);
+    const refHead = (e: { metadata?: Record<string, unknown> }): string | null => {
+      const refName = e.metadata?.refName;
+      return typeof refName === 'string' ? refName.split('.')[0]! : null;
+    };
+    // Where each bound name's own import edge lands today.
+    const bindsNow = new Map<string, string>();
+    for (const e of edges) {
+      const refName = e.metadata?.refName;
+      if (e.kind !== 'imports' || typeof refName !== 'string' || refName.includes('.')) continue;
+      const target = this.queries.getNodeById(e.target);
+      if (target) bindsNow.set(`${e.sourceFilePath}\0${refName}`, `${target.filePath}\0${target.kind === 'file' ? '' : target.name}`);
+    }
+    const moved = new Map<string, Set<string>>();
+    for (const [file, names] of bindings) {
+      for (const [name, binding] of names) {
+        if (binding !== null && bindsNow.get(`${file}\0${name}`) === binding) continue;
+        let set = moved.get(file);
+        if (!set) moved.set(file, (set = new Set()));
+        set.add(name);
+      }
+    }
+    if (moved.size === 0) return [];
+    this.reopenEdges(edges.filter((e) => moved.get(e.sourceFilePath)?.has(refHead(e) ?? '') === true));
+    this.queries.requeueFailedReferencesBinding('python', moved);
+    return [...moved.keys()];
+  }
+
+  private reopenEdges(edges: Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }>): number {
+    const edgeIds: number[] = [];
+    const refs: UnresolvedReference[] = [];
+    for (const e of edges) {
+      const ref = resurrectRefFromDroppedEdge(e);
+      if (!ref) continue;
+      edgeIds.push(e.edgeId);
+      refs.push(ref);
+    }
+    if (refs.length > 0) this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
     return refs.length;
   }
 
@@ -3516,13 +3635,18 @@ export class ExtractionOrchestrator {
       }
       const fullPath = path.join(this.rootDir, filePath);
       const tracked = trackedMap.get(filePath);
+      // A row an older engine stored while the file's grammar could not load
+      // (#2335) holds no parse of these bytes: re-index it even though its
+      // size, mtime and hash all match. Rows with a real parse error are
+      // deterministic and are not retried.
+      const neverParsed = tracked !== undefined && hasGrammarLoadFailure(tracked.errors);
 
       // Cheap pre-filter: an already-indexed file whose size AND mtime both match
       // the DB is unchanged — skip it without reading or hashing. (A content
       // change that preserves both exactly is the blind spot every mtime-based
       // incremental tool accepts; `index --force` is the escape hatch. Git bumps
       // mtime on every file it writes during checkout/merge, so pulls are caught.)
-      if (tracked && !this.forceHdlFile(filePath)) {
+      if (tracked && !neverParsed && !this.forceHdlFile(filePath)) {
         try {
           const stat = fs.statSync(fullPath);
           if (stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)) {
@@ -3558,7 +3682,7 @@ export class ExtractionOrchestrator {
         filesToIndex.push(filePath);
         changedFilePaths.push(filePath);
         filesAdded++;
-      } else if (tracked.contentHash !== contentHash || this.forceHdlFile(filePath)) {
+      } else if (tracked.contentHash !== contentHash || neverParsed || this.forceHdlFile(filePath)) {
         onFileChange?.(filePath, content);
         filesToIndex.push(filePath);
         changedFilePaths.push(filePath);
@@ -3593,7 +3717,7 @@ export class ExtractionOrchestrator {
 
       const result = await this.indexFile(filePath);
       if (result.errors.some(e => e.severity === 'error')) failedFilePaths.push(filePath);
-      nodesUpdated += result.nodes.length;
+      if (!hasGrammarLoadFailure(result.errors)) nodesUpdated += result.nodes.length; // else nothing was stored (#2335)
 
       const pause = backpressure?.();
       if (pause) await pause;

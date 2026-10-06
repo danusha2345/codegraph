@@ -21,25 +21,24 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { matchKotlinReceiverChain, isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, GO_STDLIB_PACKAGES } from './name-matcher';
+import { matchKotlinReceiverChain, isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, GO_STDLIB_PACKAGES, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
+import { clearVbnetReceiverMemos, isVbMemberRead, matchVbMemberRead } from './vbnet-receivers';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
-import { resolveViaImport, resolveRustImportedCall, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
+import { resolveViaImport, resolveRustImportedCall, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters } from './import-resolver';
 import { isVerilogMemberRef, matchVerilogMember } from './verilog-members';
 import { isVerilogPortRef, matchVerilogPort } from './verilog-ports';
 import { isVerilogWildcardRef, matchVerilogWildcard } from './verilog-wildcard';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
-import { resolveJsObjectCall, JS_OBJECT_LANGUAGES } from './js-object-members';
-import type { JsObjectInfo } from '../extraction/js-object-bindings';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
-import { findGoModuleForImport, loadGoModule, type GoModule } from './go-module';
+import { findGoModuleForImport, goModulePackageDir, loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
 import { lexicalPathWithinRoot } from '../utils';
@@ -290,7 +289,6 @@ export class ReferenceResolver {
   // resolution pass (same lifetime assumption as nameCache); clearCaches() resets
   // it between passes. Callers must treat the returned array as read-only.
   private nodesByKindCache = new Map<Node['kind'], Node[]>();
-  private jsObjectInfoCache = new Map<string, JsObjectInfo | null>();
   // Filesystem existence probes behind context.fileExists (paths not in knownFiles).
   private fileExistsMemo = new Map<string, boolean>();
   private knownNames: Set<string> | null = null; // all known symbol names for fast pre-filtering
@@ -302,12 +300,17 @@ export class ReferenceResolver {
   private projectAliases: AliasMap | null | undefined = undefined;
   // Per directory: the aliases of the nearest non-root tsconfig declaring `paths`.
   private dirAliases = new Map<string, AliasMap | null>();
-  // Per directory: the module of the nearest go.mod at or above it, up to the
-  // project root ('' = the root). Same lazy/immutable convention as dirAliases.
+  // Per project-relative directory ('' = the root): the module of the nearest
+  // go.mod at or above it, up to the project root. Same lazy/immutable
+  // convention as dirAliases.
   private goModuleByDir = new Map<string, GoModule | null>();
-  // Every module owning an indexed .go file, plus the root one. Depends on the
-  // file set, like knownFiles, so clearCaches drops it.
+  // The project's Go modules: the root one plus every module that owns an
+  // indexed .go file. Depends on the file set, like knownFiles, so
+  // clearCaches drops it.
   private goModules: GoModule[] | null = null;
+  // getGoPackageDir answers, keyed by import path and the importing file's
+  // module. Derived from goModules, so dropped with it.
+  private goPackageDirs = new Map<string, string | null>();
   // Monorepo workspace member packages. Same lazy/immutable convention.
   private workspacePackages: WorkspacePackages | null | undefined = undefined;
 
@@ -453,13 +456,13 @@ export class ReferenceResolver {
     this.supertypeMemo.clear();
     this.supertypeGen++;
     this.nodesByKindCache.clear();
-    this.jsObjectInfoCache.clear();
     this.fileExistsMemo.clear();
     this.manifestScopes.clear();
     this.knownNames = null;
     this.knownLowerNames = null;
     this.knownFiles = null;
     this.goModules = null;
+    this.goPackageDirs.clear();
     this.cachesWarmed = false;
     // The import-resolver's and name-matcher's per-context memos assume the
     // same stable window as the caches above — drop them together.
@@ -468,11 +471,16 @@ export class ReferenceResolver {
       clearNameMatcherMemos(this.context);
       clearCppMacroVisibility(this.context);
       clearSwiftTypeVisibility(this.context);
+      clearVbnetReceiverMemos(this.context);
       clearTypeParameterMemos(this.context);
     }
   }
 
-  /** The module of the nearest `go.mod` at or above project-relative `dir`, up to the project root. */
+  /**
+   * The module of the nearest `go.mod` at or above project-relative `dir`
+   * ('' = the root), never above the project root (#2322). Each directory
+   * is read at most once: every directory the walk passes is memoized.
+   */
   private nearestGoModule(dir: string): GoModule | null {
     const walked: string[] = [];
     let found: GoModule | null | undefined;
@@ -486,6 +494,29 @@ export class ReferenceResolver {
     }
     for (const d of walked) this.goModuleByDir.set(d, found);
     return found;
+  }
+
+  /**
+   * The project's Go modules: the root `go.mod`'s, and the nearest `go.mod`
+   * of every directory holding an indexed `.go` file — so an ignored or
+   * vendored tree, which holds no indexed file, adds none, and nothing walks
+   * the disk. The go tool ignores `testdata/` and `_`/`.`-prefixed
+   * directories, so a module there serves only its own files (#2322).
+   */
+  private getGoModules(): GoModule[] {
+    if (this.goModules) return this.goModules;
+    const dirs = new Set<string>(['']);
+    for (const file of this.knownFiles ?? this.queries.getAllFilePaths()) {
+      if (file.endsWith('.go')) dirs.add(goDirOf(file));
+    }
+    const modules = new Set<GoModule>();
+    for (const dir of dirs) {
+      const mod = this.nearestGoModule(dir);
+      const modDir = mod ? path.relative(this.projectRoot, mod.rootDir).split(path.sep).join('/') : '';
+      if (mod && !/(?:^|\/)(?:testdata|[_.][^/]*)(?:\/|$)/.test(modDir)) modules.add(mod);
+    }
+    this.goModules = [...modules];
+    return this.goModules;
   }
 
   /** `readFile` through the LRU content cache (null = read failed, also cached). */
@@ -533,40 +564,15 @@ export class ReferenceResolver {
   /**
    * Create the resolution context
    */
-  private jsObjectInfo(nodeId: string): JsObjectInfo | null {
-    if (this.jsObjectInfoCache.has(nodeId)) return this.jsObjectInfoCache.get(nodeId)!;
-    this.jsObjectInfoCache.set(nodeId, null); // a corrupt containment cycle must not recurse forever.
-    for (const edge of this.queries.getIncomingEdges(nodeId, ['contains'])) {
-      const info = edge.metadata?.jsObject;
-      if (info && typeof info === 'object') {
-        const object = info as Partial<JsObjectInfo>;
-        if (typeof object.path === 'string' && typeof object.binding === 'string' &&
-            Array.isArray(object.scope) && object.scope.length === 4 && object.scope.every(value => Number.isInteger(value) && value >= 0)) {
-          const result: JsObjectInfo = { path: object.path, binding: object.binding, scope: object.scope as JsObjectInfo['scope'] };
-          this.jsObjectInfoCache.set(nodeId, result);
-          return result;
-        }
-      }
-      if (edge.metadata?.jsObjectMember === true) {
-        const owner = this.jsObjectInfo(edge.source);
-        if (owner) {
-          const result = { ...owner, ownerId: edge.source };
-          this.jsObjectInfoCache.set(nodeId, result);
-          return result;
-        }
-      }
-    }
-    return null;
-  }
-
   private createContext(): ResolutionContext {
     return {
-      getJsObjectInfo: (nodeId) => this.jsObjectInfo(nodeId),
       resolveImport: (ref) => resolveViaImport(ref, this.context),
       isOutOfRepoImport: (source, fromFile, language) =>
         isExternalImport(source, language, this.context) &&
         resolveImportPath(source, fromFile, language, this.context) === null &&
         this.isDeclaredOutsidePackage(source, fromFile),
+      resolveModuleFile: (source, fromFile, language) =>
+        resolveImportPath(source, fromFile, language, this.context),
       getNodesInFile: (filePath: string) => {
         if (!this.nodeCache.has(filePath)) {
           this.nodeCache.set(filePath, this.queries.getNodesByFile(filePath));
@@ -857,24 +863,16 @@ export class ReferenceResolver {
         return found;
       },
 
-      getGoModuleForImport: (importPath: string, fromFile?: string) => {
-        if (this.goModules === null) {
-          const dirs = new Set<string>(['']);
-          for (const file of this.queries.getAllFilePaths()) {
-            if (file.endsWith('.go')) dirs.add(goDirOf(file));
-          }
-          const modules = new Set<GoModule>();
-          for (const dir of dirs) {
-            const mod = this.nearestGoModule(dir);
-            if (mod) modules.add(mod);
-          }
-          this.goModules = [...modules];
-        }
+      getGoPackageDir: (importPath: string, fromFile?: string) => {
         const own = fromFile === undefined ? null : this.nearestGoModule(goDirOf(fromFile));
-        return findGoModuleForImport(importPath, this.goModules, own);
+        const key = `${importPath}\0${own?.rootDir ?? ''}`;
+        const hit = this.goPackageDirs.get(key);
+        if (hit !== undefined) return hit;
+        const mod = findGoModuleForImport(importPath, this.getGoModules(), own);
+        const dir = mod ? goModulePackageDir(importPath, mod, this.projectRoot) : null;
+        this.goPackageDirs.set(key, dir);
+        return dir;
       },
-
-      getGoModuleOfFile: (filePath: string) => this.nearestGoModule(goDirOf(filePath)),
 
       getWorkspacePackages: () => {
         if (this.workspacePackages === undefined) {
@@ -891,15 +889,16 @@ export class ReferenceResolver {
           this.reExportCache.set(filePath, []);
           return [];
         }
-        // Re-exports are a JS/TS-only construct, and what matters is the
-        // BARREL file's own language — not the consuming reference's. A
-        // `.svelte`/`.vue` consumer threads its own language down the
-        // re-export chase, which would make extractReExports() bail on a
-        // `.ts` index barrel and silently break the chain (#629). Re-key
+        // What matters is the BARREL file's own language — not the consuming
+        // reference's. A `.svelte`/`.vue` consumer threads its own language
+        // down the re-export chase, which would make extractReExports() bail
+        // on a `.ts` index barrel and silently break the chain (#629). Re-key
         // the parse on the barrel's extension so the chase works no matter
-        // what kind of file imports through it.
+        // what kind of file imports through it. Python re-exports through its
+        // imports (a package `__init__.py`), so a `.py` barrel parses as Python.
         const isJsFamily = /\.(?:d\.ts|[cm]?tsx?|[cm]?jsx?|ets)$/i.test(filePath);
-        const reExports = extractReExports(content, isJsFamily ? 'typescript' : language);
+        const barrelLanguage = isJsFamily ? 'typescript' : /\.py$/i.test(filePath) ? 'python' : language;
+        const reExports = extractReExports(content, barrelLanguage);
         this.reExportCache.set(filePath, reExports);
         return reExports;
       },
@@ -1109,21 +1108,15 @@ export class ReferenceResolver {
       ref,
       this.context,
     );
-    const objectInfo = candidate &&
-      (ref.candidates !== undefined || (ref.referenceKind === 'calls' && ref.referenceName.includes('.'))) &&
-      JS_OBJECT_LANGUAGES.has(this.nodeById(candidate.targetNodeId)?.language ?? '')
-      ? this.jsObjectInfo(candidate.targetNodeId) : null;
-    const literal = candidate && (
-      (objectInfo?.ownerId && ref.candidates !== undefined &&
-        !ref.candidates.includes(this.nodeById(candidate.targetNodeId)?.qualifiedName ?? '')) ||
-      // A direct literal holder proves the receiver, not a missing callable member.
-      (objectInfo && !objectInfo.ownerId && ref.referenceKind === 'calls' && ref.referenceName.includes('.'))
-    ) ? null : candidate;
-    const scoped = this.gateRustScope(literal, ref);
+    const scoped = this.gateRustScope(candidate, ref);
     const resolved = this.gateSuperSelfCall(
       scoped?.resolvedBy === 'framework' ? this.gateFrameworkLanguage(scoped, ref) : this.gateLanguage(scoped, ref),
       ref,
     );
+    // A Dart class whose field holds its own type (`class Node { Node? next; }`)
+    // names itself: a self-edge that says nothing (#2327).
+    if (resolved && ref.language === 'dart' && ref.referenceKind === 'references' &&
+        resolved.targetNodeId === ref.fromNodeId) return null;
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
 
     const target = this.nodeById(resolved.targetNodeId);
@@ -1145,6 +1138,10 @@ export class ReferenceResolver {
     // A local C++ object construction (`T obj(args)`, ref `ns::T::T/1`)
     // resolves ONLY to a constructor of the lexically nearest `T` (#1839).
     if (isCppConstructorRef(ref)) return matchCppConstructor(ref, this.context);
+
+    // A Dart member read (`x.area`) links the getter the receiver's type
+    // reaches, as a call, or nothing — never a guess by name (#2338).
+    if (isDartMemberRead(ref)) return matchDartMemberRead(ref, this.context);
 
     // A Kotlin call through a receiver chain (`engine.pump.drain()`) resolves
     // on the chain's declared type, or gets no edge when that type is a
@@ -1191,10 +1188,6 @@ export class ReferenceResolver {
     const phpQualified = resolvePhpQualifiedClassRef(ref, this.context);
     if (phpQualified !== undefined) return this.gateLanguage(phpQualified, ref);
 
-    const objectCall = resolveJsObjectCall(ref, this.context,
-      (name) => this.resolveOneInner({ ...ref, referenceName: name, candidates: undefined }));
-    if (objectCall !== undefined) return this.gateLanguage(objectCall, ref);
-
     // Rust `use …::take as consume; consume()` can have no node named
     // `consume`. Its explicit binding takes precedence over name heuristics.
     const rustImportedCall = resolveRustImportedCall(ref, this.context);
@@ -1233,6 +1226,12 @@ export class ReferenceResolver {
     if (!preFilterPass) {
       return this.gateLanguage(matchJsStoreBindingCall(ref, this.context), ref);
     }
+
+    // A VB.NET value read through a name (`AppSession.SessionId`, #2305) means
+    // what VB.NET's scoping says the name is — a project type, whose member
+    // and the type itself it links, or a value, which links nothing here — and
+    // no framework, import or name strategy guesses past that.
+    if (isVbMemberRead(ref)) return this.gateLanguage(matchVbMemberRead(ref, this.context), ref);
 
     // Function-as-value refs (#756) get a dedicated, strictly-gated path:
     // import-based resolution first (an imported callback resolves through its
@@ -1320,7 +1319,8 @@ export class ReferenceResolver {
     if (isUnresolvedJsMemberCall(ref)) {
       const root = ref.referenceName.slice(0, ref.referenceName.indexOf('.'));
       const namespace = this.context.getImportMappings(ref.filePath, ref.language).some((m) => m.isNamespace && m.localName === root);
-      if (!namespace) return null;
+      // `App.utils.fmt()` through a path an object literal was hung on (#2300).
+      if (!namespace) return this.gateLanguage(matchObjectPathCall(ref, this.context), ref);
       const viaNamespace = this.gateLanguage(resolveViaImport(ref, this.context), ref);
       const target = viaNamespace ? this.nodeById(viaNamespace.targetNodeId) : null;
       return target && (target.kind === 'function' || target.kind === 'method' || target.kind === 'class' || target.kind === 'constant' || target.kind === 'variable')
@@ -1513,7 +1513,8 @@ export class ReferenceResolver {
           // wrong rebind; edges without refName (pre-#1240, synthesized) are
           // deliberately NOT resurrected for the same reason.
           refName: ref.original.referenceName,
-          ...(ref.original.candidates !== undefined ? { refCandidates: ref.original.candidates } : {}),
+          ...(ref.original.language === 'verilog' && ref.original.candidates?.length
+            ? { refCandidates: ref.original.candidates } : {}),
           ...(ref.original.referenceKind !== kind ? { refKind: ref.original.referenceKind } : {}),
           // Uniform marker for function-as-value edges (#756), regardless of
           // which strategy resolved them (import vs matchFunctionRef) — lets
@@ -2492,6 +2493,40 @@ export class ReferenceResolver {
   }
 
   /**
+   * Digest of the package roots Python import resolution rests on (see
+   * `pythonRootFingerprint`). Build configs are read from disk rather than
+   * the file cache, so a sync after an edit sees the edit. Empty for a
+   * project with no Python.
+   */
+  getPythonRootFingerprint(): string {
+    return pythonRootFingerprint(this.diskContext());
+  }
+
+  /** What a sync must re-open after these Python files were added or removed (see `pythonReopenScope`). */
+  getPythonReopenScope(changedFiles: string[]): ReturnType<typeof pythonReopenScope> {
+    return pythonReopenScope(this.diskContext(), changedFiles);
+  }
+
+  /** Importers of Python packages whose `__init__.py` was edited, with the names they bind (see `pythonPackageImporters`). */
+  getPythonPackageImporters(initFiles: string[]): Map<string, Map<string, string | null>> {
+    return pythonPackageImporters(this.context, initFiles);
+  }
+
+  /** The resolution context, reading build configs from disk rather than the file cache. */
+  private diskContext(): ResolutionContext {
+    return {
+      ...this.context,
+      readFile: (filePath: string) => {
+        try {
+          return fs.readFileSync(path.join(this.projectRoot, filePath), 'utf-8');
+        } catch {
+          return null;
+        }
+      },
+    };
+  }
+
+  /**
    * Get detected frameworks
    */
   getDetectedFrameworks(): string[] {
@@ -2630,10 +2665,9 @@ export class ReferenceResolver {
       const dotIdx = name.indexOf('.');
       if (dotIdx > 0) {
         const pkg = name.substring(0, dotIdx);
-        // Only when the file imports it: an unimported `ring` / `list` / `url`
-        // is a local variable (`func flush(ring *ringLog) { ring.Write(b) }`),
-        // and skipping it here dropped every method call made through it.
-        // Matched on any path segment, not the import's local name, so a
+        // Only when the file imports it: an unimported `ring` / `token` /
+        // `url` is a local variable (`func flush(ring *ringLog) { ring.Write(b) }`).
+        // Matched on any path segment, not only the import's local name, so a
         // versioned path (`math/rand/v2`) still counts as importing `rand`.
         if (
           GO_STDLIB_PACKAGES.has(pkg) &&
@@ -2850,8 +2884,11 @@ export class ReferenceResolver {
   private resolveThisMemberFnRef(ref: UnresolvedRef): ResolvedRef | null {
     const member = ref.referenceName.slice('this.'.length);
     if (!member) return null;
-    const fromNode = this.nodeById(ref.fromNodeId);
-    if (!fromNode) return null;
+    const written = this.nodeById(ref.fromNodeId);
+    if (!written) return null;
+    // Inside an object literal: its own method's `this` is the object, an
+    // arrow member's is the method around the literal (#2300).
+    const fromNode = thisScopeCaller(written, this.context);
     // A hook declared at class-body level (Ruby `before_action :authenticate`)
     // attributes to the CLASS node itself — its qualified name IS the scope.
     // For members, strip the member segment.
@@ -2938,8 +2975,9 @@ export class ReferenceResolver {
     for (const ref of deferred) {
       await maybeYield();
       const member = ref.referenceName.slice('this.'.length);
-      const fromNode = this.nodeById(ref.fromNodeId);
-      if (!fromNode || !member) continue;
+      const written = this.nodeById(ref.fromNodeId);
+      if (!written || !member) continue;
+      const fromNode = thisScopeCaller(written, this.context);
       // Class-body-level hooks (Ruby) attribute to the CLASS node itself.
       let className: string;
       if (SUPERTYPE_BEARING_KINDS.has(fromNode.kind) || fromNode.kind === 'module') {

@@ -7,6 +7,12 @@
  * — `github.com/example/myproject/pkga` — as a third-party package, so
  * resolution falls through to name-matching with path proximity and returns
  * a tiny fraction of the real call sites. See issue #388.
+ *
+ * A project can hold several modules — a Go backend in `server/` next to a
+ * frontend, or etcd's root module beside `server/go.mod` and
+ * `client/v3/go.mod` — so the resolver reads the `go.mod` nearest every
+ * directory with indexed Go files and maps an import path to the module
+ * that declares the longest prefix of it (#2322).
  */
 
 import * as fs from 'fs';
@@ -22,8 +28,6 @@ export interface GoModule {
 /**
  * Read the `go.mod` file in `moduleDir` and extract the module path.
  * Returns `null` if no `go.mod` exists there or it has no `module` directive.
- * The resolver calls it for every directory between a Go file and the project
- * root, so a module whose `go.mod` sits below the root resolves too (#2322).
  */
 export function loadGoModule(moduleDir: string): GoModule | null {
   const goModPath = path.join(moduleDir, 'go.mod');
@@ -45,8 +49,8 @@ export function loadGoModule(moduleDir: string): GoModule | null {
 }
 
 /**
- * The module an import path belongs to: the one whose module path equals it or
- * is a `/`-bounded prefix of it. Nested modules (`example.com/app` and
+ * The module an import path belongs to: the one whose module path equals it
+ * or is a `/`-bounded prefix of it. Nested modules (`example.com/app` and
  * `example.com/app/tools`) take the longest module path, as Go does; two
  * modules declaring the same path prefer `own`, the importing file's module.
  * `null` for the standard library and third-party modules.
@@ -57,10 +61,21 @@ export function findGoModuleForImport(
   own?: GoModule | null
 ): GoModule | null {
   let best: GoModule | null = null;
-  for (const mod of modules) {
+  for (const mod of own && !modules.includes(own) ? [...modules, own] : modules) {
     if (importPath !== mod.modulePath && !importPath.startsWith(`${mod.modulePath}/`)) continue;
     const length = best ? best.modulePath.length : -1;
     if (mod.modulePath.length > length || (mod.modulePath.length === length && mod === own)) best = mod;
   }
   return best;
+}
+
+/**
+ * The project-relative directory (`/`-separated, `.` for the project root)
+ * of the package `importPath` names inside module `mod`: the module's own
+ * directory followed by the rest of the import path.
+ */
+export function goModulePackageDir(importPath: string, mod: GoModule, projectRoot: string): string {
+  const modDir = path.relative(projectRoot, mod.rootDir).split(path.sep).join('/');
+  const rest = importPath === mod.modulePath ? '' : importPath.slice(mod.modulePath.length + 1);
+  return path.posix.join(modDir, rest);
 }

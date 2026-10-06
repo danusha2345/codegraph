@@ -4,7 +4,9 @@
  * line below `.route(`; the Rust scope gate reads the reference's line to see
  * how the name is written (`handlers::f` names the `handlers` module), so a
  * reference left on the `.route(` line never found the name there and the
- * edge was dropped. A call inside a closure handler's body is not a method
+ * edge was dropped — as it was when the line wrote the handler's name
+ * elsewhere too (`/login` in the path, `delete(` as the method router), which
+ * the gate read as a bare use. A call inside a closure handler's body is not a method
  * router: `cache.get(keys::session_key)` is not a `GET` route handled by
  * `session_key`. Nor is an Actix resource's chain longer than the call it is
  * an argument of: the App-level `.route(..)` after it is not its method.
@@ -19,7 +21,7 @@ import { rustResolver } from '../src/resolution/frameworks/rust';
 const MAIN_RS = `mod actix_app;
 mod handlers;
 mod keys;
-use axum::{routing::{get, post}, Router};
+use axum::{routing::{delete, get, post}, Router};
 use crate::handlers::used_handler;
 
 pub fn app() -> Router {
@@ -49,6 +51,8 @@ pub fn app() -> Router {
             "/other",
             get(metrics::render_handler),
         )
+        .route("/login", post(handlers::login))
+        .route("/account", delete(handlers::delete))
         .route("/closure-inline", get(|| async { cache().get(keys::session_key) }))
         .route(
             "/closure",
@@ -99,6 +103,8 @@ pub async fn create_item() {}
 pub async fn delete_item() {}
 pub async fn used_handler() {}
 pub async fn render_handler() {}
+pub async fn login() {}
+pub async fn delete() {}
 pub async fn actix_index() {}
 pub async fn actix_get_user() {}
 pub async fn actix_hello() {}
@@ -152,6 +158,14 @@ describe('Axum: a handler written below `.route(` is linked to its route (#2326)
 
   it('does not link a wrapped handler another module names to a same-named one', () => {
     expect(routeEdges('src/main.rs').filter((e) => e.includes('render_handler'))).toEqual([]);
+  });
+
+  it('links a single-line route whose line also writes the handler name elsewhere', () => {
+    // `/login` in the path, `delete(` as the method router: neither is how the handler is named.
+    expect(routeEdges('src/main.rs')).toEqual(expect.arrayContaining([
+      'POST /login -> src/handlers/mod.rs:login',
+      'DELETE /account -> src/handlers/mod.rs:delete',
+    ]));
   });
 
   it('never reads a call inside a closure handler as a route', () => {

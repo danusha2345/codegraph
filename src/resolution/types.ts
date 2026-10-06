@@ -90,8 +90,6 @@ export interface ResolutionResult {
 export interface ResolutionContext {
   /** Get all nodes in a file */
   getNodesInFile(filePath: string): Node[];
-  /** AST-proven literal ownership persisted on containment edges (including anonymous scopes). */
-  getJsObjectInfo?(nodeId: string): import('../extraction/js-object-bindings').JsObjectInfo | null;
   /** Whether any node in the file is exported (`getNodesInFile(f).some(n => n.isExported)`), as one indexed probe. */
   fileHasExportedNode?(filePath: string): boolean;
   /** `getNodesInFile(f).filter(n => n.isExported)`, without decoding the rest of the file. */
@@ -176,6 +174,12 @@ export interface ResolutionContext {
    */
   isOutOfRepoImport?(source: string, fromFile: string, language: Language): boolean;
   /**
+   * The project file a module specifier, written in `fromFile`, names — the
+   * import resolver's own answer (for Python: from the package roots), or null
+   * when no project file provides it. Supplied by the coordinator.
+   */
+  resolveModuleFile?(source: string, fromFile: string, language: Language): string | null;
+  /**
    * Project import-path aliases (tsconfig/jsconfig `paths`). Returns
    * `null` when the project doesn't define any. Cached per resolver
    * instance — safe to call from any resolver code path. Optional so
@@ -189,17 +193,16 @@ export interface ResolutionContext {
    */
   getNearestAliases?(fromFile: string): import('./path-aliases').AliasMap | null;
   /**
-   * The project's Go module that an import path belongs to — one whose
-   * `go.mod` is at the project root or in any directory above an indexed
-   * `.go` file (#2322) — or `null` for the standard library, third-party
-   * modules and projects without a `go.mod`. `fromFile` (the importing file)
-   * breaks a tie between two modules declaring the same path. Used by the Go
-   * branch of import resolution to distinguish in-project cross-package
-   * imports from third-party packages.
+   * The project-relative directory (`/`-separated, `.` for the root) of
+   * the Go package an import path names, when it is a package of one of the
+   * project's own modules — the `go.mod` at the root or any `go.mod` above
+   * an indexed `.go` file (#2322) — else `null` (the standard library,
+   * third-party modules, a project with no `go.mod`). `fromFile`, the
+   * importing file, breaks a tie between two modules declaring one path.
+   * Used by the Go branch of resolution to tell in-project cross-package
+   * imports from outside ones, and to find the package's files.
    */
-  getGoModuleForImport?(importPath: string, fromFile?: string): import('./go-module').GoModule | null;
-  /** The Go module a file belongs to — the nearest `go.mod` at or above it (#2322) — or `null`. */
-  getGoModuleOfFile?(filePath: string): import('./go-module').GoModule | null;
+  getGoPackageDir?(importPath: string, fromFile?: string): string | null;
   /**
    * Monorepo workspace member packages, keyed by declared package name.
    * Returns `null` for single-package repos (no `workspaces` field).

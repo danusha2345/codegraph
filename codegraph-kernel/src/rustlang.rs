@@ -1188,10 +1188,12 @@ impl<'t> Walker<'t> {
 
     fn visit_function_body(&mut self, body: Node<'t>) {
         stack_guard!();
-        self.visit_for_calls_and_structure(body);
+        self.visit_for_calls_and_structure(body, None);
     }
 
-    fn visit_for_calls_and_structure(&mut self, node: Node<'t>) {
+    /// `parent` is `node`'s parent, handed down by the walk (None at a body's
+    /// root): `Node::parent()` walks down from the tree's root on every call.
+    fn visit_for_calls_and_structure(&mut self, node: Node<'t>, parent: Option<Node<'t>>) {
         stack_guard!();
         let kind = node.kind();
         self.maybe_capture_fn_refs(node);
@@ -1206,7 +1208,7 @@ impl<'t> Walker<'t> {
         } else if kind == "struct_expression" {
             self.extract_instantiation(node);
         }
-        self.extract_static_member_ref(node);
+        self.extract_static_member_ref(node, parent);
 
         // Nested NAMED fns become their own nodes (a nested fn inside an impl
         // method walks up to the impl and indexes as a METHOD).
@@ -1238,26 +1240,28 @@ impl<'t> Walker<'t> {
 
         for i in 0..node.named_child_count() {
             if let Some(c) = node.named_child(i) {
-                self.visit_for_calls_and_structure(c);
+                self.visit_for_calls_and_structure(c, Some(node));
             }
         }
     }
 
-    /// extractStaticMemberRef — the rust branch (#2328): a variant or an
-    /// associated const written as a path (`Mode::A`, `mode::Mode::B`, a
-    /// `Mode::C(x)` / `Mode::D { .. }` pattern, `Self::A` in an impl) references
-    /// the receiver — the segment before the member, at the place it is
-    /// written. A lowercase receiver (module) or member (fn), a call's callee
-    /// or a struct literal's name (both already linked to their member), a
-    /// path's prefix and a `use` tree emit nothing. Mirrored byte-for-byte —
-    /// change both.
-    fn extract_static_member_ref(&mut self, node: Node<'t>) {
-        if self.stack.is_empty() {
+    /// extractStaticMemberRef — the rust branch (#2328): an enum variant
+    /// written as a path (`Mode::A`, `mode::Mode::B`, a `Mode::C(x)` /
+    /// `Mode::D { .. }` pattern, `Self::A` in an impl) references the receiver
+    /// — the segment before the member, at the place it is written; the
+    /// resolver keeps it only on an enum that declares the member. A lowercase
+    /// receiver (module) or member (fn), a call's callee or a struct literal's
+    /// name (both already linked to their member), a path's prefix and a `use`
+    /// tree emit nothing. Mirrored byte-for-byte — change both.
+    fn extract_static_member_ref(&mut self, node: Node<'t>, parent: Option<Node<'t>>) {
+        let kind = node.kind();
+        if (kind != "scoped_identifier" && kind != "scoped_type_identifier") || self.stack.is_empty() {
             return;
         }
-        let Some(parent) = node.parent() else { return };
-        let member_path = match node.kind() {
-            "scoped_identifier" => !matches!(
+        // Looked up only at a body's root (a `const X: M = M::A;` value).
+        let Some(parent) = parent.or_else(|| node.parent()) else { return };
+        let member_path = if kind == "scoped_identifier" {
+            !matches!(
                 parent.kind(),
                 "scoped_identifier"
                     | "scoped_type_identifier"
@@ -1266,9 +1270,9 @@ impl<'t> Walker<'t> {
                     | "scoped_use_list"
                     | "use_as_clause"
                     | "use_wildcard"
-            ),
-            "scoped_type_identifier" => parent.kind() == "struct_pattern",
-            _ => false,
+            )
+        } else {
+            parent.kind() == "struct_pattern"
         };
         if !member_path {
             return;

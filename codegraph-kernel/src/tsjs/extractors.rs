@@ -5,9 +5,8 @@
 
 use crate::textutil as util;
 use super::{
-    body_of, is_builtin_type, is_literal_receiver, is_react_hoc, is_variable_type,
-    is_vue_collection_name, Extra, Scope, Walker,
-    JsObjectOwner, js_object_metadata,
+    body_of, is_builtin_type, is_host_global_root, is_literal_receiver, is_object_member_function,
+    is_react_hoc, is_static_object_key, is_variable_type, is_vue_collection_name, Extra, Scope, Walker,
 };
 use crate::buffers::edge_kind_index;
 use tree_sitter::Node;
@@ -16,10 +15,6 @@ impl<'t> Walker<'t> {
     // --- extractFunction --------------------------------------------------------
 
     pub(super) fn extract_function(&mut self, node: Node<'t>, name_override: Option<String>) {
-        self.extract_function_with_metadata(node, name_override, None);
-    }
-
-    fn extract_function_with_metadata(&mut self, node: Node<'t>, name_override: Option<String>, contains_metadata: Option<String>) {
         let mut name = name_override
             .clone()
             .unwrap_or_else(|| self.extract_name(node));
@@ -55,25 +50,18 @@ impl<'t> Walker<'t> {
             return;
         }
 
-        let object_member = contains_metadata.is_some();
         let extra = Extra {
             docstring: crate::docstring::preceding_docstring(node, self.src),
             signature: self.signature_of(node),
             visibility: self.visibility_of(node),
-            is_exported: Some(!object_member && (common_js_export || self.is_exported(node))),
+            is_exported: Some(common_js_export || self.is_exported(node)),
             is_async: Some(self.is_async(node)),
             is_static: self.is_static(node),
-            contains_metadata,
             ..Extra::default()
         };
         let Some(row) = self.create_node("function", &name, node, extra) else {
             return;
         };
-        if object_member {
-            let point = self.js_binding_point(node);
-            let qualified_name = self.js_qualified_name(&name);
-            self.js_object_members.entry(point).or_insert(qualified_name);
-        }
 
         self.extract_type_annotations(node, row);
         self.extract_decorators_for(node, row);
@@ -375,8 +363,11 @@ impl<'t> Walker<'t> {
             return false;
         }
         let n = regex::escape(name);
+        // `R` (CRLF mode): JS's multiline `^`/`$` treat `\r` as a line end as
+        // well as `\n`; `(?m)` alone sees only `\n`, and would miss `export
+        // default NAME;\r\n` on every Windows autocrlf checkout.
         let pattern = format!(
-            r"(?m)^[ \t]*export\s+(?:default\s+{n}\s*;?[ \t]*$|\{{[^}}]*\b{n}\b[^}}]*\}})",
+            r"(?mR)^[ \t]*export\s+(?:default\s+{n}\s*;?[ \t]*$|\{{[^}}]*\b{n}\b[^}}]*\}})",
             n = n
         );
         match regex::Regex::new(&pattern) {
@@ -386,25 +377,6 @@ impl<'t> Walker<'t> {
     }
 
     pub(super) fn extract_variable(&mut self, node: Node<'t>) {
-        self.extract_variable_selection(node, None);
-    }
-
-    pub(super) fn extract_local_objects(&mut self, node: Node<'t>) -> bool {
-        if !is_variable_type(node.kind()) { return false; }
-        let objects: Vec<Node> = (0..node.named_child_count()).filter_map(|i| node.named_child(i)).filter(|child|
-            child.kind() == "variable_declarator" && child.child_by_field_name("value").is_some_and(|value|
-                matches!(value.kind(), "object" | "object_expression") && self.object_has_inline_functions(value))).collect();
-        if objects.is_empty() { return false; }
-        for child in &objects { self.extract_variable_selection(node, Some(*child)); }
-        self.scan_fn_ref_subtree(node, 0);
-        for i in 0..node.named_child_count() {
-            let Some(child) = node.named_child(i).filter(|n| n.kind() == "variable_declarator") else { continue };
-            if !objects.iter().any(|object| object.id() == child.id()) { self.visit_function_body(child); }
-        }
-        true
-    }
-
-    fn extract_variable_selection(&mut self, node: Node<'t>, selected: Option<Node<'t>>) {
         let is_const = self.is_const_decl(node);
         let kind: &'static str = if is_const { "constant" } else { "variable" };
         let docstring = crate::docstring::preceding_docstring(node, self.src);
@@ -415,11 +387,10 @@ impl<'t> Walker<'t> {
             if child.kind() != "variable_declarator" {
                 continue;
             }
-            if selected.is_some_and(|n| n.id() != child.id()) { continue; }
             let Some(name_node) = child.child_by_field_name("name") else { continue };
             let value = child.child_by_field_name("value");
 
-            // Destructured patterns are skipped — except RTK Query generated
+            // Destructured patterns mint no node — except RTK Query generated
             // hooks (`export const { useGetXQuery } = api`).
             if matches!(name_node.kind(), "object_pattern" | "array_pattern") {
                 if name_node.kind() == "object_pattern"
@@ -427,10 +398,14 @@ impl<'t> Walker<'t> {
                 {
                     self.extract_rtk_hook_bindings(name_node, is_exported);
                 }
+                // The initializer (and any default in the pattern) still runs:
+                // walk the declarator as a function body walks it, with the
+                // enclosing scope on the stack (#2340). Mirrors
+                // TreeSitterExtractor.extractVariable.
+                self.visit_function_body(child);
                 continue;
             }
             let name = self.text(name_node).to_string();
-            let direct_object = value.filter(|v| matches!(v.kind(), "object" | "object_expression"));
 
             // Arrow/function/generator values extract as functions, named by the declarator.
             if let Some(v) = value {
@@ -462,9 +437,6 @@ impl<'t> Walker<'t> {
                 }
             }
 
-            let object_info = direct_object.map(|_| self.js_object_info(child, &name, true));
-            let contains_metadata = object_info.as_ref().map(js_object_metadata);
-            let qualified_name = self.js_qualified_name(&name);
             let var_row = self.create_node(
                 kind,
                 &name,
@@ -473,15 +445,20 @@ impl<'t> Walker<'t> {
                     docstring: docstring.clone(),
                     signature: init_signature.clone(),
                     is_exported: Some(is_exported),
-                    contains_metadata,
                     ..Extra::default()
                 },
             );
             if let Some(row) = var_row {
-                if let Some(info) = object_info {
-                    self.js_object_owners.push(JsObjectOwner { row, qualified_name, info });
-                }
                 self.extract_variable_type_annotation(child, row);
+            }
+
+            // A named object literal owns its function members, exported or
+            // not (#2300): `const api = { load() {…} }` gives `api::load`. The
+            // rest of the literal is walked under the owner (#693). Mirrors
+            // the ownedObject branch of TreeSitterExtractor.extractVariable.
+            if let (Some(row), Some(obj)) = (var_row, self.owned_object_value(value)) {
+                self.extract_owned_object_members(obj, row, kind, &name, true, false);
+                continue;
             }
 
             // Exported const object-of-functions / store shapes.
@@ -498,7 +475,7 @@ impl<'t> Walker<'t> {
             // shape most React Native stores are written in. Mirrors
             // TreeSitterExtractor.isExportedLater.
             let extract_object_methods =
-                (direct_object.is_some() || is_exported || self.is_exported_later(&name)) && object_of_fns.is_some() && has_inline_fns;
+                (is_exported || self.is_exported_later(&name)) && object_of_fns.is_some() && has_inline_fns;
 
             let rtk_endpoints = match value {
                 Some(v) if v.kind() == "call_expression" => self.find_rtk_endpoints_object(v),
@@ -548,13 +525,7 @@ impl<'t> Walker<'t> {
 
             if extract_object_methods {
                 if let Some(obj) = object_of_fns {
-                    if let (Some(_), Some(row)) = (direct_object, var_row) {
-                        self.stack.push(Scope { row, kind, name: name.clone() });
-                        self.extract_owned_object_literal_functions(obj);
-                        self.stack.pop();
-                    } else {
-                        self.extract_object_literal_functions(obj);
-                    }
+                    self.extract_object_literal_functions(obj);
                 }
             }
             if let Some(rtk) = rtk_endpoints {
@@ -593,69 +564,190 @@ impl<'t> Walker<'t> {
         }
     }
 
-    // --- object-literal / store helpers -------------------------------------------------
+    // --- owned object literals (#2300) ------------------------------------------------
 
-    fn static_object_key(&self, key: Node<'t>) -> Option<String> {
-        if !matches!(key.kind(), "property_identifier" | "string" | "number") { return None; }
-        Some(util::object_key_name(self.text(key)))
+    /// ownsObjectLiterals: a generated or minified bundle — named so or not —
+    /// keeps the old shape. (Every tsjs variant is TS/JS, so only that check
+    /// remains; it is computed once per file.)
+    fn owns_object_literals(&self) -> bool {
+        self.owns_objects
     }
 
-    fn extract_owned_object_literal_functions(&mut self, obj: Node<'t>) {
+    /// ownedMemberFunction: the function an owned literal's member becomes,
+    /// named by its static key — `load() {…}`, `load: () => {…}`,
+    /// `load: function () {…}`, `load: function* () {…}`. None for every other
+    /// member (a computed key, a value, a shorthand, a spread).
+    fn owned_member_function(&self, member: Node<'t>) -> Option<(Node<'t>, String)> {
+        if member.kind() == "method_definition" {
+            let key = member.child_by_field_name("name")?;
+            if !is_static_object_key(key.kind()) {
+                return None;
+            }
+            return Some((member, util::object_key_name(self.text(key))));
+        }
+        if member.kind() != "pair" {
+            return None;
+        }
+        let key = member.child_by_field_name("key")?;
+        let value = member.child_by_field_name("value")?;
+        if !is_static_object_key(key.kind()) || !is_object_member_function(value.kind()) {
+            return None;
+        }
+        Some((value, util::object_key_name(self.text(key))))
+    }
+
+    /// ownedObjectValue: `value` when it is an object literal owning at least
+    /// one function member.
+    pub(super) fn owned_object_value(&self, value: Option<Node<'t>>) -> Option<Node<'t>> {
+        let value = value?;
+        if !matches!(value.kind(), "object" | "object_expression") || !self.owns_object_literals() {
+            return None;
+        }
+        for i in 0..value.named_child_count() {
+            if let Some(member) = value.named_child(i) {
+                if self.owned_member_function(member).is_some() {
+                    return Some(value);
+                }
+            }
+        }
+        None
+    }
+
+    /// Put an owner on the stack — on top of the file alone for one on the
+    /// global object — returning what was set aside for leave_owner.
+    fn enter_owner(&mut self, row: u32, kind: &'static str, name: &str, global: bool) -> Vec<Scope> {
+        let rest = if global { self.stack.split_off(1) } else { Vec::new() };
+        self.stack.push(Scope { row, kind, name: name.to_string() });
+        rest
+    }
+
+    fn leave_owner(&mut self, rest: Vec<Scope>) {
+        self.stack.pop();
+        self.stack.extend(rest);
+    }
+
+    /// extractOwnedObjectMembers: each function member becomes its own node,
+    /// qualified under the owner (at file scope for one on the global object).
+    /// Every other member runs where the literal is written: under the owner
+    /// for a module-scope declaration (`values_under_owner`, #693), under the
+    /// enclosing scope for a local or an assignment. The literal's shorthand
+    /// members go to the function-as-value capture the same way.
+    fn extract_owned_object_members(&mut self, obj: Node<'t>, row: u32, kind: &'static str, name: &str, values_under_owner: bool, global: bool) {
+        let held = values_under_owner.then(|| self.enter_owner(row, kind, name, global));
+        self.maybe_capture_fn_refs(obj);
         for i in 0..obj.named_child_count() {
             let Some(member) = obj.named_child(i) else { continue };
-            if member.kind() == "pair" {
-                let key = member.child_by_field_name("key").and_then(|key| self.static_object_key(key));
-                if let Some(value) = member.child_by_field_name("value") {
-                    if let Some(name) = key.as_ref().filter(|_| matches!(value.kind(), "arrow_function" | "function_expression" | "generator_function")) {
-                        self.extract_function_with_metadata(value, Some(name.clone()), Some("{\"jsObjectMember\":true}".to_string()));
-                    } else if value.kind() == "call_expression" {
-                        let function = value.child_by_field_name("arguments").and_then(|args| args.named_child(0));
-                        let bound = function.and_then(|function| self.curried_wrapper_bound_name(function));
-                        if let (Some(function), Some(bound), Some(_)) = (function, bound, key) {
-                            self.extract_function_with_metadata(function, Some(bound), Some("{\"jsObjectMember\":true}".to_string()));
-                        } else { self.visit_function_body(value); }
-                    } else { self.visit_function_body(value); }
+            if let Some((func, member_name)) = self.owned_member_function(member) {
+                if values_under_owner {
+                    self.extract_function(func, Some(member_name));
+                } else {
+                    let rest = self.enter_owner(row, kind, name, global);
+                    self.extract_function(func, Some(member_name));
+                    self.leave_owner(rest);
                 }
-            } else if member.kind() == "method_definition" {
-                if let Some(name) = member.child_by_field_name("name").and_then(|key| self.static_object_key(key)) {
-                    self.extract_function_with_metadata(member, Some(name), Some("{\"jsObjectMember\":true}".to_string()));
-                } else if let Some(body) = member.child_by_field_name("body") { self.visit_function_body(body); }
-            } else if member.kind() == "spread_element" {
+            } else {
                 self.visit_function_body(member);
             }
         }
+        if let Some(rest) = held {
+            self.leave_owner(rest);
+        }
     }
 
-    pub(super) fn extract_object_assignment(&mut self, node: Node<'t>) -> bool {
-        if node.kind() != "assignment_expression" { return false; }
-        let Some(object) = node.child_by_field_name("right").filter(|n| matches!(n.kind(), "object" | "object_expression")) else { return false };
-        let Some(path) = self.js_member_path(node.child_by_field_name("left")).filter(|path| path.contains('.')) else { return false };
-        let proof = self.js_object_root(node, path.split('.').next().unwrap_or(&path));
-        let root = path.split('.').next().unwrap_or(&path);
-        let root_owner = self.js_object_owners.iter().find(|owner| owner.info.path == root && owner.info.binding == proof);
-        let root_info = root_owner.map(|owner| (owner.qualified_name.clone(), owner.info.scope));
-        if !proof.starts_with("global:") && root_info.is_none() { return false; }
-        let mut info = self.js_object_info(node, &path, false);
-        let qualified_name = if let Some((qualified_name, scope)) = root_info {
-            info.scope = scope;
-            format!("{qualified_name}{}", &path[root.len()..])
-        } else { path.clone() };
-        let contains_metadata = js_object_metadata(&info);
-        let signature = format!("= {}", util::slice_utf16(self.text(object), 100).0);
-        let Some(row) = self.create_node("variable", &path, node, Extra {
-            signature: Some(signature),
+    /// extractLocalObjectOwner: `const api = { load() {…} }` in a function body
+    /// or an IIFE gets the node a module-scope declaration would, with its
+    /// members under it. False when the declarator holds no owned literal.
+    pub(super) fn extract_local_object_owner(&mut self, declarator: Node<'t>) -> bool {
+        let Some(name_node) = declarator.child_by_field_name("name") else { return false };
+        if name_node.kind() != "identifier" {
+            return false;
+        }
+        let Some(obj) = self.owned_object_value(declarator.child_by_field_name("value")) else {
+            return false;
+        };
+        let is_const = declarator.parent().map(|d| self.is_const_decl(d)).unwrap_or(false);
+        let kind: &'static str = if is_const { "constant" } else { "variable" };
+        let name = self.text(name_node).to_string();
+        // A local: never the target of another scope's value read.
+        let extra = Extra {
+            docstring: crate::docstring::preceding_docstring(declarator, self.src),
+            signature: Some(util::init_signature(self.text(obj))),
             is_exported: Some(false),
-            contains_metadata: Some(contains_metadata),
-            qualified_name: Some(qualified_name.clone()),
+            not_value_target: true,
             ..Extra::default()
-        }) else { return false };
-        self.js_object_owners.push(JsObjectOwner { row, qualified_name, info });
-        self.stack.push(Scope { row, kind: "variable", name: path });
-        self.extract_owned_object_literal_functions(object);
-        self.stack.pop();
-        self.scan_fn_ref_subtree(node, 0);
+        };
+        let Some(row) = self.create_node(kind, &name, declarator, extra) else { return false };
+        self.extract_variable_type_annotation(declarator, row);
+        self.extract_owned_object_members(obj, row, kind, &name, false, false);
         true
     }
+
+    /// extractAssignedObjectOwner: `window.App = {…}` / `App.utils = {…}` /
+    /// `dw_page = {…}`. A plain identifier target is qualified like a
+    /// declaration. A path's owner is named by its last link and qualified by
+    /// the path as written, and so are its members (`window.App::init`); a
+    /// path on the global object is global wherever it is written, so it is
+    /// contained by the file. False (nothing extracted) for any other assignment.
+    pub(super) fn extract_assigned_object_owner(&mut self, node: Node<'t>, module_level: bool) -> bool {
+        let Some(obj) = self.owned_object_value(node.child_by_field_name("right")) else { return false };
+        let Some(path) = self.object_owner_path(node.child_by_field_name("left")) else { return false };
+        // A plain name assigned at module level is a global (`dw_page = {…}`);
+        // in a function it is a local being reassigned.
+        if path.len() == 1 && !module_level {
+            return false;
+        }
+        let qualified_name = (path.len() > 1).then(|| path.join("."));
+        let global = path.len() > 1 && is_host_global_root(&path[0]);
+        let rest = if global { self.stack.split_off(1) } else { Vec::new() };
+        let statement = node.parent().filter(|p| p.kind() == "expression_statement").unwrap_or(node);
+        let name = path.last().cloned().unwrap_or_default();
+        // `App.utils` is read as `App.utils`, never as a bare `utils`.
+        let extra = Extra {
+            docstring: crate::docstring::preceding_docstring(statement, self.src),
+            signature: Some(util::init_signature(self.text(obj))),
+            is_exported: Some(false),
+            qualified_name: qualified_name.clone(),
+            not_value_target: !(path.len() == 1 || global),
+            ..Extra::default()
+        };
+        let row = self.create_node("variable", &name, node, extra);
+        self.stack.extend(rest);
+        let Some(row) = row else { return false };
+        if let Some(qualified_name) = qualified_name {
+            self.object_path_owners.insert(row, qualified_name);
+        }
+        self.extract_owned_object_members(obj, row, "variable", &name, false, global);
+        true
+    }
+
+    /// objectOwnerPath: an assignment target's links written as plain names
+    /// (`dw_page` → [dw_page], `App.utils.dom` → [App, utils, dom]), or None
+    /// for anything else — `this.x`, `a[k]`, a call, CommonJS's
+    /// `module.exports` / `exports.x`, or a prototype.
+    fn object_owner_path(&self, left: Option<Node<'t>>) -> Option<Vec<String>> {
+        let mut path: Vec<String> = Vec::new();
+        let mut cur = left?;
+        while cur.kind() == "member_expression" {
+            let property = cur.child_by_field_name("property")?;
+            if property.kind() != "property_identifier" {
+                return None;
+            }
+            path.push(self.text(property).to_string());
+            cur = cur.child_by_field_name("object")?;
+        }
+        if cur.kind() != "identifier" {
+            return None;
+        }
+        let root = self.text(cur);
+        if root == "module" || root == "exports" || path.iter().any(|p| p == "prototype") {
+            return None;
+        }
+        path.push(root.to_string());
+        path.reverse();
+        Some(path)
+    }
+
+    // --- object-literal / store helpers -------------------------------------------------
 
     pub(super) fn extract_object_literal_functions(&mut self, obj: Node<'t>) {
         for i in 0..obj.named_child_count() {
@@ -754,7 +846,7 @@ impl<'t> Walker<'t> {
             }
             if member.kind() == "pair" {
                 if let Some(v) = member.child_by_field_name("value") {
-                    if matches!(v.kind(), "arrow_function" | "function_expression" | "generator_function") {
+                    if matches!(v.kind(), "arrow_function" | "function_expression") {
                         return true;
                     }
                 }
@@ -1273,7 +1365,6 @@ impl<'t> Walker<'t> {
         let func = node
             .child_by_field_name("function")
             .or_else(|| node.named_child(0));
-        let object_path = self.js_member_path(func);
         let mut callee_name = String::new();
 
         if let Some(func) = func {
@@ -1362,7 +1453,7 @@ impl<'t> Walker<'t> {
         }
 
         if !callee_name.is_empty() {
-            self.push_object_call_ref(&callee_name, node, object_path.as_deref());
+            self.push_call_ref(&callee_name.clone(), node);
         }
     }
 

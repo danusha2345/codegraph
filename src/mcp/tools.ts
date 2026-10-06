@@ -55,6 +55,7 @@ import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, C
 import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranchGuardGrammars } from '../graph/branch-guards';
 import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
 import { countImplementers } from '../graph/type-hierarchy';
+import { isCopybookInclude, MAX_COPYBOOK_INCLUDES, type NamedCopybook } from '../graph/cobol-copybooks';
 import {
   findAllSymbols,
   resolveNamedSymbolFlow,
@@ -1953,6 +1954,7 @@ export class ToolHandler {
   // agent instead of "no project loaded" — today only the Windows/WSL
   // shared-index error (#995). Engine-maintained; cleared by a successful open.
   private defaultOpenFailure: WslSharedIndexError | null = null;
+  private activeProjectRoots = new Map<string, number>();
   // Per-start-path cache of the git worktree/index mismatch (issue #155). The
   // mismatch is a fixed property of (where the request came from → which
   // .codegraph/ it resolves to), so the up-to-two `git rev-parse` spawns run
@@ -2391,19 +2393,34 @@ export class ToolHandler {
     await this.awaitCatchUpGate(gate);
   }
 
+  private pinProject(projectPath: unknown): string | null {
+    const resolved = typeof projectPath === 'string' ? findNearestCodeGraphRoot(projectPath) : null;
+    if (!resolved) return null;
+    const root = canonicalPath(resolved);
+    this.activeProjectRoots.set(root, (this.activeProjectRoots.get(root) ?? 0) + 1);
+    return root;
+  }
+
+  private unpinProject(root: string | null): void {
+    if (!root) return;
+    const count = this.activeProjectRoots.get(root)!;
+    if (count === 1) this.activeProjectRoots.delete(root);
+    else this.activeProjectRoots.set(root, count - 1);
+  }
+
   /**
    * Never evict a graph while a tool call or its timed-out reconcile uses it.
    * Evicts over the LRU bound, on close, and once idle past the timeout
    * (#2087). The cache is in last-use order, so idle entries lead it.
    */
   private trimProjects(): void {
-    if (this.activeCalls > 0) return;
+    if (this.activeCalls > 0 && (this.closing || this.activeProjectRoots.size === 0)) return;
     const idleMs = resolveProjectIdleTimeoutMs();
     const now = Date.now();
     for (const [root, cg] of this.projectCache) {
       const idle = idleMs > 0 && now - (this.projectUsedAt.get(root) ?? now) >= idleMs;
       if (!this.closing && this.projectCache.size <= MAX_CACHED_PROJECTS && !idle) break;
-      if (this.projectGates.has(cg)) continue;
+      if (this.projectGates.has(cg) || [...this.activeProjectRoots.keys()].some(active => isSameIndexRoot(root, active))) continue;
       this.projectCache.delete(root);
       this.projectUsedAt.delete(root);
       if (this.projectLifecycle) {
@@ -2414,7 +2431,7 @@ export class ToolHandler {
         });
       } else cg.close();
     }
-    if (this.closing && this.projectCache.size === 0 && this.pendingCloses === 0) {
+    if (this.closing && this.projectCache.size === 0 && this.activeCalls === 0 && this.activeProjectRoots.size === 0 && this.pendingCloses === 0) {
       for (const resolve of this.closeWaiters.splice(0)) resolve();
     }
     this.scheduleIdleRelease(idleMs);
@@ -2432,7 +2449,7 @@ export class ToolHandler {
     this.idleReleaseTimer = null;
     if (this.closing || idleMs <= 0) return;
     for (const [root, cg] of this.projectCache) {
-      if (this.projectGates.has(cg)) continue;
+      if (this.projectGates.has(cg) || [...this.activeProjectRoots.keys()].some(active => isSameIndexRoot(root, active))) continue;
       const due = (this.projectUsedAt.get(root) ?? Date.now()) + idleMs - Date.now();
       this.idleReleaseTimer = setTimeout(() => {
         this.idleReleaseTimer = null;
@@ -2479,7 +2496,7 @@ export class ToolHandler {
     this.idleReleaseTimer = null;
     this.nestedRepoCache.clear();
     this.trimProjects();
-    if (this.projectCache.size === 0 && this.activeCalls === 0 && this.pendingCloses === 0) return Promise.resolve();
+    if (this.projectCache.size === 0 && this.activeCalls === 0 && this.activeProjectRoots.size === 0 && this.pendingCloses === 0) return Promise.resolve();
     return new Promise((resolve) => this.closeWaiters.push(resolve));
   }
 
@@ -2780,6 +2797,7 @@ export class ToolHandler {
   ): Promise<ToolResult> {
     if (this.closing) return this.textResult('This MCP session is closing; retry with a connected session.');
     this.activeCalls++;
+    let pinnedRoot: string | null = null;
     try {
       // Block the first tool call on the engine's post-open reconcile so we
       // never serve rows for files deleted/edited while no MCP server was
@@ -2806,6 +2824,7 @@ export class ToolHandler {
       if (typeof pathCheck === 'object' && pathCheck !== undefined) {
         return pathCheck;
       }
+      pinnedRoot = this.pinProject(pathCheck);
       // An explicit project gets the same first-call guarantee as the default
       // (#1835): its post-open catch-up sync finishes (time-boxed) before we
       // serve it. Resolved on the main thread so the watcher lives here even
@@ -2924,6 +2943,7 @@ export class ToolHandler {
         'continue without codegraph for this task.'
       );
     } finally {
+      this.unpinProject(pinnedRoot);
       this.activeCalls--;
       this.trimProjects();
     }
@@ -2994,6 +3014,7 @@ export class ToolHandler {
    * path validation already ran in {@link execute} before routing here.
    */
   async executeReadTool(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+    const pinnedRoot = this.pinProject(args.projectPath);
     try {
       return await this.dispatchTool(toolName, args);
     } catch (err) {
@@ -3011,6 +3032,9 @@ export class ToolHandler {
         'This is an internal codegraph error — retry the call once; if it persists, ' +
         'continue without codegraph for this task.'
       );
+    } finally {
+      this.unpinProject(pinnedRoot);
+      this.trimProjects();
     }
   }
 
@@ -3987,6 +4011,46 @@ export class ToolHandler {
   }
 
   /**
+   * The COBOL copybooks an explore query named (#2342): where each one's source
+   * lives, and every `COPY` / `EXEC SQL INCLUDE` statement that pulls it in —
+   * locations only, one per line. The source section can afford a few include
+   * windows; this list is what answers "what includes X / what does changing X
+   * touch" without a grep for `COPY X`. A member whose source is not indexed
+   * says so, so nobody goes hunting for a copybook file that is not here.
+   */
+  private buildCopybookSection(copybooks: NamedCopybook[]): string {
+    const MAX_LISTED_SITES = 25;
+    const blocks: string[] = [];
+    for (const copybook of copybooks) {
+      // Spelled as the code spells it — an include's member, else the file's
+      // stem — not as the query happened to type it.
+      const name = copybook.includes[0]?.name
+        ?? copybook.files[0]?.name.replace(/\.[^.]*$/, '')
+        ?? copybook.member;
+      const source = copybook.files.length > 0
+        ? `source ${copybook.files.map((f) => `\`${f.filePath}\``).join(', ')}`
+        : 'no indexed source (typically a DB2 DCLGEN member, a compiler-supplied copybook such as SQLCA, or one kept outside this project)';
+      const count = copybook.includes.length;
+      if (count === 0) {
+        blocks.push(`**COBOL copybook \`${name}\`** — ${source}; nothing indexed includes it (no \`COPY\` or \`EXEC SQL INCLUDE\` of it).`, '');
+        continue;
+      }
+      const sites = `${count}${count >= MAX_COPYBOOK_INCLUDES ? '+' : ''} site${count === 1 ? '' : 's'}`;
+      blocks.push(`**COBOL copybook \`${name}\`** — ${source}; included at ${sites}:`, '');
+      for (const include of copybook.includes.slice(0, MAX_LISTED_SITES)) {
+        const statement = /^\s*EXEC\b/i.test(include.signature ?? '') ? 'EXEC SQL INCLUDE' : 'COPY';
+        blocks.push(`- \`${include.filePath}:${include.startLine}\` — ${statement}`);
+      }
+      if (count > MAX_LISTED_SITES) {
+        const files = new Set(copybook.includes.slice(MAX_LISTED_SITES).map((n) => n.filePath)).size;
+        blocks.push(`- … +${count - MAX_LISTED_SITES} more site${count - MAX_LISTED_SITES === 1 ? '' : 's'} in ${files} file${files === 1 ? '' : 's'}`);
+      }
+      blocks.push('');
+    }
+    return blocks.join('\n');
+  }
+
+  /**
    * Test-coverage note for a blast-radius entry whose DIRECT callers include no
    * test file. A helper called only by production code can still be exercised
    * by tests further up the caller chain (#1475: 40% of directly-unflagged
@@ -4178,6 +4242,22 @@ export class ToolHandler {
           matchQuery = normalizeQuerySpelling(extraction.strippedQuery);
         }
       } catch { /* path pinning must never fail an explore call */ }
+    }
+    // A COBOL copybook the query names (`CVACT01Y`) names its FILE as surely as
+    // `app/cpy/CVACT01Y.cpy` would (#2342), so it is pinned the same way: the
+    // copybook's own source is admitted, ranked first and funded first. Looked
+    // up on the path-stripped query — a query that already pinned the file by
+    // path gets exactly the answer it got before. The include sites are listed
+    // in their own section below.
+    let namedCopybooks: NamedCopybook[] = [];
+    try {
+      namedCopybooks = cg.findNamedCopybooks(matchQuery);
+    } catch { /* copybook pinning must never fail an explore call */ }
+    for (const copybook of namedCopybooks) {
+      for (const file of copybook.files) {
+        if (pinnedFiles.length >= maxFiles) break;
+        if (!pinnedFiles.includes(file.filePath)) pinnedFiles = [...pinnedFiles, file.filePath];
+      }
     }
     // A same-named file the span did not pin is named in the summary line, so
     // an agent that did mean it sees where it went instead of a silent drop.
@@ -4713,9 +4793,20 @@ export class ToolHandler {
       }
     }
 
+    // Import/export nodes add noise without information — except a COBOL
+    // include the query named (#2342). `COPY CVACT01Y` is where the copybook is
+    // pulled in, half of what a question about the copybook asks, so it is
+    // grouped, rendered (a window around the statement) and listed like any
+    // symbol. The context builder makes one an entry point only when the query
+    // names its member, so no other import ever passes this test.
+    const namedIncludeIds = new Set(subgraph.roots.filter((id) => {
+      const root = subgraph.nodes.get(id);
+      return root !== undefined && isCopybookInclude(root);
+    }));
+    const isListedSymbol = (n: Node): boolean =>
+      n.kind !== 'export' && (n.kind !== 'import' || namedIncludeIds.has(n.id));
     for (const node of subgraph.nodes.values()) {
-      // Skip import/export nodes — they add noise without information
-      if (node.kind === 'import' || node.kind === 'export') continue;
+      if (!isListedSymbol(node)) continue;
       // SECURITY (#383): never render the on-disk source of a config-leaf
       // (Spring application.{yml,properties} key) — its line is `key = <secret>`,
       // so whole-file/cluster rendering here would push secrets into context
@@ -5132,6 +5223,12 @@ export class ToolHandler {
     ];
     const summaryLineIdx = 2;
 
+    // A named COBOL copybook's include sites, ALL of them (#2342) — the source
+    // below has room for a few include windows, and "what includes X" is the
+    // question a copybook name asks.
+    const copybookSection = this.buildCopybookSection(namedCopybooks);
+    if (copybookSection) lines.push(copybookSection);
+
     // Blast radius (always-on, compact): for the entry symbols, who depends on
     // them + which tests cover them — locations only, no source — so the agent
     // knows what to update/verify before editing without a separate call.
@@ -5499,7 +5596,7 @@ export class ToolHandler {
       const hit = overheadCache.get(filePath);
       if (hit !== undefined) return hit;
       const names = [...new Set(
-        nodes.filter((n) => n.kind !== 'import' && n.kind !== 'export')
+        nodes.filter(isListedSymbol)
           .map((n) => `${n.name}(${n.kind})`),
       )].slice(0, budget.maxSymbolsInFileHeader);
       // header + blank, then ```lang / body / ``` / blank around the source.
@@ -6037,7 +6134,7 @@ export class ToolHandler {
       // The file node is not one of them: no section delivers "the file" as a
       // symbol, and it spans trailing lines no render prints.
       const wantedFrom = (nodes: readonly Node[]): ExploreWantedSpan[] => nodes
-        .filter((n) => n.kind !== 'import' && n.kind !== 'export' && n.kind !== 'file' && n.startLine > 0)
+        .filter((n) => isListedSymbol(n) && n.kind !== 'file' && n.startLine > 0)
         .map((n) => ({
           name: n.name,
           kind: n.kind,
@@ -6074,7 +6171,7 @@ export class ToolHandler {
           && !anchorSpans.has(filePath)
           && (onSpineGodFile || (!hasSpineNode && isPolymorphicSibling(group.nodes) && !spared))) {
         const syms = group.nodes
-          .filter(n => n.kind !== 'import' && n.kind !== 'export' && n.startLine > 0)
+          .filter(n => isListedSymbol(n) && n.startLine > 0)
           .sort((a, b) => a.startLine - b.startLine);
         // Pass 1: choose which symbols get a FULL body, by priority, greedily within
         // a per-file body cap — so one huge family file can't body every named method
@@ -6217,7 +6314,7 @@ export class ToolHandler {
           }
         }
         if (skel.length > 0) {
-          const names = [...new Set(group.nodes.filter(n => n.kind !== 'import' && n.kind !== 'export').map(n => n.name))]
+          const names = [...new Set(group.nodes.filter(isListedSymbol).map(n => n.name))]
             .slice(0, budget.maxSymbolsInFileHeader).join(', ');
           // Steer the agent to codegraph_explore for an elided body — NEVER to
           // Read. The old "Read for more" / "Read for a full body" tags invited
@@ -6376,7 +6473,7 @@ export class ToolHandler {
         const wholeSection = ddWhole.parts.map((p) => p.text).join(GAP_MARKER);
         const uniqSymbols = [...new Set(
           group.nodes
-            .filter(n => n.kind !== 'import' && n.kind !== 'export')
+            .filter(isListedSymbol)
             .map(n => `${n.name}(${n.kind})`)
         )];
         const headerNames = uniqSymbols.slice(0, budget.maxSymbolsInFileHeader);
@@ -7555,7 +7652,7 @@ export class ToolHandler {
       const g = fileGroups.get(fp);
       if (!g) return sum;
       return sum + new Set(
-        g.nodes.filter((n) => n.kind !== 'import' && n.kind !== 'export').map((n) => n.id),
+        g.nodes.filter(isListedSymbol).map((n) => n.id),
       ).size;
     }, 0);
     let summaryLine = survivors.length > 0
