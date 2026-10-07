@@ -202,21 +202,24 @@ class Personal extends L\\Base
     expect(await instantiated()).toEqual(['App\\Blocks\\Personal\\Fields::FirstName']);
   });
 
-  it('does not guess the first target when different namespace scopes reuse an alias', async () => {
-    write('one.php', firstName('App\\Fields'));
-    write('two.php', firstName('App\\Other'));
-    write('app/Blocks/Personal/Personal.php', `<?php
+  it('does not guess the first target when two namespace blocks bind one alias differently', async () => {
+    write('app/Fields/FirstName.php', firstName('App\\Fields'));
+    write('app/Other/FirstName.php', firstName('App\\Other'));
+    write('app/Personal.php', `<?php
 namespace One {
   use App\\Fields as Field;
-  class Personal { public function fields() { return new Field\\FirstName(); } }
+  class Personal { public function a() { return new Field\\FirstName(); } }
 }
 namespace Two {
   use App\\Other as Field;
-  class Another { public function fields() { return new Field\\FirstName(); } }
+  class Another
+  {
+    public function b() { return new Field\\FirstName(); }
+    public function c() { return new \\App\\Other\\FirstName(); }
+  }
 }
 `);
-    cg = await CodeGraph.init(dir, { index: true });
-    const ids = cg.getNodesInFile('app/Blocks/Personal/Personal.php').map(n => n.id);
-    expect(cg.getOutgoingEdgesFrom(ids).filter(e => e.kind === 'instantiates')).toEqual([]);
+    // The alias has two meanings in this file; the fully qualified name has one.
+    expect(await edgesFrom('app/Personal.php')).toEqual(['c instantiates App\\Other::FirstName']);
   });
 });

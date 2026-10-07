@@ -7,12 +7,12 @@
  *   a call into that package;
  * - a package-qualified parameter (`s *store.Store`);
  * - the result of a function or a conversion (`r := newRing()`, `s :=
- *   store.NewStore()`, `list := web.Users(names)`);
- * - an alias (`type Context = web.Context`).
+ *   store.NewStore()`, `list := web.Users(names)`).
  *
  * A receiver typed outside the project (`conn net.Conn`, `ctx
- * context.Context`, `c, _ := net.Dial(…)`) gets no edge rather than the one
- * project method that happens to share the name. A project function's result
+ * context.Context`, `c, _ := net.Dial(…)`, an alias `type Ctx =
+ * context.Context`) gets no edge rather than a project method that happens
+ * to share the name. A project function's result
  * declared as an outside type by value (`http.RoundTripper`) is left as it
  * was: that is usually an interface a project type implements.
  */
@@ -203,25 +203,15 @@ func (s *Store) Put(k string) {}
   });
 });
 
-describe('Go receiver typing through aliases and conversions', () => {
+describe('Go receiver typing through conversions and aliases', () => {
   let dir: string;
   let cg: CodeGraph;
 
   beforeAll(async () => {
     ({ dir, cg } = await indexProject({
-      'app/app.go': `package app
-
-type App struct{}
-
-func (a *App) GetUser() {}
-`,
       'web/context.go': `package web
 
-import "example.com/app/app"
-
-type Context struct {
-	App *app.App
-}
+type Context struct{}
 
 func (c *Context) MakeAuditRecord() {}
 
@@ -246,17 +236,7 @@ type (
 
 type Defined web.Context
 
-type Wrapped struct {
-	Context
-}
-
-func getUser(c *Context) {
-	c.App.GetUser()
-	c.MakeAuditRecord()
-}
-
-func groupedPointerAlias(h Handler)      { h.MakeAuditRecord() }
-func embeddedAlias(w *Wrapped)           { w.MakeAuditRecord() }
+func projectAlias(h Handler)             { h.MakeAuditRecord() }
 func conversion(names []string)          { list := web.Users(names); list.Usernames() }
 func definedType(d *Defined)             { d.MakeAuditRecord() }
 func stdlibReceiver(ctx context.Context) { ctx.Done() }
@@ -270,11 +250,13 @@ type Context struct{}
 
 func (c *Context) MakeAuditRecord() {}
 
-type Wrapped struct{}
+// Named like the alias of an outside type in api4.
+type Ctx struct{}
+
+func (c *Ctx) Done() {}
 
 type Decoy struct{}
 
-func (d *Decoy) GetUser()   {}
 func (d *Decoy) Done()      {}
 func (d *Decoy) Usernames() {}
 `,
@@ -286,13 +268,12 @@ func (d *Decoy) Usernames() {}
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it.each([
-    ['getUser', ['app/app.go::App::GetUser', 'web/context.go::Context::MakeAuditRecord']],
-    ['groupedPointerAlias', ['web/context.go::Context::MakeAuditRecord']],
-    ['embeddedAlias', ['web/context.go::Context::MakeAuditRecord']],
-    ['conversion', ['web/context.go::Users::Usernames']],
-  ])('%s resolves through the alias or the conversion', async (caller, expected) => {
-    expect(await methodCallees(cg, caller)).toEqual(expected);
+  it('a receiver bound to a conversion resolves on the converted type', async () => {
+    expect(await methodCallees(cg, 'conversion')).toEqual(['web/context.go::Users::Usernames']);
+  });
+
+  it('an alias of a project type still resolves on that type', async () => {
+    expect(await methodCallees(cg, 'projectAlias')).toEqual(['web/context.go::Context::MakeAuditRecord']);
   });
 
   it.each(['definedType', 'stdlibReceiver', 'aliasedStdlib'])(

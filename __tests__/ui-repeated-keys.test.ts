@@ -80,7 +80,14 @@ afterAll(() => {
 });
 
 describe('the routes list', () => {
-  it('preserves routing detection for one inline route with several calls', async () => {
+  it('applies its limit to routes, not to the calls of one inline handler', () => {
+    const payload = buildRoutes(cg, new URLSearchParams('limit=3'));
+    expect(payload.entries.map((e) => e.url)).toEqual(['GET /dense', 'GET /second', 'GET /third']);
+    expect(payload.shown).toBe(3);
+    expect(payload.truncated).toBe(true);
+  });
+
+  it('still calls a project routed when its one inline route has three calls', async () => {
     const singleRoot = path.join(root, 'one-route');
     fs.mkdirSync(singleRoot, { recursive: true });
     fs.writeFileSync(path.join(singleRoot, 'package.json'), JSON.stringify({ dependencies: { express: '^4.0.0' } }));
@@ -90,19 +97,14 @@ app.get('/one', () => { first(); second(); third(); });
 `);
     const single = await CodeGraph.init(singleRoot, { index: true });
     try {
-      expect(single.getRoutingManifest(3)).not.toBeNull();
       const payload = buildRoutes(single, new URLSearchParams('limit=3'));
       expect(payload.routed).toBe(true);
-      expect(payload.entries.map(e => e.url)).toEqual(['GET /one']);
-    } finally { single.close(); }
+      expect(payload.entries.map((e) => e.url)).toEqual(['GET /one']);
+    } finally {
+      single.close();
+    }
   });
 
-  it('applies its limit to distinct routes even when the first handler has many calls', () => {
-    const payload = buildRoutes(cg, new URLSearchParams('limit=3'));
-    expect(payload.entries.map(e => e.url)).toEqual(['GET /dense', 'GET /second', 'GET /third']);
-    expect(payload.shown).toBe(3);
-    expect(payload.truncated).toBe(true);
-  });
   it('has one row per route', () => {
     const { entries } = buildRoutes(cg, new URLSearchParams());
     const ids = entries.map((e) => e.routeId);

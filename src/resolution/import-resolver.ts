@@ -13,6 +13,7 @@ import { applyAliases } from './path-aliases';
 import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport } from './workspace-packages';
 import { stripCommentsForRegex } from './strip-comments';
+import { dartDirectiveFile } from './dart-libraries';
 import { parseRustUseBindings } from './rust-use-bindings';
 import {
   resolveMethodOnType,
@@ -1433,6 +1434,28 @@ export function isCobolCopybookRef(ref: UnresolvedRef): boolean {
 }
 
 /**
+ * Is this a Dart `import`, `export` or `part`? Its name is the URI, which
+ * names one file (see ./dart-libraries) or none — `dart:async`, a package from
+ * outside the project, a generated part nobody committed — and never a
+ * symbol: the name-matcher took the URI's last segment for a file name
+ * (`package:flutter/foundation.dart` went to riverpod's own foundation.dart)
+ * or bound it to the file's own `import` node.
+ */
+export function isDartImportRef(ref: UnresolvedRef): boolean {
+  return ref.language === 'dart' && ref.referenceKind === 'imports';
+}
+
+/**
+ * Is this a Lua / Luau `require`? It names a module file (see
+ * resolveLuaRequire) or a module from outside the project, never a symbol:
+ * the name-matcher bound `local lfs = require "lfs"` and `local Signal =
+ * require(script.Parent.Signal)` to the local each is assigned to.
+ */
+export function isLuaRequireRef(ref: UnresolvedRef): boolean {
+  return (ref.language === 'lua' || ref.language === 'luau') && ref.referenceKind === 'imports';
+}
+
+/**
  * Resolve a PHP include/require path to a project-relative file path.
  *
  * PHP resolves includes relative to the including file's directory (the
@@ -1526,7 +1549,9 @@ const SPECIFIER_LIST = '[^{}]+';
  */
 const ES_IMPORT_RE = new RegExp(
   `(?<![$.\\p{ID_Continue}])import(?:\\s+|(?=[{*]))(?:(?:type(?:of)?|defer)(?:\\s*(?=[{*])|\\s+(?!from(?![$\\p{ID_Continue}]))(?=[$_\\p{ID_Start}])))?` +
-    `(?:(${JS_IDENT})\\s*(?:,\\s*)?)?` +
+    // A default binding is never followed by `{`, so the `${` of a code
+    // generator's `` `import ${name} from '${src}'` `` is no binding.
+    `(?:(${JS_IDENT})(?![$\\u200c\\u200d\\p{ID_Continue}{])\\s*(?:,\\s*)?)?` +
     `(?:\\{(${SPECIFIER_LIST})\\}\\s*)?` +
     `(?:(\\*)\\s*as\\s+(${JS_IDENT})\\s*)?` +
     `from\\s*['"]([^'"]+)['"]`,
@@ -1653,7 +1678,9 @@ function extractJSImports(content: string): ImportMapping[] {
             localName: specifier.local,
             exportedName: specifier.imported,
             source: source!,
-            isDefault: false,
+            // `{ default as X }` is the default import spelled as a named one;
+            // no module declares an export named `default` to find.
+            isDefault: specifier.imported === 'default',
             isNamespace: false,
           });
         }
@@ -1692,7 +1719,7 @@ function extractJSImports(content: string): ImportMapping[] {
     if (destructured) {
       const names = destructured.split(',').map((s) => s.trim());
       for (const name of names) {
-        const aliasMatch = name.match(/(\w+)\s*:\s*(\w+)/);
+        const aliasMatch = name.match(/([A-Za-z_$][\w$]*)\s*:\s*([A-Za-z_$][\w$]*)/);
         if (aliasMatch) {
           mappings.push({
             localName: aliasMatch[2]!,
@@ -1796,52 +1823,83 @@ function extractPythonImports(content: string): ImportMapping[] {
 }
 
 /**
- * Extract Go import mappings
+ * Extract Go import mappings. An import is bound to the name written before
+ * its path, or else to the name of the package it imports — which the path
+ * alone doesn't settle: `k8s.io/api/core/v1` is package `v1`, while
+ * `go.yaml.in/yaml/v3` and `gopkg.in/yaml.v3` are `yaml`, and
+ * `github.com/mattn/go-sqlite3` is `sqlite3`. So an unaliased import keeps its
+ * last path element and also takes the name goimports assumes for the path,
+ * unless another of the file's imports is bound to that name.
  */
 function extractGoImports(content: string): ImportMapping[] {
-  const mappings: ImportMapping[] = [];
-  // A comment is not part of an import: the last word of `// memory cache`
-  // was read as the alias of the import on the next line, a quoted word in a
-  // comment as an import of its own, and a `)` in one ended the block early.
-  content = stripCommentsForRegex(content, 'go');
+  const specs: Array<{ name: string | undefined; source: string }> = [];
+  // Only the imports, which Go puts before any other declaration, and without
+  // their comments: a word in one is no name — `"fmt" // for printing` used to
+  // name the next import `printing`. A name is on its path's own line.
+  const code = stripCommentsForRegex(content.slice(0, goImportsEnd(content)), 'go');
 
-  // import "path" or import alias "path"
-  const singleImportRegex = /import\s+(?:(\w+)\s+)?["']([^"']+)["']/g;
+  // import "path" or import name "path"
+  const singleImportRegex = /\bimport\s+(?:([A-Za-z_]\w*)[ \t]*)?["']([^"']+)["']/g;
   let match;
-
-  while ((match = singleImportRegex.exec(content)) !== null) {
-    const [, alias, source] = match;
-    const packageName = source!.split('/').pop()!;
-    mappings.push({
-      localName: alias || packageName,
-      exportedName: '*',
-      source: source!,
-      isDefault: false,
-      isNamespace: true,
-    });
+  while ((match = singleImportRegex.exec(code)) !== null) {
+    specs.push({ name: match[1], source: match[2]! });
   }
 
   // import ( ... ) block
-  const blockImportRegex = /import\s*\(\s*([^)]+)\s*\)/gs;
-  while ((match = blockImportRegex.exec(content)) !== null) {
-    const block = match[1]!;
-    const lineRegex = /(?:(\w+)\s+)?["']([^"']+)["']/g;
+  const blockImportRegex = /\bimport\s*\(\s*([^)]+)\s*\)/g;
+  while ((match = blockImportRegex.exec(code)) !== null) {
+    const lineRegex = /(?:([A-Za-z_]\w*|\.)[ \t]*)?["']([^"']+)["']/g;
     let lineMatch;
-
-    while ((lineMatch = lineRegex.exec(block)) !== null) {
-      const [, alias, source] = lineMatch;
-      const packageName = source!.split('/').pop()!;
-      mappings.push({
-        localName: alias || packageName,
-        exportedName: '*',
-        source: source!,
-        isDefault: false,
-        isNamespace: true,
-      });
+    while ((lineMatch = lineRegex.exec(match[1]!)) !== null) {
+      specs.push({ name: lineMatch[1], source: lineMatch[2]! });
     }
   }
 
+  const mapping = (localName: string, source: string): ImportMapping =>
+    ({ localName, exportedName: '*', source, isDefault: false, isNamespace: true });
+  // A dot import (`. "pkg"`) binds no name of its own; it stays listed under
+  // its last path element.
+  const mappings = specs.map(({ name, source }) =>
+    mapping(name === undefined || name === '.' ? source.split('/').pop()! : name, source));
+  const bound = new Set(mappings.map((m) => m.localName));
+  const assumed = new Map<string, string[]>();
+  for (const { name, source } of specs) {
+    if (name !== undefined) continue;
+    const assumedName = goAssumedPackageName(source);
+    if (assumedName && !bound.has(assumedName)) assumed.set(assumedName, [...(assumed.get(assumedName) ?? []), source]);
+  }
+  // Two imports that assume one name can't both be that package.
+  for (const [localName, sources] of assumed) {
+    if (sources.length === 1) mappings.push(mapping(localName, sources[0]!));
+  }
   return mappings;
+}
+
+/**
+ * Where a Go file's imports end: at its first other top-level declaration, a
+ * line opening with `func`, `type`, `var` or `const` outside a block comment.
+ */
+function goImportsEnd(content: string): number {
+  const decl = /^(?:func|type|var|const)\b/gm;
+  for (let m; (m = decl.exec(content)) !== null;) {
+    if (content.lastIndexOf('/*', m.index) <= content.lastIndexOf('*/', m.index)) return m.index;
+  }
+  return content.length;
+}
+
+/**
+ * The package name goimports assumes for an import path
+ * (ImportPathToAssumedName): its last element that isn't a major version
+ * (`go.yaml.in/yaml/v3` → `yaml`), without a `go-` prefix
+ * (`github.com/mattn/go-sqlite3` → `sqlite3`), cut where an identifier can't
+ * go on (`gopkg.in/yaml.v3` → `yaml`).
+ */
+function goAssumedPackageName(importPath: string): string {
+  const elements = importPath.split('/');
+  let base = elements[elements.length - 1]!;
+  if (elements.length > 1 && /^v\d+$/.test(base)) base = elements[elements.length - 2]!;
+  if (base.startsWith('go-')) base = base.slice(3);
+  return /^[\p{L}\p{Nd}_]*/u.exec(base)![0];
 }
 
 /**
@@ -2343,6 +2401,14 @@ export function resolveViaImport(
     const file = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
     const fileNode = file && file !== ref.filePath ? context.getNodesInFile(file).find((n) => n.kind === 'file') : undefined;
     if (fileNode) return { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' };
+  }
+  // A Dart `import` / `export` URI names a library file, and a `part` URI one
+  // of the library's own files: `package:app/x.dart` is app's lib/x.dart, any
+  // other path is from the file the directive is in.
+  if (isDartImportRef(ref)) {
+    const file = dartDirectiveFile(ref.filePath, ref.referenceName, context);
+    const fileNode = file && file !== ref.filePath ? context.getNodesInFile(file).find((n) => n.kind === 'file') : undefined;
+    return fileNode ? { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' } : null;
   }
   // C/C++ #include references — resolve directly to the included file
   // (file→file edge), bypassing symbol lookup. The extractor emits these

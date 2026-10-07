@@ -86,6 +86,24 @@ func Std() error {
 	return errors.New("std")
 }
 `,
+    'lib/log/v2/log.go': `package log
+
+func Infof(format string, args ...any) {}
+`,
+    // Unaliased imports whose paths end in a major version are known as `log`
+    // and `errors`; only the first is a package of this module.
+    'svc/versioned.go': `package svc
+
+import (
+	"example.com/app/lib/log/v2"
+	"github.com/acme/errors/v2"
+)
+
+func Versioned() error {
+	log.Infof("versioned")
+	return errors.New("outside")
+}
+`,
     'svc/variable.go': `package svc
 
 type bag struct{}
@@ -137,6 +155,10 @@ describe('Go project package named like a standard-library package', () => {
   it('resolves when the alias is the standard-library name itself', () => {
     expect(edgesFrom('svc/both.go', 'Ours')).toContain('calls lib/errors/errors.go:New');
     expect(edgesFrom('svc/both.go', 'Theirs')).toEqual([]);
+  });
+
+  it('resolves through an unaliased import whose path ends in a major version', () => {
+    expect(edgesFrom('svc/versioned.go', 'Versioned')).toEqual(['calls lib/log/v2/log.go:Infof']);
   });
 
   it('leaves a file importing the standard library package alone', () => {
