@@ -113,6 +113,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A call to a function defined in the same file is no longer marked as an uncertain match when the file sits near the top of the project, and it now wins over a weaker same-named guess in another file.
 - When a project keeps copies of the same code in several modules, a call now links to the copy in the caller's own module, even in deeply nested trees where it could previously land on another module's copy.
 - In TypeScript and JavaScript, a method called on a freshly constructed object, such as `new RegExp(p).exec(s)` or `new URL(u).toString()`, now links only to that class's own (or inherited) method and no longer to an unrelated project method of the same name. (#1945)
+- In JavaScript and TypeScript, a function declared inside another function now takes calls to its name even when the file also imports that name from a package, such as `resolve` from `node:path`. Such calls used to link to nothing. (#1715)
 
 ## [1.6.2] - 2026-10-03
 
