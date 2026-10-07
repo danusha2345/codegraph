@@ -123,6 +123,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Kotlin, a call on a library type you import, like Jetpack Compose's `Modifier.pad()`, now links to the extension your project declares on that type (`fun Modifier.pad()`), when the calling file can see it: same package, or imported by name or with `.*`. The library type's own methods, like `Modifier.fillMaxSize()`, still never link to a project method that shares the name.
 - In Rust, a call to a function brought in by `use`, like `take(3)` after `use crate::util::take;` (also through an `as` alias, a nested group or a `use` inside a function), and a call written as a module path, like `crate::util::take(3)` or `super::util::take(3)`, now link to the function that module declares. Before, they could land on a same-named function of another module, or on a same-named method declared above the function. (#2308)
 - `codegraph_explore` and the Claude Code prompt hook are much faster on long prompts, such as a pasted report several thousand characters long, which could run past the hook's 30-second timeout. The results are unchanged. (#2184)
+- In PHP, a class written through a namespace alias now resolves whatever case the alias is written in (`new field\FirstName()` after `use App\Fields as Field;`), and a file whose `namespace { }` blocks bind the same alias to different namespaces no longer links every use of it to the first one. (#2256)
 
 ## [1.6.2] - 2026-10-03
 
