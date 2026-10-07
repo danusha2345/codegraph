@@ -129,6 +129,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In TypeScript and JavaScript, a method called on a freshly constructed object, such as `new RegExp(p).exec(s)` or `new URL(u).toString()`, now links only to that class's own (or inherited) method and no longer to an unrelated project method of the same name. (#1945)
 - In JavaScript and TypeScript, a function declared inside another function now takes calls to its name even when the file also imports that name from a package, such as `resolve` from `node:path`. Such calls used to link to nothing. (#1715)
 - In Kotlin, a call on a library type you import, like Jetpack Compose's `Modifier.pad()`, now links to the extension your project declares on that type (`fun Modifier.pad()`), when the calling file can see it: same package, or imported by name or with `.*`. The library type's own methods, like `Modifier.fillMaxSize()`, still never link to a project method that shares the name.
+- In Rust, a call to a function brought in by `use`, like `take(3)` after `use crate::util::take;` (also through an `as` alias, a nested group or a `use` inside a function), and a call written as a module path, like `crate::util::take(3)` or `super::util::take(3)`, now link to the function that module declares. Before, they could land on a same-named function of another module, or on a same-named method declared above the function. (#2308)
 
 ## [1.6.2] - 2026-10-03
 
