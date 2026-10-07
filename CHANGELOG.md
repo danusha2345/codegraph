@@ -120,6 +120,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A method calling another method of its own class — `render()` in Java, Scala or C++, or `this.render()` / `self.render()` in TypeScript, JavaScript or Python — now links to that class's method (or the one it inherits or is nested in) instead of a same-named method of another class declared nearer in the file.
 - A call to a function defined in the same file is no longer marked as an uncertain match when the file sits near the top of the project, and it now wins over a weaker same-named guess in another file.
 - When a project keeps copies of the same code in several modules, a call now links to the copy in the caller's own module, even in deeply nested trees where it could previously land on another module's copy.
+- In TypeScript and JavaScript, a method called on a freshly constructed object, such as `new RegExp(p).exec(s)` or `new URL(u).toString()`, now links only to that class's own (or inherited) method and no longer to an unrelated project method of the same name. (#1945)
 
 ## [1.6.2] - 2026-10-03
 
