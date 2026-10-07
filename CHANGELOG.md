@@ -106,6 +106,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph_impact` on a heavily referenced symbol now stops at a safety limit and says the answer was truncated, instead of exhausting the MCP server's memory; narrow it with `file` or a smaller `depth`. (#1583)
 - The MCP server now recycles its query workers after they sit idle, releasing the memory a burst of large queries left behind while keeping one worker warm for the next call. (#1583)
 - Path search between two symbols no longer slows down sharply or grows its memory use on densely connected graphs. (#1583)
+- **A C `#if` group whose branches are not whole statements no longer produces phantom functions.** An `else if (…) { … }` arm kept behind `#ifdef`, an `if (…)` header whose body sits after the `#endif` (the ST HAL's per-device latency tables), or a function signature that differs per configuration all read to the C grammar as a function *named* `if` — and every real function after it in the file was then filed underneath it, or dropped. Such a group is now collapsed to its first live branch before parsing, offsets kept, and block macros written in capitals (`ATOMIC_BLOCK(…) { … }`) are recognized like their lowercase cousins. On a betaflight tree 265 phantom nested functions became 5, and whole functions that had been missing (`spiInternalStartDMA`, `processSmartPortTelemetry`, the CMSIS matrix routines) are back with their callers at exact-match confidence. Re-index after upgrading.
 
 ## [1.6.2] - 2026-10-03
 
