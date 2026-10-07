@@ -140,6 +140,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Java calls through static fields now follow the correct nested type, inherited field, or concrete initializer without linking external library calls to unrelated project methods. (#1949)
 
+### Fixes
+
+- Installing or removing CodeGraph in Codex now preserves TOML examples in your instructions and recognizes server tables with spaces or quoted names, keeping your configuration readable. (#2250) Thanks @rudycelekli.
 
 ## [1.6.2] - 2026-10-03
 
