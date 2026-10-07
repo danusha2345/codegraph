@@ -376,6 +376,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The Claude Code prompt hook no longer runs on the task-notification messages Claude Code injects when a background agent finishes, removing a multi-second stall on every such turn. (#1832)
 
 - C function-pointer calls no longer link to a Python or Rust function that happens to share the handler's name, and such a function no longer hides the real C handler.
+- Indexing a project that vendors tree-sitter grammars is faster: the C function-pointer pass now skips generated C files, and a tree-sitter `parser.c` counts as generated even when it carries no banner (releases before 0.25 print none).
 
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
