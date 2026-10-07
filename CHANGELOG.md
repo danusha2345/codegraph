@@ -133,37 +133,20 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph_explore` and the Claude Code prompt hook are much faster on long prompts, such as a pasted report several thousand characters long, which could run past the hook's 30-second timeout. The results are unchanged. (#2184)
 - In PHP, a class written through a namespace alias now resolves whatever case the alias is written in (`new field\FirstName()` after `use App\Fields as Field;`), and a file whose `namespace { }` blocks bind the same alias to different namespaces no longer links every use of it to the first one. (#2256)
 - The errors that ask you to stop a background server before `codegraph index` can rebuild, or when two servers want the same project, now name `codegraph daemon`, the command that lists the servers and stops the one you pick. Before, they said `codegraph daemon stop`, which fails with "too many arguments".
-### Fixes
-
+- C function-pointer calls no longer link to a Python or Rust function that happens to share the handler's name, and such a function no longer hides the real C handler.
+- Indexing a project that vendors tree-sitter grammars is faster: the C function-pointer pass now skips generated C files, and a tree-sitter `parser.c` counts as generated even when it carries no banner (releases before 0.25 print none).
+- Linking callbacks and events is faster on files with many registrations: line numbers come from a newline index instead of re-splitting the file for every match.
+- In TypeScript, `this.field.method()` on a type declared in two equally near apps now picks the same target on every machine. The tie used to be broken by locale-dependent string comparison, so indexes built with different system locales could disagree.
 - A call like `Logger.log()` now links to `Logger`'s own method instead of the same-named method of a class whose name merely contains it, such as `FileLogger`.
-### Fixes
-
 - Java calls through static fields now follow the correct nested type, inherited field, or concrete initializer without linking external library calls to unrelated project methods. (#1949)
-
-### Fixes
-
 - Installing or removing CodeGraph in Codex now preserves TOML examples in your instructions and recognizes server tables with spaces or quoted names, keeping your configuration readable. (#2250) Thanks @rudycelekli.
-### Fixes
-
 - Searches with `path:` or `name:` filters now find matching symbols before unrelated results consume the limit, including typo searches and queries containing only filters.
-### Fixes
-
 - A TypeScript type re-exported through a barrel (`export type { Foo } from`, `export { type Foo } from`, `export type * from`) now links to its real declaration instead of a same-named type elsewhere in the project, and import lists with comments, string names, or a JSDoc `@import` are read correctly. Re-index to update an existing project.
-### Fixes
-
 - Type hierarchy queries and context results now include subclasses and implementations alongside parent types, retaining every inheritance relationship in diamonds and cycles.
-### Fixes
-
 - Repeating a full index through the library keeps unchanged symbols discoverable by the words in their names, and cancelling a re-index preserves those matches.
-### Fixes
-
 - Kotlin calls through imported types now avoid unrelated same-named methods while retaining inherited members and project extension functions. (#1948)
-
-### Fixes
-
+- In Claude Code, agents now receive all of CodeGraph's guidance. Claude Code cuts each MCP server's instructions at 2,048 characters, so agents never saw the rules for stale-index warnings or for a project that isn't indexed; the guidance now fits, with those rules first. Thanks @inth3shadows. (#1529)
 - An Express route keeps its named handler when a middleware before it contains an arrow function. `rateLimit({ keyGenerator: (req) => req.ip })` or `(req, res, next) => next()` no longer hides the handler at the end of the route (re-index to update an existing project).
-### Fixes
-
 - Python imports now resolve the way Python finds modules: from your project's package roots — the repository root, `src/` layouts, each service with its own `pyproject.toml`, `setup.cfg` or `setup.py`, and the package directories those declare — so `from shop.cart import total` reaches `src/shop/cart.py`, `from pkg import name` reaches what the package's `__init__.py` defines or re-exports (respecting `__all__`), and `import json` or `import requests` no longer links to a same-named file nested in a test fixture, an example, a vendored copy or another package. After a module, package or `__init__.py` is added or removed, a package's `__init__.py` is edited, or a build config is edited, the next sync brings Python imports back in line with a fresh index; the file watcher doesn't react to a build-config edit by itself, so run `codegraph sync` after one. Re-index Python projects after upgrading. (#1704)
 
 ## [1.6.2] - 2026-10-03
@@ -378,25 +361,6 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - PHP calls on `$this`, `self`, `static` and `parent` now reach the method of the class they're written in, a class it extends, or a trait any of them uses, with parent classes and traits found through the file's `namespace` and `use` imports. On Drupal core, `$this->assertEquals()` (PHPUnit's) used to link to an unrelated comparator class 8,832 times, `$this->assertSession()` to a JavaScript-test base class, and `$this->t()` to `Views::t`. They now reach `UiHelperTrait` and `StringTranslationTrait`, or nothing when the method lives in a package outside the repository. A call inside a trait, and a base class calling a method its subclass defines, keep their links. Re-index PHP projects after upgrading.
 - A PHP function call written after `=>` in an array, like `'count' => count($items)`, `'by' => user()->id` or `'label' => trans('…')`, is now read as a plain function call. It used to be taken for a method call and linked to whichever class had a method of that name. On BookStack, that meant 166 wrong links.
 - A PHP call written without a receiver, such as `redirect($url)`, `view('books.show')`, `auth()` or `basename($path)`, is a function call, and no longer links to a same-named method, field or class elsewhere in the project. These wrong links showed up in callers, impact and `codegraph_explore` answers wherever a Laravel helper or PHP built-in shared its name with a project member. Re-index PHP projects after upgrading.
-- The Claude Code prompt hook no longer runs on the messages Claude Code uses to hand a subagent's report back to the main session. Before, such a long report could keep the hook busy past Claude Code's 30-second hook timeout and inject context unrelated to what you asked. Thanks @danusha2345, and @tippmar-nr for the report. (#2184)
-- Newer MCP clients such as Antigravity 2.5 connect again: the server now answers their `server/discover` probe right away with "method not found", so they go straight on to the regular handshake instead of waiting on a reply that could take seconds or never come. Thanks @danusha2345, and @samem26 for the report. (#2084)
-- A CodeGraph session that queried another project through `projectPath` no longer keeps that project locked for as long as it runs: after 10 minutes without a query it lets the project go, so the project's own session and `codegraph index` can take over again (tune with `CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS`, `0` keeps it open). Thanks @danusha2345, and @bompus for the report. (#2087)
-- Claude Code now shows the model the full text of `codegraph_status` and of explore's stale-index refusal. Both results also carried `structuredContent`, and Claude Code shows a result's `structuredContent` in place of its text, so the model saw only a freshness JSON object: no refusal message, no retry guidance and no status report. Both results are now text only. Thanks @bompus. (#2088)
-- When an agent asks CodeGraph about a separate git repository nested inside an indexed project, one the project's index leaves out (for example because the parent's `.gitignore` excludes it), it now gets the usual "isn't indexed" guidance instead of answers from the parent project's code. Nested repositories the parent does index, such as submodules, work as before. Thanks @wstczyw for the report. (#2110)
-- Editing a file that defines the same name more than once, like two classes that each have an `execute` method or a method's overloads, no longer moves every caller from other files onto one of them during `codegraph sync`. A sync interrupted partway through a file also no longer loses those callers until a full re-index. Thanks @ijbranch for the report. (#2276)
-- Delphi and Free Pascal include files (`.inc`) are now indexed as Pascal. Before, they were read as PHP and came up empty. A `.inc` file with a `<?php` tag is still PHP, and a `codegraph.json` mapping for `.inc` still wins. Thanks @ijbranch for the report. (#2279)
-- In Python, a call written on the instance, like `self.get_breadcrumbs(...)`, now links to the class's own method even when the file also imports a function of the same name. Before, the import claimed it: Django REST Framework's renderers, netbox's change logging and django-allauth's account adapter all linked their own method calls to an imported helper.
-- In Python, a method passed as a value through a module-level variable that a setup function assigns, like `settings.docStoreConn.delete_payload_fields` after `global docStoreConn; docStoreConn = QdrantConnection()`, now links to that class's method. When several backend classes can be assigned, it links to the declaration they all inherit. Thanks @JosefAschauer. (#2074)
-- In Python, an import split over several lines in parentheses, `from x import (A, B)` written one name per line, is now read in full. Before, its names were invisible to resolution, so Django REST Framework's `serializers.CharField()` and netbox's model mixins linked to the wrong class or to nothing. Thanks @JosefAschauer.
-- Indexing a large C or C++ project no longer runs out of memory partway through "Resolving refs". Headers whose include guard is written as `#define X_H 1`, as in OpenSceneGraph and osgEarth, or that are included under a build flag codegraph cannot know, used to be re-read on every include path, which grows exponentially with the depth of the include tree. Each is now read once per include state, and a hard limit stops the check on any include tree that is still too large. Thanks @danusha2345, and @coolhitmanleon for the report. (#2127)
-- In tag-based CFML, calls written in tags are now linked: in `<cfset>`, `<cfif>`/`<cfelseif>`, `<cfreturn>`, `<cfloop condition>` and `#…#` expressions. Before, only `<cfscript>` and `<cfquery>` code was read, so callers and impact found almost nothing in tag-based components. Functions wrapped in tags like `<cfprocessingdirective>` or `<cfsilent>` are now indexed too, and a `<cfinterface>` is indexed as an interface that `implements` links to. Re-index CFML projects after upgrading. Thanks @HarryMuc for the report. (#2091)
-- On Windows, a project opened with a different drive-letter or folder-name case, like `d:\work\app` and `D:\Work\App`, now joins the CodeGraph background server that is already running for it. Before, each spelling started a server of its own that exited at once, so the session quietly served the graph by itself with no shared file watching or auto-sync, and `codegraph list` showed the project twice. Thanks @greatjackzhou. (#2278)
-- An agent session that lost its connection to CodeGraph's shared background server, or couldn't reach it at startup, no longer stops that server from running for the rest of the session. It reconnects on its own once the server can start, so other sessions on the same project get auto-sync back instead of running read-only. Thanks @ijbranch for the report. (#2277)
-- On Windows, `codegraph upgrade` no longer breaks the install while an agent session is using CodeGraph. It used to stop partway and leave CodeGraph unable to start; it now swaps the new files in with CodeGraph running and puts the previous version back if anything fails, and re-running the PowerShell installer works the same way. If an earlier upgrade already broke your install, re-run `irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex` to repair it. Thanks @tippmar-nr for the report. (#2185)
-- On Windows, `codegraph init`, `codegraph index` and the background server's syncs no longer sometimes crash right after parsing on a busy machine (exit code 3221225477, an access violation). Shutting down the parsing threads could stop one while it was still starting up, which took the whole process down; they now finish starting first.
-- On a busy machine, indexing or syncing a small project no longer starts extra background threads for resolving references that it can't use. Under heavy load the slower pace made a ten-file project look big enough to need them, which added seconds to the run and held extra memory.
-- On Windows, the CodeGraph background server no longer sometimes crashes as it shuts down (exit code 3221225477, an access violation) when it stops shortly after starting. Shutting down could stop one of its background threads while that thread was still starting up; it now lets the thread finish starting first.
-- In Claude Code, agents now receive all of CodeGraph's guidance. Claude Code cuts each MCP server's instructions at 2,048 characters, so agents never saw the rules for stale-index warnings or for a project that isn't indexed; the guidance now fits, with those rules first. Thanks @inth3shadows. (#1529)
 
 ## [1.6.1] - 2026-09-29
 
@@ -433,11 +397,6 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixes
 
 - The Claude Code prompt hook no longer runs on the task-notification messages Claude Code injects when a background agent finishes, removing a multi-second stall on every such turn. (#1832)
-
-- C function-pointer calls no longer link to a Python or Rust function that happens to share the handler's name, and such a function no longer hides the real C handler.
-- Indexing a project that vendors tree-sitter grammars is faster: the C function-pointer pass now skips generated C files, and a tree-sitter `parser.c` counts as generated even when it carries no banner (releases before 0.25 print none).
-- Linking callbacks and events is faster on files with many registrations: line numbers come from a newline index instead of re-splitting the file for every match.
-- In TypeScript, `this.field.method()` on a type declared in two equally near apps now picks the same target on every machine. The tie used to be broken by locale-dependent string comparison, so indexes built with different system locales could disagree.
 
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
