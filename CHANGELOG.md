@@ -152,6 +152,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixes
 
 - Type hierarchy queries and context results now include subclasses and implementations alongside parent types, retaining every inheritance relationship in diamonds and cycles.
+### Fixes
+
+- Repeating a full index through the library keeps unchanged symbols discoverable by the words in their names, and cancelling a re-index preserves those matches.
 
 ## [1.6.2] - 2026-10-03
 
