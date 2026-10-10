@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, GO_STDLIB_PACKAGES, matchGoAssertedCall, matchKotlinReceiverChain, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, GO_STDLIB_PACKAGES, matchGoAssertedCall, matchKotlinReceiverChain, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGoAssertedLocal } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -33,7 +33,7 @@ import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { clearCppIncluderMemos } from './cpp-includers';
 import { matchShopifyThemeFile } from './shopify-themes';
-import { resolveViaImport, resolveRustImportedCall, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters } from './import-resolver';
+import { resolveViaImport, resolveRustImportedCall, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters, importBindingTail } from './import-resolver';
 import { isVerilogMemberRef, matchVerilogMember } from './verilog-members';
 import { isVerilogPortRef, matchVerilogPort } from './verilog-ports';
 import { isVerilogWildcardRef, matchVerilogWildcard } from './verilog-wildcard';
@@ -281,6 +281,8 @@ export class ReferenceResolver {
   // 565s of combined worker time (~581µs each, recursion-multiplied).
   private supertypeGen = 0;
   private supertypeMemo = new Map<string, { gen: number; supers: string[] }>();
+  // getSupertypeNodes' memo, by node id, under the same generation tag.
+  private supertypeNodeMemo = new Map<string, { gen: number; nodes: Node[] }>();
 
   /** Invalidate the getSupertypes memo — call when resolved edges may have advanced. */
   private advanceSupertypeGeneration(): void {
@@ -288,6 +290,7 @@ export class ReferenceResolver {
     // Lazy invalidation via the gen tag; bound the map so a long run over many
     // batches doesn't accrete dead entries.
     if (this.supertypeMemo.size > 50_000) this.supertypeMemo.clear();
+    if (this.supertypeNodeMemo.size > 50_000) this.supertypeNodeMemo.clear();
   }
   // Node kinds are a small fixed set (~24), so this is a plain Map, not an LRU.
   // getNodesByKind returns the FULL node list for a kind; it was previously
@@ -461,6 +464,42 @@ export class ReferenceResolver {
   }
 
   /**
+   * Put back in the pending set the route references whose answer reads a
+   * module in `changedFilePaths` (`FrameworkResolver.lazyModules`), for a
+   * sync's resolution sweep. Returns the number put back.
+   *
+   * A route that renders a same-file `const Docs = lazy(() =>
+   * import('./pages/Docs'))` binds to the declaration while the module is
+   * missing, and nothing revisited it once the module was added: the
+   * reference had resolved, so it was never parked for the failed-ref retry,
+   * and the rebind of the names a sync defines (CG-33) reaches it only when
+   * the module's component is named like the declaration. An edit that gives
+   * the module its default export, or moves it to another component, changes
+   * the answer the same way: a route's edge follows its old target through
+   * the module's re-index. So does a page behind a barrel the module
+   * forwards. References written in a changed file were resolved against the
+   * new files already.
+   */
+  reopenRouteModuleReaders(changedFilePaths: readonly string[]): number {
+    const readers = this.frameworks.filter((f) => f.lazyModules);
+    if (readers.length === 0 || changedFilePaths.length === 0) return 0;
+    const changed = new Set(changedFilePaths);
+    const edgeIds: number[] = [];
+    const refs: UnresolvedReference[] = [];
+    for (const edge of this.queries.getRouteEdgesMovedBy(changedFilePaths)) {
+      const ref = resurrectRefFromDroppedEdge(edge);
+      if (!ref) continue;
+      const asked: UnresolvedRef = { ...ref, filePath: edge.sourceFilePath, language: edge.sourceLanguage };
+      const reads = readers.some((f) => f.lazyModules!(asked, this.context).some((file) => changed.has(file)));
+      if (!reads) continue;
+      edgeIds.push(edge.edgeId);
+      refs.push(ref);
+    }
+    if (refs.length > 0) this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
+    return refs.length;
+  }
+
+  /**
    * Pre-build lightweight caches for resolution.
    * Node lookups are now handled by indexed SQLite queries instead of
    * loading all nodes into memory (which caused OOM on large codebases).
@@ -527,6 +566,7 @@ export class ReferenceResolver {
     this.methodMatchCache.clear();
     this.methodOwnerIndexCache.clear();
     this.supertypeMemo.clear();
+    this.supertypeNodeMemo.clear();
     this.supertypeGen++;
     this.nodesByKindCache.clear();
     this.fileExistsMemo.clear();
@@ -902,6 +942,18 @@ export class ReferenceResolver {
         return supers;
       },
 
+      getSupertypeNodes: (id: string) => {
+        const hit = this.supertypeNodeMemo.get(id);
+        if (hit && hit.gen === this.supertypeGen) return hit.nodes;
+        const nodes: Node[] = [];
+        for (const edge of this.queries.getOutgoingEdges(id, RESOLUTION_READ_EDGE_KINDS)) {
+          const target = this.nodeById(edge.target);
+          if (target) nodes.push(target);
+        }
+        this.supertypeNodeMemo.set(id, { gen: this.supertypeGen, nodes });
+        return nodes;
+      },
+
       getImportMappings: (filePath: string, language) => {
         const cacheKey = filePath;
         const cached = this.importMappingCache.get(cacheKey);
@@ -1037,7 +1089,7 @@ export class ReferenceResolver {
         resolved.push(result);
         byMethod[result.resolvedBy] = (byMethod[result.resolvedBy] || 0) + 1;
       } else {
-        unresolved.push(ref);
+        unresolved.push(this.parkable(ref));
       }
 
       // Report progress every 1% to avoid too many updates
@@ -1328,6 +1380,11 @@ export class ReferenceResolver {
     // Erlang refs carry the call-site arity (`f/1`, `mod::f/2` — #1610); the
     // name index stores bare names, so existence is checked arity-less.
     if (ref.language === 'erlang') existenceName = existenceName.replace(/\/\d{1,3}$/, '');
+    // A C or C++ name written from the global scope (`::_pbi::PrivateAccess::
+    // GenerateParseTable`, `::memset`) exists when the name under the `::` does.
+    if ((ref.language === 'cpp' || ref.language === 'c') && existenceName.startsWith('::')) {
+      existenceName = existenceName.slice(2);
+    }
     const tPre = this.profileStages ? process.hrtime.bigint() : 0n;
     const preFilterPass =
       isNixPathImportRef(ref) ||
@@ -1337,11 +1394,7 @@ export class ReferenceResolver {
       // calls `FormatPrice`, which the exact-name set never lists.
       (CASE_INSENSITIVE_LANGUAGES.has(ref.language) && this.hasAnyPossibleMatchIgnoringCase(existenceName)) ||
       this.matchesAnyImport(ref) ||
-      // Every detected framework's claim, not only those that resolve this
-      // language: the check above reads no leading `::`, and protobuf's C++
-      // `::_pbi::…` calls get past it only on the Swift ↔ Objective-C
-      // bridge's claim of any name with a `:` in it.
-      this.frameworks.some((f) => f.claimsReference?.(ref.referenceName));
+      this.frameworksFor(ref.language).some((f) => f.claimsReference?.(ref.referenceName));
     if (this.profileStages) this.stageAdd('preFilter', ref, preFilterPass, tPre);
     if (!preFilterPass) {
       return this.gateLanguage(matchJsStoreBindingCall(ref, this.context), ref);
@@ -1692,20 +1745,34 @@ export class ReferenceResolver {
    * ref's line), so a sibling must not inherit this row's failure (#1269).
    */
   private static partitionFailedCleanup(unresolved: UnresolvedRef[]): {
-    byRowId: Array<{ rowId: number; referenceName: string; referenceKind: string }>;
-    legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>;
+    byRowId: Array<{ rowId: number; referenceName: string; referenceKind: string; nameTail?: string }>;
+    legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string; nameTail?: string }>;
   } {
-    const byRowId: Array<{ rowId: number; referenceName: string; referenceKind: string }> = [];
-    const legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }> = [];
+    const byRowId: Array<{ rowId: number; referenceName: string; referenceKind: string; nameTail?: string }> = [];
+    const legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string; nameTail?: string }> = [];
     for (const r of unresolved) {
-      if (r.rowId != null) byRowId.push({ rowId: r.rowId, referenceName: r.referenceName, referenceKind: r.referenceKind });
+      if (r.rowId != null) byRowId.push({ rowId: r.rowId, referenceName: r.referenceName, referenceKind: r.referenceKind, nameTail: r.nameTail });
       else legacyKeys.push({
         fromNodeId: r.fromNodeId,
         referenceName: r.referenceName,
         referenceKind: r.referenceKind,
+        nameTail: r.nameTail,
       });
     }
     return { byRowId, legacyKeys };
+  }
+
+  /**
+   * `ref`, which no strategy resolved, with the tail it is parked under when
+   * that is not the one its name gives: a reference through an import
+   * binding the module doesn't declare by that name waits for the module
+   * (see importBindingTail). Decided here, where the file's import mappings
+   * are still cached from the attempt — in a resolver-pool worker too.
+   */
+  private parkable(ref: UnresolvedRef): UnresolvedRef {
+    const tail = importBindingTail(ref, this.context);
+    if (tail) ref.nameTail = tail;
+    return ref;
   }
 
   /** A deferred attempt is unfinished work, not a final failure (#1577). */
@@ -1945,7 +2012,7 @@ export class ReferenceResolver {
         resolved.push(result);
         byMethod[result.resolvedBy] = (byMethod[result.resolvedBy] || 0) + 1;
       } else {
-        unresolved.push(ref);
+        unresolved.push(this.parkable(ref));
       }
       // Fast-path the per-ref yield check: awaiting the async no-op costs a
       // microtask hop per ref, which dominates at ~10⁵ refs (see MaybeYield).
@@ -2066,7 +2133,7 @@ export class ReferenceResolver {
         resolved.push(result);
         byMethod[result.resolvedBy] = (byMethod[result.resolvedBy] || 0) + 1;
       } else {
-        unresolved.push(ref);
+        unresolved.push(this.parkable(ref));
       }
     }
     this.deferredRowIds.clear(); // the admission side now owns both queues
@@ -2896,9 +2963,13 @@ export class ReferenceResolver {
         const pkg = name.substring(0, dotIdx);
         // Only when the file imports it: an unimported `ring` / `token` /
         // `url` is a local variable (`func flush(ring *ringLog) { ring.Write(b) }`).
+        // And not a local bound from a type assertion that is named like one:
+        // grpc-go's `parser.ParseConfig(…)` after `parser, ok :=
+        // b.(balancer.ConfigParser)`.
         if (
           GO_STDLIB_PACKAGES.has(pkg) &&
-          this.context.getImportMappings(ref.filePath, 'go').some((i) => i.localName === pkg)
+          this.context.getImportMappings(ref.filePath, 'go').some((i) => i.localName === pkg) &&
+          !isGoAssertedLocal(pkg, ref, this.context)
         ) {
           return true;
         }
@@ -2927,12 +2998,15 @@ export class ReferenceResolver {
     // when there's no user node with this name — then name-matching would
     // produce zero edges anyway and the filter just short-circuits work.
     if (ref.language === 'c' || ref.language === 'cpp') {
+      // A leading `::` names the global scope: `::std::move` is `std::move`,
+      // `::memset` is `memset`.
+      const scoped = name.startsWith('::') ? name.slice(2) : name;
       // C++ std:: namespace prefix — safe to filter unconditionally,
       // since `std::foo` is never a user-defined qualified name in
       // tree-sitter output.
-      if (name.startsWith('std::')) return true;
-      if (C_BUILT_INS.has(name) || CPP_BUILT_INS.has(name)) {
-        return !this.hasAnyPossibleMatch(name);
+      if (scoped.startsWith('std::')) return true;
+      if (C_BUILT_INS.has(scoped) || CPP_BUILT_INS.has(scoped)) {
+        return !this.hasAnyPossibleMatch(scoped);
       }
     }
 

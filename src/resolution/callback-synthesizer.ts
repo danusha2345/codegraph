@@ -51,7 +51,11 @@ const EMIT_RE = /\.(?:emit|fire|dispatchEvent)\(\s*['"]([^'"]+)['"]/g;
 const SETSTATE_RE = /this\.setState\s*\(/;
 const FLUTTER_SETSTATE_RE = /\bsetState\s*\(/; // Flutter: setState((){…}) / this.setState
 const JS_FAMILY = ['typescript', 'javascript', 'tsx', 'jsx'];
-const JSX_TAG_RE = /<([A-Z][A-Za-z0-9_]*)[\s/>]/g;
+// A tag's name ends at whitespace, `/` or `>`, or at the `<` of the type
+// arguments a generic component's tag passes: `<PaginatedList<Document>
+// items={…} />` renders PaginatedList. The lookahead leaves that `<` to open
+// the next match, which `opensTag` reads as a type argument, not a tag.
+const JSX_TAG_RE = /<([A-Z][A-Za-z0-9_]*)(?=[\s/><])/g;
 const MAX_JSX_CHILDREN = 30;
 // Vue SFC templates: kebab-case child components (<el-button> → ElButton) and
 // event bindings (@click="fn" / v-on:click="fn"). PascalCase children (<VPNav/>)
@@ -835,10 +839,99 @@ function isGoEmbedding(e: Edge, kindOf: (id: string) => NodeKind | null): boolea
   return to !== null && (kindOf(e.source) !== 'interface' || to === 'interface');
 }
 /**
+ * The top-level items of the Go bracketed list opening at `text[open]` — the
+ * parameters of `(ctx context.Context, a, b int)` are `ctx context.Context`, `a`
+ * and `b int` — and the offset where the list closes. Nested brackets, string
+ * literals and comments are skipped whole. Null when the list never closes.
+ */
+function goListItems(text: string, open: number): { items: string[]; end: number } | null {
+  const items: string[] = [];
+  let depth = 0;
+  let item = '';
+  for (let i = open; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '/' && (text[i + 1] === '/' || text[i + 1] === '*')) {
+      const end = text[i + 1] === '/' ? text.indexOf('\n', i) : text.indexOf('*/', i + 2) + 1;
+      if (end <= 0) return null;
+      i = end;
+      item += ' ';
+      continue;
+    }
+    if (c === '"' || c === '`' || c === "'") {
+      let j = i + 1;
+      while (j < text.length && text[j] !== c) j += c !== '`' && text[j] === '\\' ? 2 : 1;
+      if (j >= text.length) return null;
+      item += text.slice(i, j + 1);
+      i = j;
+      continue;
+    }
+    if (c === '(' || c === '[' || c === '{') {
+      if (depth++ === 0) continue;
+    } else if (c === ')' || c === ']' || c === '}') {
+      if (--depth === 0) {
+        if (item.trim()) items.push(item.trim());
+        return { items, end: i };
+      }
+    } else if (c === ',' && depth === 1) {
+      if (item.trim()) items.push(item.trim());
+      item = '';
+      continue;
+    }
+    item += c;
+  }
+  return null;
+}
+
+/**
+ * A Go signature as extraction stores it for a function or method — the
+ * parameter list's text, then the result's — split into its parameters and
+ * results: `(ctx context.Context, a, b int) (int, error)` has the parameters
+ * `ctx context.Context`, `a` and `b int`. Null when the text has another shape.
+ */
+function goSignatureParts(signature: string | undefined): { params: string[]; results: string[] } | null {
+  const sig = signature?.trim();
+  if (!sig || sig[0] !== '(') return null;
+  const params = goListItems(sig, 0);
+  if (!params) return null;
+  const rest = sig.slice(params.end + 1).trim();
+  if (rest[0] !== '(') return { params: params.items, results: rest ? [rest] : [] };
+  const results = goListItems(rest, 0);
+  if (!results || rest.slice(results.end + 1).trim()) return null;
+  return { params: params.items, results: results.items };
+}
+
+/**
+ * How many parameters and results a Go signature has, as `params/results`:
+ * `(ctx context.Context, keys ...string) (int, error)` is `2/2`, and a grouped
+ * `a, b int` is two parameters. Null when the signature doesn't read.
+ */
+export function goSignatureArity(signature: string | undefined): string | null {
+  const parts = goSignatureParts(signature);
+  return parts ? `${parts.params.length}/${parts.results.length}` : null;
+}
+
+/**
+ * The arity a gRPC server implements an RPC with, read off the signature the
+ * generated client has for it. A unary call (`Range(ctx, in *RangeRequest,
+ * opts ...grpc.CallOption) (*RangeResponse, error)`) is served without the
+ * call options (`Range(ctx, *RangeRequest) (*RangeResponse, error)`); a
+ * streaming one (`Watch(ctx, opts ...grpc.CallOption) (Watch_WatchClient,
+ * error)`) gets its stream in their place and returns an error
+ * (`Watch(Watch_WatchServer) error`). Null when it isn't a client's.
+ */
+function goGrpcServerArity(signature: string | undefined): string | null {
+  const parts = goSignatureParts(signature);
+  const opts = parts?.params[parts.params.length - 1];
+  if (!parts || !opts || !/^(?:[A-Za-z_]\w*\s+)?\.\.\.\s*(?:grpc\.)?CallOption$/.test(opts)) return null;
+  const unary = parts.results.length === 2 && parts.results[0]!.startsWith('*');
+  return `${parts.params.length - 1}/${unary ? 2 : 1}`;
+}
+
+/**
  * Go implicit interface satisfaction (#584). Go has no `implements` keyword — a
  * type satisfies an interface structurally when its method set covers the
  * interface's. Synthesize the missing `implements` edge (type → interface) by
- * matching method-NAME sets, so impl-navigation works and the interface-dispatch
+ * matching method sets, so impl-navigation works and the interface-dispatch
  * bridge ({@link interfaceOverrideEdges}, now 'go'-enabled) can link an interface
  * method call to the concrete overrides, and to the methods embedding promotes.
  *
@@ -863,12 +956,19 @@ function isGoEmbedding(e: Edge, kindOf: (id: string) => NodeKind | null): boolea
  * never followed (this pass writes them), and an embedding that resolved to
  * nothing (`io.Closer`) adds nothing.
  *
- * Name-only matching (signatures ignored, and a promoted name counted even
- * where Go finds it ambiguous or hidden by a field) — over-approximation
- * accepted, in line with the other dispatch synthesizers; capped per
- * interface. Empty interfaces (`any`) are skipped so they don't match every
- * type, and a struct that embeds the interface keeps the edge its embedding
- * already is.
+ * Each wanted method also needs a declaration with its parameter and result
+ * counts, read off the stored signatures: Go wants the signatures identical,
+ * and the counts are what the text settles for certain — a cache's `Get(ctx,
+ * key, opts ...OpOption)` is no `Get(id types.ID) Peer`. A signature that
+ * doesn't read rules nothing out. A gRPC client interface also takes the
+ * structs serving its service (see `wantedArities`), the bridge a client's
+ * call crosses to reach its handler.
+ *
+ * Types are not compared, and a promoted name counts even where Go finds it
+ * ambiguous or hidden by a field — over-approximation accepted, in line with
+ * the other dispatch synthesizers; capped per interface. Empty interfaces
+ * (`any`) are skipped so they don't match every type, and a struct that
+ * embeds the interface keeps the edge its embedding already is.
  */
 async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
   let scanned255 = 0;
@@ -898,19 +998,25 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
   for (const i of goInterfaces) typeKind.set(i.id, 'interface');
   const kindOf = (id: string): NodeKind | null => typeKind.get(id) ?? null;
 
-  // Memoized: an embedded base is read once, however many types embed it.
+  // Memoized: an embedded base is read once, however many types embed it. Each
+  // method's stored signature rides along for the arity check below.
   const ownMemo = new Map<string, Set<string>>();
+  const ownSignatures = new Map<string, Map<string, (string | undefined)[]>>();
   const ownMethods = (id: string): Set<string> => {
     let names = ownMemo.get(id);
     if (!names) {
-      names = new Set(
-        queries
-          .getOutgoingEdges(id, ['contains'])
-          .map((e) => queries.getNodeById(e.target))
-          .filter((n): n is Node => !!n && n.kind === 'method')
-          .map((n) => n.name),
-      );
+      names = new Set();
+      const signatures = new Map<string, (string | undefined)[]>();
+      for (const e of queries.getOutgoingEdges(id, ['contains'])) {
+        const n = queries.getNodeById(e.target);
+        if (!n || n.kind !== 'method') continue;
+        names.add(n.name);
+        const list = signatures.get(n.name);
+        if (list) list.push(n.signature);
+        else signatures.set(n.name, [n.signature]);
+      }
       ownMemo.set(id, names);
+      ownSignatures.set(id, signatures);
     }
     return names;
   };
@@ -933,22 +1039,29 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
   }
   const embeds = (id: string): string[] => embedMemo.get(id) ?? NO_EMBEDS;
 
-  // Own methods plus every embedded type's, down to the last level. Go allows
-  // a struct to embed a pointer to itself, or to one embedding it back.
-  const methodSet = (id: string): Set<string> => {
-    if (embeds(id).length === 0) return ownMethods(id);
-    const names = new Set<string>();
+  // The type and every type it embeds, down to the last level. Go allows a
+  // struct to embed a pointer to itself, or to one embedding it back.
+  const embedClosure = (id: string): string[] => {
+    if (embeds(id).length === 0) return [id];
     const reached = new Set<string>([id]);
     const pending = [id];
     while (pending.length > 0) {
       const at = pending.pop()!;
-      for (const m of ownMethods(at)) names.add(m);
       for (const t of embeds(at)) {
         if (reached.has(t)) continue;
         reached.add(t);
         pending.push(t);
       }
     }
+    return [...reached];
+  };
+
+  // Own methods plus every embedded type's.
+  const methodSet = (id: string): Set<string> => {
+    const types = embedClosure(id);
+    if (types.length === 1) return ownMethods(id);
+    const names = new Set<string>();
+    for (const t of types) for (const m of ownMethods(t)) names.add(m);
     return names;
   };
 
@@ -956,6 +1069,77 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
     if (have.size < want.size) return false;
     for (const m of want) {
       if (!have.has(m)) return false;
+    }
+    return true;
+  };
+
+  // Each method name in a type's method set → the arities (`params/results`)
+  // its declarations there have, or null when one of their signatures doesn't
+  // read (then the name rules nothing out). Built only for the pairs whose
+  // names already match.
+  const arityMemo = new Map<string, Map<string, Set<string> | null>>();
+  const methodArities = (id: string): Map<string, Set<string> | null> => {
+    let arities = arityMemo.get(id);
+    if (arities) return arities;
+    arities = new Map();
+    for (const t of embedClosure(id)) {
+      ownMethods(t);
+      for (const [name, signatures] of ownSignatures.get(t) ?? []) {
+        let known = arities.get(name);
+        if (known === null) continue;
+        if (!known) arities.set(name, (known = new Set()));
+        for (const signature of signatures) {
+          const arity = goSignatureArity(signature);
+          if (arity === null) {
+            arities.set(name, null);
+            break;
+          }
+          known.add(arity);
+        }
+      }
+    }
+    arityMemo.set(id, arities);
+    return arities;
+  };
+  // The arities an implementer may declare each of an interface's methods
+  // with: the interface's own. A gRPC client interface (every method takes
+  // `opts ...grpc.CallOption` last) also takes its service's server side, so
+  // the structs serving it (etcd's `kvServer` for `KVClient`) stay linked and
+  // a client's call keeps reaching the handler that serves it.
+  const wantedArities = (iface: Node): Map<string, Set<string> | null> => {
+    const own = methodArities(iface.id);
+    const wanted = new Map<string, Set<string> | null>();
+    for (const t of embedClosure(iface.id)) {
+      for (const [name, signatures] of ownSignatures.get(t) ?? []) {
+        let arities = wanted.get(name);
+        if (!arities) wanted.set(name, (arities = new Set(own.get(name))));
+        for (const signature of signatures) {
+          const served = goGrpcServerArity(signature);
+          if (served === null) return own;
+          arities.add(served);
+        }
+      }
+    }
+    return wanted;
+  };
+
+  // Go accepts an implementation only when each method's signature is the
+  // interface's. The stored text settles how many parameters and results
+  // there are: a type with no declaration of a wanted name at a wanted arity
+  // can't satisfy it.
+  const aritiesFit = (typeId: string, wanted: Map<string, Set<string> | null>): boolean => {
+    const have = methodArities(typeId);
+    for (const [name, arities] of wanted) {
+      const got = have.get(name);
+      if (!arities || !got) continue;
+      let fits = false;
+      for (const arity of arities) {
+        if (got.has(arity)) {
+          fits = true;
+          break;
+        }
+      }
+      if (!fits) return false;
     }
     return true;
   };
@@ -994,11 +1178,14 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
     // of them, every defined type among them: under the cap, those are what
     // the interface-dispatch bridge links a call through the interface to.
     const throughEmbedding: Node[] = [];
+    let wanted: Map<string, Set<string> | null> | undefined;
     for (const s of candidates) {
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
       const have = candidateMethods.get(s.id)!;
       if (!covers(have, want)) continue;
       if (embeds(s.id).includes(iface.id)) continue; // declared by embedding it
+      if (!wanted) wanted = wantedArities(iface);
+      if (!aritiesFit(s.id, wanted)) continue;
       const own = ownMethods(s.id);
       if (own !== have && !covers(own, want)) throughEmbedding.push(s);
       else link(s);
@@ -1420,105 +1607,6 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
 }
 
 /**
- * Python override dispatch. A call bound to a base method (a base-typed
- * receiver `store: Base; store.fetch()`, or a module global holding one of
- * several backends) runs the subclass override at runtime — no static edge
- * reaches it, so `callers`/`impact` of the override miss every such call.
- * Link each override to the NEAREST declaration of the same name up its
- * `extends` chain: Python classes often inherit through a base that does not
- * redeclare the method (`Leaf(Mid(Base))`, only Base and Leaf define it).
- * Not dispatch, so skipped on either side: class-creation hooks (`Base()`
- * never runs `Leaf.__init__`), static and class methods (`Base.fetch()` names
- * its class), and properties (read, not called). A supertype is followed when
- * its `extends` edge was resolved through an import or lies in the same file;
- * a cross-file bare-name guess (`exact-match` / `fuzzy`) is not.
- * Over-approximation accepted (reachability-correct), like interface-impl; no
- * cap, since each override yields one edge per nearest declaration.
- */
-const PYTHON_NON_VIRTUAL = new Set(['__init__', '__new__', '__init_subclass__', '__class_getitem__']);
-const PYTHON_NON_DISPATCH_DECORATOR = /^@?(?:staticmethod|classmethod|(?:functools\.)?cached_property|property|\w+\.(?:setter|getter|deleter))\b/;
-const GUESSED_SUPERTYPE = new Set(['exact-match', 'fuzzy']);
-async function pythonOverrideEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
-  // Python decorators are not on the node (only `isStatic`); read the `@` lines
-  // above the def, past blank and comment lines between them.
-  const isPythonDispatchMethod = (m: Node): boolean => {
-    if (PYTHON_NON_VIRTUAL.has(m.name) || m.isStatic) return false;
-    const lines = ctx.getFileLines?.(m.filePath) ?? ctx.readFile(m.filePath)?.split('\n') ?? [];
-    for (let i = m.startLine - 2; i >= 0; i--) {
-      const line = (lines[i] ?? '').trim();
-      if (line === '' || line.startsWith('#')) continue;
-      if (!line.startsWith('@')) break;
-      if (PYTHON_NON_DISPATCH_DECORATOR.test(line)) return false;
-    }
-    return true;
-  };
-  let scanned = 0;
-  const edges: Edge[] = [];
-  const seen = new Set<string>();
-  const methodsMemo = new Map<string, Map<string, Node[]>>();
-  const methodsOf = (classId: string): Map<string, Node[]> => {
-    let byName = methodsMemo.get(classId);
-    if (byName) return byName;
-    byName = new Map();
-    for (const e of queries.getOutgoingEdges(classId, ['contains'])) {
-      const n = queries.getNodeById(e.target);
-      if (!n || n.kind !== 'method' || n.language !== 'python') continue;
-      const arr = byName.get(n.name);
-      if (arr) arr.push(n); else byName.set(n.name, [n]);
-    }
-    methodsMemo.set(classId, byName);
-    return byName;
-  };
-  const basesOf = (cls: Node): Node[] =>
-    queries.getOutgoingEdges(cls.id, ['extends'])
-      .map((e) => ({ e, base: queries.getNodeById(e.target) }))
-      .filter(({ e, base }) => !!base && base.kind === 'class' && base.language === 'python' && base.id !== cls.id &&
-        (base.filePath === cls.filePath ||
-          !GUESSED_SUPERTYPE.has(String((e.metadata as { resolvedBy?: string } | undefined)?.resolvedBy))))
-      .map(({ base }) => base!);
-  for (const cls of queries.iterateNodesByKind('class')) {
-    if ((++scanned & 63) === 0) await onYield();
-    if (cls.language !== 'python') continue;
-    const bases = basesOf(cls);
-    if (bases.length === 0) continue;
-    for (const [name, all] of methodsOf(cls.id)) {
-      const overrides = all.filter(isPythonDispatchMethod);
-      if (overrides.length === 0) continue;
-      // Breadth-first up the bases; a branch stops at its first declaration.
-      const visited = new Set<string>([cls.id]);
-      let frontier = bases;
-      for (let depth = 0; frontier.length && depth < 16; depth++) {
-        const next: Node[] = [];
-        for (const base of frontier) {
-          if (visited.has(base.id)) continue;
-          visited.add(base.id);
-          const declared = methodsOf(base.id).get(name);
-          if (!declared) { next.push(...basesOf(base)); continue; }
-          // The nearest declaration ends this branch even when it is static or a property.
-          for (const bm of declared.filter(isPythonDispatchMethod)) {
-            for (const m of overrides) {
-              const key = `${bm.id}>${m.id}`;
-              if (bm.id === m.id || seen.has(key)) continue;
-              seen.add(key);
-              edges.push({
-                source: bm.id,
-                target: m.id,
-                kind: 'calls',
-                line: bm.startLine,
-                provenance: 'heuristic',
-                metadata: { synthesizedBy: 'python-override', via: m.name, registeredAt: `${m.filePath}:${m.startLine}` },
-              });
-            }
-          }
-        }
-        frontier = next;
-      }
-    }
-  }
-  return edges;
-}
-
-/**
  * Go gRPC stub → impl bridge. The protoc-gen-go-grpc codegen emits an
  * `UnimplementedXxxServer` struct in `*_grpc.pb.go` carrying one method
  * per service RPC; the real handler is a hand-written struct in another
@@ -1639,6 +1727,18 @@ const JSX_CHILD_KINDS = new Set<NodeKind>(['component', 'function', 'class']);
  */
 const JSX_CHILD_LANGUAGES = [...JS_FAMILY, 'vue', 'svelte'];
 
+/**
+ * Whether a JSX tag can render `node` (`jsxChild`): a script's component,
+ * function or class named with a tag's capital, or any component, which a
+ * default import names under a name of its own. A tag in a file a sync never
+ * touched may name one the sync adds, so adding one redraws the JSX edges.
+ * (A `.vue` or `.svelte` file redraws them on any change.)
+ */
+export function isJsxChildCandidate(node: Pick<Node, 'kind' | 'name' | 'language'>): boolean {
+  return JSX_CHILD_KINDS.has(node.kind) && JS_FAMILY.includes(node.language) &&
+    (node.kind === 'component' || /^[A-Z]/.test(node.name));
+}
+
 function languageForJsxFile(file: string): Language {
   if (file.endsWith('.tsx')) return 'tsx';
   if (/\.[cm]?ts$/.test(file)) return 'typescript';
@@ -1661,6 +1761,19 @@ function importedFrom(ctx: ResolutionContext, file: string, language: Language):
 }
 
 /**
+ * Does `file` import `name` from a package outside the repository (`import {
+ * Button } from 'antd'`)? A package means one the file's package.json, or an
+ * enclosing one, declares, under a specifier no project file answers. That is
+ * the test the name matcher applies to calls and values. What such a name
+ * renders is the package's, never a project symbol that shares the name.
+ */
+function importedFromPackage(ctx: ResolutionContext, name: string, file: string): boolean {
+  const language = languageForJsxFile(file);
+  const binding = ctx.getImportMappings(file, language).find((m) => m.localName === name);
+  return !!binding && ctx.isOutOfRepoImport?.(binding.source, file, language) === true;
+}
+
+/**
  * The component a JSX tag names, among every node that shares the name.
  *
  * A tag is written in one file, and that file already says which `FrameCard` it
@@ -1674,8 +1787,11 @@ function importedFrom(ctx: ResolutionContext, file: string, language: Language):
  * another sheet.
  *
  * Same file first — a small component declared beside its use is the commonest
- * shape, and the one an import can never disambiguate. Then the file the name
- * is imported from. Then the language, which only decides a tie: a `.tsx` tag
+ * shape, and the one an import can never disambiguate. Then a name the file
+ * imports from a package: that package's component, which is no node here, so
+ * nothing. On SigNoz, antd's `<Button>` rendered the one project `Button` there
+ * was, a styled link in a 404 page's styles. Then the file the name is
+ * imported from. Then the language, which only decides a tie: a `.tsx` tag
  * naming both a TS component and a same-named Swift class means the TS one.
  */
 function jsxChild(
@@ -1685,6 +1801,9 @@ function jsxChild(
   importsOf: () => Map<string, string>
 ): Node | undefined {
   const candidates = ctx.getNodesByName(name).filter((n) => JSX_CHILD_KINDS.has(n.kind));
+  const local = candidates.find((n) => n.filePath === file);
+  if (local) return local;
+  if (importedFromPackage(ctx, name, file)) return undefined;
   if (candidates.length === 0) {
     // A name nothing declares is the file's DEFAULT import of a module's one
     // component under another name: segmented-control renders
@@ -1700,8 +1819,6 @@ function jsxChild(
     return components.length === 1 ? components[0] : undefined;
   }
   if (candidates.length === 1) return candidates[0];
-  const local = candidates.find((n) => n.filePath === file);
-  if (local) return local;
   const from = importsOf().get(name);
   if (from) {
     const imported = candidates.find((n) => n.filePath === from);
@@ -1913,17 +2030,22 @@ async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
       added++;
     };
     // Prefer a target in THIS SFC (handlers live in the same file's script) —
-    // avoids cross-file mis-match when a name repeats across a monorepo.
-    const resolve = (name: string, kinds: Set<string>): Node | undefined => {
+    // avoids cross-file mis-match when a name repeats across a monorepo. A name
+    // the SFC imports from a package (`import { NButton } from 'naive-ui'`) is
+    // the package's: no other project symbol, nor a Nuxt auto-imported
+    // component (`fallback`), is what it renders or calls.
+    const resolve = (name: string, kinds: Set<string>, fallback?: Node): Node | undefined => {
       const matches = ctx.getNodesByName(name).filter((n) => kinds.has(n.kind));
-      return matches.find((n) => n.filePath === file) ?? matches[0];
+      const local = matches.find((n) => n.filePath === file);
+      if (local || importedFromPackage(ctx, name, file)) return local;
+      return matches[0] ?? fallback;
     };
 
     let m: RegExpExecArray | null;
     VUE_KEBAB_RE.lastIndex = 0;
     while ((m = VUE_KEBAB_RE.exec(tpl))) {
       const tag = kebabToPascal(m[1]!);
-      addEdge(resolve(tag, COMPONENT_KINDS) ?? nuxtComponents.get(tag), { synthesizedBy: 'jsx-render', via: m[1] });
+      addEdge(resolve(tag, COMPONENT_KINDS, nuxtComponents.get(tag)), { synthesizedBy: 'jsx-render', via: m[1] });
     }
     // PascalCase component tags. Try a direct name match first (flat components
     // and explicit registrations), then the Nuxt dir-prefixed auto-import name
@@ -1931,7 +2053,7 @@ async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
     VUE_PASCAL_RE.lastIndex = 0;
     while ((m = VUE_PASCAL_RE.exec(tpl))) {
       const tag = m[1]!;
-      addEdge(resolve(tag, COMPONENT_KINDS) ?? nuxtComponents.get(tag), { synthesizedBy: 'jsx-render', via: tag });
+      addEdge(resolve(tag, COMPONENT_KINDS, nuxtComponents.get(tag)), { synthesizedBy: 'jsx-render', via: tag });
     }
     VUE_HANDLER_RE.lastIndex = 0;
     while ((m = VUE_HANDLER_RE.exec(tpl))) {
@@ -4339,7 +4461,6 @@ export const SYNTH_PASSES: SynthPassDef[] = [
     gate: (has) => has('java', 'kotlin', 'csharp', 'swift', 'scala', 'go', 'rust', 'arkts', ...JS_FAMILY),
     run: (q, _c, y) => interfaceOverrideEdges(q, y),
   },
-  { name: 'pythonOverrideEdges', gate: (has) => has('python'), run: (q, c, y) => pythonOverrideEdges(q, c, y) },
   { name: 'kotlinExpectActual', gate: (has) => has('kotlin'), run: (q, _c, y) => kotlinExpectActualEdges(q, y) },
   { name: 'goGrpcEdges', gate: (has) => has('go'), run: (q, _c, y) => goGrpcStubImplEdges(q, y) },
   { name: 'rnEventEdgesList', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => rnEventEdges(c, y) },
