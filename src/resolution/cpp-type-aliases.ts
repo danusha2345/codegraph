@@ -65,7 +65,7 @@ interface TypeName {
 }
 
 /** `SkipList<const char*, Cmp<int>>::Iterator` → `SkipList::Iterator`. */
-function stripTemplateArguments(text: string): string {
+export function stripCppTemplateArguments(text: string): string {
   let out = '';
   let depth = 0;
   for (const c of text) {
@@ -112,7 +112,7 @@ function cppTypeName(raw: string): TypeName | null {
 
 /** Is a written type a pointer (`Table*`, `const Foo* const`), not counting its template arguments? */
 export function isCppPointerType(raw: string): boolean {
-  return stripTemplateArguments(raw).includes('*');
+  return stripCppTemplateArguments(raw).includes('*');
 }
 
 /**
@@ -122,6 +122,23 @@ export function isCppPointerType(raw: string): boolean {
  */
 export function cppTypeSegments(raw: string): string[] | null {
   return cppTypeName(raw)?.names ?? null;
+}
+
+/**
+ * The top-level arguments of the first template argument list in a written
+ * type: `['Iterator']` for `const std::unique_ptr<Iterator>&`, `['Foo',
+ * 'Deleter<Foo>']` for `std::unique_ptr<Foo, Deleter<Foo>>`. Null when it has
+ * none, or the list is not closed.
+ */
+export function cppTemplateArguments(raw: string): string[] | null {
+  const open = raw.indexOf('<');
+  if (open < 0) return null;
+  let depth = 0;
+  for (let i = open; i < raw.length; i++) {
+    if (raw[i] === '<') depth++;
+    else if (raw[i] === '>' && --depth === 0) return splitTopLevel(raw.slice(open + 1, i)).map((a) => a.trim());
+  }
+  return null;
 }
 
 /** C and C++ declare the names a C++ file can see (a header may be either). */
@@ -336,7 +353,7 @@ function collectTemplateHeader(lines: readonly string[], startLine: number, star
   if (!header) return;
   for (const item of splitTopLevel(header[1]!)) {
     // `typename T = int`, `template <typename> class Policy`, `typename... Ts`, `int N`.
-    const declared = stripTemplateArguments(item).split('=')[0]!;
+    const declared = stripCppTemplateArguments(item).split('=')[0]!;
     const name = /([A-Za-z_]\w*)\s*$/.exec(declared)?.[1];
     if (name && name !== 'typename' && name !== 'class') names.add(name);
   }

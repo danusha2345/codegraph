@@ -58,7 +58,7 @@ import {
   createResolver,
   ResolutionResult,
 } from './resolution';
-import { hasSynthesisPattern } from './resolution/callback-synthesizer';
+import { hasSynthesisPattern, isJsxChildCandidate } from './resolution/callback-synthesizer';
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { findNamedCopybooks, type NamedCopybook } from './graph/cobol-copybooks';
 import { ContextBuilder, createContextBuilder } from './context';
@@ -986,6 +986,19 @@ export class CodeGraph {
             }
           });
 
+        // A component a tag in an unchanged file may render: `<Team />` links
+        // to the `Team` this sync adds. The gate above reads each changed file
+        // on its own, and a component with no markup of its own (`return null`,
+        // a wrapper) matches none of its patterns. Removing one needs no check:
+        // a component a tag rendered had synthesized edges into its file.
+        if (!refreshSynthesis && result.definitionDelta && result.changedFilePaths) {
+          const delta = new Set(result.definitionDelta);
+          if (this.queries.getNodesByFiles(result.changedFilePaths).some((n) => delta.has(n.name) && isJsxChildCandidate(n))) {
+            refreshSynthesis = true;
+            this.queries.setMetadata('synthesis_pending', '1');
+          }
+        }
+
         // Fold the store phase's WAL BEFORE the post-store reads below
         // (resolution reads on the main thread) — same rationale as
         // indexAll's fold between store and resolution.
@@ -1063,10 +1076,12 @@ export class CodeGraph {
             // own, which a reference written as a path
             // (`snippets/price.liquid`) waits under, and the keys a route's
             // lazily loaded module waits under (`module:Team` for
-            // `lazy-import:./pages/Team`): a route renders the component its
-            // module exports, so an edit can satisfy it as well as an added
-            // file. On a sync where no failed ref matches, this is one
-            // indexed lookup.
+            // `lazy-import:./pages/Team`), as does a reference through an
+            // import binding the module declares under another name
+            // (`module:tag` for `import tagsController from
+            // './tag/tag.controller'`): each resolves through the module, so
+            // an edit can satisfy it as well as an added file. On a sync
+            // where no failed ref matches, this is one indexed lookup.
             const tRetry = Date.now();
             const retryable = this.queries.getRetryableFailedReferences([...new Set([
               ...this.queries.getNodeNamesByFiles(result.changedFilePaths),
@@ -1222,6 +1237,18 @@ export class CodeGraph {
             }
           }
           if (before !== now) this.stampPythonRootFingerprint(now);
+        }
+
+        // The same for a route whose answer is read from a module: one that
+        // renders `const Docs = lazy(() => import('./pages/Docs'))` binds to
+        // the component the module exports, so it moves when the module is
+        // added or edited, though no name it carries changes.
+        if (filesChanged && result.changedFilePaths) {
+          const tModules = Date.now();
+          const reopened = this.resolver.reopenRouteModuleReaders(result.changedFilePaths);
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+            console.error(`[phase-timing] sync-route-modules: ${Date.now() - tModules}ms (${reopened} refs re-opened)`);
+          }
         }
 
         // Orphan sweep (#1187). A resolution pass that dies mid-run — the #850
