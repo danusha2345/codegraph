@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, GO_STDLIB_PACKAGES, matchGoAssertedCall, matchKotlinReceiverChain, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGoAssertedLocal } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, GO_STDLIB_PACKAGES, matchGoAssertedCall, matchKotlinReceiverChain, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGoAssertedLocal, isGoProjectLocalCall } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -2961,16 +2961,13 @@ export class ReferenceResolver {
       // may be called `errors`, `log` or `types` too.
       if (dotIdx > 0 && !this.isGoProjectPackage(ref, name.substring(0, dotIdx))) {
         const pkg = name.substring(0, dotIdx);
-        // Only when the file imports it: an unimported `ring` / `token` /
-        // `url` is a local variable (`func flush(ring *ringLog) { ring.Write(b) }`).
-        // And not a local bound from a type assertion that is named like one:
+        // Not a local bound from a type assertion that is named like one:
         // grpc-go's `parser.ParseConfig(…)` after `parser, ok :=
-        // b.(balancer.ConfigParser)`.
-        if (
-          GO_STDLIB_PACKAGES.has(pkg) &&
-          this.context.getImportMappings(ref.filePath, 'go').some((i) => i.localName === pkg) &&
-          !isGoAssertedLocal(pkg, ref, this.context)
-        ) {
+        // b.(balancer.ConfigParser)`. Nor a call on any other parameter or
+        // local of the name that can hold one of the project's values: gin's
+        // `context.AbortWithError(…)` in `func(context *Context)`.
+        if (GO_STDLIB_PACKAGES.has(pkg) && !isGoAssertedLocal(pkg, ref, this.context) &&
+            !isGoProjectLocalCall(ref, this.context)) {
           return true;
         }
       }
