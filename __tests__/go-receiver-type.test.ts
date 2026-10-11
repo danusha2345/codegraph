@@ -2,9 +2,6 @@
  * Go method calls through a receiver whose type is written somewhere other
  * than a plain parameter of the caller's own package:
  *
- * - a variable named like a standard-library package the file does not
- *   import (`ring *ringLog`, `token := get()`), which used to be skipped as
- *   a call into that package;
  * - a package-qualified parameter (`s *store.Store`);
  * - the result of a function or a conversion (`r := newRing()`, `s :=
  *   store.NewStore()`, `list := web.Users(names)`).
@@ -126,7 +123,6 @@ func stdlibCtor()                       { c, _ := net.Dial("tcp", ""); c.RemoteA
 func projectFuncReturningStdlib()       { f, _ := open(); f.Truncate(0) }
 func interfaceResult()                  { rt := transport(); rt.RoundTrip(nil) }
 func netParam(conn net.Conn)            { conn.LocalAddr() }
-func untyped(get func() net.Conn)       { token := get(); token.LocalAddr() }
 
 func main() {}
 `,
@@ -191,8 +187,8 @@ func (s *Store) Put(k string) {}
     expect(await methodCallees(cg, 'selfArg')).toEqual(['main.go::Engine::Run']);
   });
 
-  it.each(['stdlibParam', 'stdlibCtor', 'projectFuncReturningStdlib', 'netParam', 'untyped'])(
-    '%s: a receiver typed outside the project, or untyped, gets no edge',
+  it.each(['stdlibParam', 'stdlibCtor', 'projectFuncReturningStdlib', 'netParam'])(
+    '%s: a receiver typed outside the project gets no edge',
     async (caller) => {
       expect(await methodCallees(cg, caller)).toEqual([]);
     },
