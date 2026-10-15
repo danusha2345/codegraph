@@ -1016,6 +1016,8 @@ describe('Installer targets — partial-state idempotency', () => {
     refreshTargets([codex], 'global');
     codex.uninstall('global');
     expect(fs.readFileSync(file, 'utf8')).toBe(example);
+  });
+
   it('codex: an indented [mcp_servers.codegraph] is replaced, never duplicated (#2562)', () => {
     const codex = getTarget('codex')!;
     const tomlPath = path.join(tmpHome, '.codex', 'config.toml');
