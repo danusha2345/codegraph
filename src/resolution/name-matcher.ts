@@ -8367,7 +8367,10 @@ export function matchByExactName(
   // A member of the caller's own class (or what it inherits / is nested in)
   // is what the name means there, however far away it is declared.
   const member = matchEnclosingScopeMember(ref, candidates, context);
-  if (member) {
+  // C++ overloads of one free function in the caller's namespace are not the
+  // scope's to pick: the one the arguments fit, else the nearest, is chosen below.
+  if (member && !((ref.language === 'cpp' || ref.language === 'c') && member.kind === 'function' &&
+      candidates.some((c) => c !== member && c.qualifiedName === member.qualifiedName))) {
     return { original: ref, targetNodeId: member.id, confidence: 0.9, resolvedBy: 'exact-match' };
   }
 
