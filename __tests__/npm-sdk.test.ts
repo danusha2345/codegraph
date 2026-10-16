@@ -13,7 +13,7 @@
  * hermetically with no real bundle, network, or registry.
  */
 
-import { describe, it, expect, afterAll } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -23,11 +23,8 @@ const SDK_SRC = path.join(__dirname, '..', 'scripts', 'npm-sdk.js');
 const target = `${process.platform}-${process.arch}`;
 const VERSION = '9.9.9-test';
 
-// Every temp dir the file makes, removed once at the end.
+// Every temp dir a case makes, removed after it.
 const tmpDirs: string[] = [];
-afterAll(() => {
-  for (const dir of tmpDirs) fs.rmSync(dir, { recursive: true, force: true });
-});
 
 function mkTmp(label: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `cg-sdk-${label}-`));
@@ -83,6 +80,10 @@ function requireSdk(mainPkg: string, env: Record<string, string> = {}) {
 }
 
 describe('npm-sdk programmatic entry', () => {
+  afterEach(() => {
+    for (const dir of tmpDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('re-exports the installed platform bundle library', () => {
     const { root, mainPkg } = makeConsumer();
     installPlatformPackage(root, 'platform-lib');
