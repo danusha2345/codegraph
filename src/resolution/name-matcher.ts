@@ -8679,6 +8679,9 @@ function matchEnclosingScopeMember(
   if (!caller?.qualifiedName) return null;
   const receiver = callReceiverKind(ref, context);
   if (!receiver || (receiver === 'bare' && !implicit)) return null;
+  // A C++ parameter or local of that name — `std::function<void()> done,
+  // failed;` — is what a bare call calls, not a member (isCppLocalName).
+  if (receiver === 'bare' && ref.language === 'cpp' && isCppLocalName(ref.referenceName, caller, ref, context)) return null;
 
   const name = ref.referenceName;
   // One pass over the candidates, keyed by the type that declares each: a

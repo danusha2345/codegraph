@@ -87,8 +87,9 @@ describe('same-file exact-match confidence', () => {
   });
 
   it("leaves the proximity score for a sibling class's method", async () => {
-    write('x.cpp', 'struct A {\n  int run() { return 1; }\n};\nint go() { return run(); }\n');
-    write('pkg/other.cpp', 'int run() { return 2; }\n');
+    // The other `run` is one the file includes: C++ sees no other file's (#2684).
+    write('x.cpp', '#include "pkg/other.h"\nstruct A {\n  int run() { return 1; }\n};\nint go() { return run(); }\n');
+    write('pkg/other.h', 'inline int run() { return 2; }\n');
     const edge = (await calls()).find((e) => e.src === 'go' && e.tgt === 'run');
     expect(edge?.tgtQn).toBe('A::run');
     expect(edge?.confidence).toBe(0.4);
