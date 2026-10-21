@@ -3590,6 +3590,16 @@ function resolveRustPathReference(
   const leaf = segments[segments.length - 1]!;
   const modSegs = segments.slice(0, -1);
 
+  // A path whose head a `use` binds from the standard library — `error::Error`
+  // under `use std::{error, fmt, io};` — is std's, whatever the file around it
+  // is called: `error/mod.rs`'s own `Error` is not `std::error::Error`.
+  const head = modSegs[0]!;
+  if (!/^(?:crate|self|super)$/.test(head)) {
+    const usePath = rustUseBindings(ref.filePath, context).get(head, ref.line, ref.column);
+    const useSegs = usePath ? usePath.split('::').filter(Boolean) : [];
+    if (useSegs.length > 0 && RUST_STDLIB_ROOTS.has(useSegs[0]!) && resolveRustModuleFile(useSegs, ref.filePath, context) === null) return null;
+  }
+
   const file = resolveRustModuleFile(modSegs, ref.filePath, context);
   if (!file) return null;
 

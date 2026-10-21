@@ -1345,59 +1345,6 @@ export class CodeGraph {
           }
           }
 
-        // Python module answers this sync may have moved in files it never
-        // touched. If the root set changed (a top-level package appeared, a
-        // build config was edited) any import anywhere may bind differently:
-        // re-open them all. Otherwise only modules or packages appeared or
-        // vanished below the roots, and only the edges into those module
-        // names, out of a changed package, and the failures naming them can
-        // move. The orphan sweep below re-resolves whatever is re-opened
-        // exactly as a full index would. An index stamped by an older engine
-        // has no fingerprint — record one rather than re-resolving on upgrade.
-        {
-          const before = this.queries.getMetadata(PYTHON_ROOTS_METADATA_KEY);
-          const now = this.resolver.getPythonRootFingerprint();
-          if (before !== null && before !== now) {
-            this.resolver.clearCaches();
-            this.orchestrator.resurrectResolutionEdgesForLanguage('python');
-            // Any Python edge may move, so any synthesis built on one may too.
-            refreshSynthesis = true;
-            this.queries.setMetadata('synthesis_pending', '1');
-          } else if (before !== null) {
-            const after = this.pythonFilePaths();
-            const moved = [...after].filter((f) => !pythonFilesBefore.has(f));
-            for (const f of pythonFilesBefore) if (!after.has(f)) moved.push(f);
-            const reopened = new Set<string>();
-            if (moved.length > 0) {
-              this.resolver.clearCaches();
-              for (const f of this.orchestrator.resurrectResolutionEdgesTouching('python', this.resolver.getPythonReopenScope(moved))) reopened.add(f);
-            }
-            // An edited `__init__.py` can add, drop or repoint what its
-            // package binds, which moves what its importers' names resolve to.
-            const editedInits = (result.changedFilePaths ?? []).filter(
-              (f) => pythonFilesBefore.has(f) && after.has(f) && /(?:^|[\\/])__init__\.py$/.test(f)
-            );
-            if (editedInits.length > 0) {
-              this.resolver.clearCaches();
-              for (const f of this.orchestrator.resurrectPythonPackageImporters(this.resolver.getPythonPackageImporters(editedInits))) reopened.add(f);
-            }
-            // Resolve the narrow set now, the way the changed files' own
-            // references were resolved above, rather than leaving a handful of
-            // refs to the orphan sweep and its whole-graph synthesis pass.
-            if (reopened.size > 0) {
-              this.resolver.resolveAndPersist(this.queries.getUnresolvedReferencesByFiles([...reopened]));
-              // Same rule as the changed files above: a moved edge in a file
-              // synthesis read or wrote means synthesis must be rebuilt.
-              if (!refreshSynthesis && [...reopened].some((f) =>
-                this.queries.hasSynthesizedEdgesTouchingFile(f) || this.queries.wasSynthesisInput(f))) {
-                refreshSynthesis = true;
-                this.queries.setMetadata('synthesis_pending', '1');
-              }
-            }
-          }
-          if (before !== now) this.stampPythonRootFingerprint(now);
-        }
-
         // Orphan sweep (#1187). A resolution pass that dies mid-run — the #850
         // daemon liveness watchdog's SIGKILL (#1122), Ctrl-C, a crash — leaves
         // the refs it never reached in unresolved_refs, and the git-scoped fast
