@@ -22,6 +22,7 @@
  * tagged `provenance:'heuristic'`. See docs/design/callback-edge-synthesis.md.
  */
 import type { Edge, Language, Node, NodeKind } from '../types';
+import { workspaceMemberDirs } from './workspace-packages';
 import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
 import { isGeneratedFile } from '../extraction/generated-detection';
@@ -604,7 +605,7 @@ async function arkuiEmitterEdges(ctx: ResolutionContext, onYield: MaybeYield): P
 
   const moduleDirs = (() => {
     const ws = ctx.getWorkspacePackages?.();
-    return ws ? [...new Set(ws.byName.values())].sort((a, b) => b.length - a.length) : [];
+    return ws ? workspaceMemberDirs(ws) : [];
   })();
   const moduleScopeOf = (file: string): string => {
     for (const dir of moduleDirs) {
@@ -708,7 +709,7 @@ async function arkuiRouterEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
   const allFiles = ctx.getAllFiles();
   const moduleDirs = (() => {
     const ws = ctx.getWorkspacePackages?.();
-    return ws ? [...new Set(ws.byName.values())].sort((a, b) => b.length - a.length) : [];
+    return ws ? workspaceMemberDirs(ws) : [];
   })();
   const moduleScopeOf = (file: string): string => {
     for (const dir of moduleDirs) {
