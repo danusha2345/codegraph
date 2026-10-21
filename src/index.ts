@@ -60,7 +60,7 @@ import {
   ResolutionResult,
 } from './resolution';
 import { hasSynthesisPattern, isJsxChildCandidate } from './resolution/callback-synthesizer';
-import { createImportReader, reopenReferencesThroughAddedFiles, reopenReferencesThroughBarrels } from './resolution/module-importers';
+import { createImportReader, reopenReferencesThroughAddedFiles, reopenReferencesThroughBarrels, reopenReferencesThroughDeclaredPackages } from './resolution/module-importers';
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { findNamedCopybooks, type NamedCopybook } from './graph/cobol-copybooks';
 import { ContextBuilder, createContextBuilder } from './context';
@@ -1205,6 +1205,14 @@ export class CodeGraph {
               this.queries, importReader, [...seeds].map(([path, language]) => ({ path, language })), edgesBeforeResolution
             );
             if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-barrel-modules: ${Date.now() - tBarrels}ms (${throughBarrels} refs re-opened)`);
+
+            // A declaration file that declares a package itself (`declare
+            // module 'mammoth' { … }`): the files importing the package bound
+            // nothing through it while it was missing or lacked a name.
+            const declared = reopenReferencesThroughDeclaredPackages(
+              this.queries, importReader, this.projectRoot, result.changedFilePaths, edgesBeforeResolution
+            );
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS && declared > 0) console.error(`[phase-timing] sync-declared-packages: ${declared} refs re-opened`);
           } else {
             // No git info — use batched resolution to avoid OOM
             const unresolvedCount = this.queries.getUnresolvedReferencesCount();
@@ -1335,6 +1343,59 @@ export class CodeGraph {
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
             console.error(`[phase-timing] sync-route-modules: ${Date.now() - tModules}ms (${reopened} refs re-opened)`);
           }
+          }
+
+        // Python module answers this sync may have moved in files it never
+        // touched. If the root set changed (a top-level package appeared, a
+        // build config was edited) any import anywhere may bind differently:
+        // re-open them all. Otherwise only modules or packages appeared or
+        // vanished below the roots, and only the edges into those module
+        // names, out of a changed package, and the failures naming them can
+        // move. The orphan sweep below re-resolves whatever is re-opened
+        // exactly as a full index would. An index stamped by an older engine
+        // has no fingerprint — record one rather than re-resolving on upgrade.
+        {
+          const before = this.queries.getMetadata(PYTHON_ROOTS_METADATA_KEY);
+          const now = this.resolver.getPythonRootFingerprint();
+          if (before !== null && before !== now) {
+            this.resolver.clearCaches();
+            this.orchestrator.resurrectResolutionEdgesForLanguage('python');
+            // Any Python edge may move, so any synthesis built on one may too.
+            refreshSynthesis = true;
+            this.queries.setMetadata('synthesis_pending', '1');
+          } else if (before !== null) {
+            const after = this.pythonFilePaths();
+            const moved = [...after].filter((f) => !pythonFilesBefore.has(f));
+            for (const f of pythonFilesBefore) if (!after.has(f)) moved.push(f);
+            const reopened = new Set<string>();
+            if (moved.length > 0) {
+              this.resolver.clearCaches();
+              for (const f of this.orchestrator.resurrectResolutionEdgesTouching('python', this.resolver.getPythonReopenScope(moved))) reopened.add(f);
+            }
+            // An edited `__init__.py` can add, drop or repoint what its
+            // package binds, which moves what its importers' names resolve to.
+            const editedInits = (result.changedFilePaths ?? []).filter(
+              (f) => pythonFilesBefore.has(f) && after.has(f) && /(?:^|[\\/])__init__\.py$/.test(f)
+            );
+            if (editedInits.length > 0) {
+              this.resolver.clearCaches();
+              for (const f of this.orchestrator.resurrectPythonPackageImporters(this.resolver.getPythonPackageImporters(editedInits))) reopened.add(f);
+            }
+            // Resolve the narrow set now, the way the changed files' own
+            // references were resolved above, rather than leaving a handful of
+            // refs to the orphan sweep and its whole-graph synthesis pass.
+            if (reopened.size > 0) {
+              this.resolver.resolveAndPersist(this.queries.getUnresolvedReferencesByFiles([...reopened]));
+              // Same rule as the changed files above: a moved edge in a file
+              // synthesis read or wrote means synthesis must be rebuilt.
+              if (!refreshSynthesis && [...reopened].some((f) =>
+                this.queries.hasSynthesizedEdgesTouchingFile(f) || this.queries.wasSynthesisInput(f))) {
+                refreshSynthesis = true;
+                this.queries.setMetadata('synthesis_pending', '1');
+              }
+            }
+          }
+          if (before !== now) this.stampPythonRootFingerprint(now);
         }
 
         // Orphan sweep (#1187). A resolution pass that dies mid-run — the #850
@@ -1382,6 +1443,32 @@ export class CodeGraph {
           result.pendingRefsProcessed = recovery.stats.total;
           result.pendingRefsResolved = recovery.stats.resolved;
           result.pendingRefsUnresolved = recovery.stats.unresolved;
+        }
+
+        // Python attribute types read from OTHER files — a factory's return, a
+        // base class's `__init__` — change with a body-only edit the definition
+        // delta above cannot see. Re-open the edges whose answer was read from a
+        // touched file, and retry the failed attribute calls in files that
+        // import one; both resolve right here. After the orphan sweep, so the
+        // import edges this sync created (a caller whose `from f import make`
+        // only now resolves) are there to find the importers by.
+        if (process.env.CODEGRAPH_NO_REBIND !== '1') {
+          const touched = [...(result.changedFilePaths ?? []), ...(result.removedFilePaths ?? [])];
+          const touchedPy = touched.filter((p) => /\.pyi?$/.test(p));
+          if (touchedPy.length > 0) {
+            const tTypes = Date.now();
+            const reopenedFiles = this.orchestrator.resurrectTypeDependentEdges(touchedPy, result.changedFilePaths ?? []);
+            // CODEGRAPH_PY_ATTR_RETRY_CEILING overrides the candidate ceiling (tests).
+            const ceiling = Number(process.env.CODEGRAPH_PY_ATTR_RETRY_CEILING ?? '') || 2000;
+            const failed = this.resolver.pythonAttrRetryCandidates(touchedPy, ceiling);
+            const retry = [...this.queries.getUnresolvedReferencesByFiles(reopenedFiles), ...(failed ?? [])];
+            if (retry.length > 0) await this.resolver.resolveAndPersistListYielding(retry);
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+              console.error(
+                `[phase-timing] sync-type-rebind: ${Date.now() - tTypes}ms (${retry.length} refs${failed ? '' : ', failed-ref fan-in over ceiling'})`
+              );
+            }
+          }
         }
 
         if (filesChanged || orphanCount > 0) {

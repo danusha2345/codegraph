@@ -321,7 +321,7 @@ describe('Go standard method names on a receiver nothing types', () => {
 
   it.each([
     // `var ( query promql.Query )`, read past the table's `query string`;
-    // `Exec` is no standard name, and the declared type links it too.
+    // `Exec`, no standard name, is typed by that declaration too.
     ['runQueries', ['promql/engine.go::Query::Exec instance-method@0.9', 'promql/engine.go::Query::String instance-method@0.9']],
     // `version, _ := ParseVersion(…)` says no type, and the table's
     // `version string` is another declaration: nothing is ruled out.

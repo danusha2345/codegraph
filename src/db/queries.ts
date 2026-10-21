@@ -213,6 +213,11 @@ function rowToNode(row: NodeRow): Node {
 /**
  * Convert database row to Edge object
  */
+/** A failed python ref through one attribute (`self.c.send`) or a call receiver (`make().send`). */
+const FAILED_PY_ATTR_REF = `status = 'failed' AND language = 'python'
+  AND reference_name NOT GLOB '*.*.*.*'
+  AND (reference_name GLOB '*.*.*' OR reference_name GLOB '*().*')`;
+
 function rowToEdge(row: EdgeRow): Edge {
   return {
     source: row.source,
@@ -247,6 +252,28 @@ interface SearchFieldFilters {
   pathFilters?: string[];
   nameFilters?: string[];
 }
+
+/**
+ * Files ranked by edges between two of their own symbols — the input to
+ * `getDominantFile`. CROSS JOIN pins the loop order to edges first, then a
+ * lookup by id for each end: one pass over the edges whatever the statistics
+ * say. With a plain JOIN the planner may start from nodes and, for each node,
+ * walk every node in its file and probe edges by (source, target) — quadratic
+ * in nodes per file. Sampled stats (`analysis_limit` + `PRAGMA optimize`) can
+ * under-count nodes per file and pick that plan, and a few huge files (a
+ * generated R.java) then cost ~100 s (#2571). Ties go to the path, so the
+ * plan never decides between equal counts.
+ */
+export const DOMINANT_FILE_SQL = `
+  SELECT n.file_path AS file_path, COUNT(*) AS edge_count
+  FROM edges e
+  CROSS JOIN nodes n ON e.source = n.id
+  CROSS JOIN nodes m ON e.target = m.id
+  WHERE n.file_path = m.file_path
+  GROUP BY n.file_path
+  ORDER BY edge_count DESC, n.file_path
+  LIMIT 20
+`;
 
 /**
  * Query builder for the knowledge graph database
@@ -1187,16 +1214,8 @@ export class QueryBuilder {
       // protobuf stub) outranks the real `server/etcdserver/server.go`
       // (470 edges) by 4×, and the boost would push the agent toward
       // generated code.
-      this.stmts.getDominantFile = this.db.prepare(`
-        SELECT n.file_path AS file_path, COUNT(*) AS edge_count
-        FROM edges e
-        JOIN nodes n ON e.source = n.id
-        JOIN nodes m ON e.target = m.id
-        WHERE n.file_path = m.file_path
-        GROUP BY n.file_path
-        ORDER BY edge_count DESC
-        LIMIT 20
-      `);
+      // Edges-first and tie-broken by path on purpose: see DOMINANT_FILE_SQL (#2571).
+      this.stmts.getDominantFile = this.db.prepare(DOMINANT_FILE_SQL);
     }
     const rows = this.stmts.getDominantFile.all() as Array<{ file_path: string; edge_count: number }>;
     const generated = this.getGeneratedPathsAmong(rows.map(r => r.file_path));
@@ -4792,6 +4811,129 @@ export class QueryBuilder {
    * Replace resolution edges with their original unresolved references as one
    * transaction. If ref insertion fails, the edge deletion is rolled back.
    */
+  /**
+   * Resolution edges whose answer was read from other files
+   * (`metadata.typeFrom` — python attribute types, see
+   * `resurrectTypeDependentEdges`), with the source file context a
+   * resurrection needs. One scan; only python attribute calls carry the key.
+   */
+  getEdgesWithTypeFrom(): Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }> {
+    const rows = this.db
+      .prepare(
+        `SELECT e.*, src.file_path AS source_file_path, src.language AS source_language
+           FROM edges e
+           JOIN nodes src ON src.id = e.source
+          WHERE e.metadata LIKE '%"typeFrom"%'`
+      )
+      .all() as Array<EdgeRow & { source_file_path: string; source_language: Language }>;
+    return rows.map((row) => ({
+      ...rowToEdge(row),
+      edgeId: row.id,
+      sourceFilePath: row.source_file_path,
+      sourceLanguage: row.source_language,
+    }));
+  }
+
+  /**
+   * The python files whose failed attribute-chain refs (`self.client.send`,
+   * `make().send`) an edit to `filePaths` can affect. Such an answer is read
+   * only from files reached through imports — the owner class, its bases, a
+   * factory and the class it returns are each looked up through the imports
+   * of the file before — so these are the files that import a touched file,
+   * directly or within `depth` hops, and the touched files themselves.
+   */
+  getPythonImporterClosure(filePaths: string[], depth: number = 6): string[] {
+    const closure = new Set<string>(filePaths);
+    let frontier = [...filePaths];
+    for (let hop = 0; hop < depth && frontier.length > 0; hop++) {
+      const next: string[] = [];
+      for (let i = 0; i < frontier.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+        const chunk = frontier.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+        const placeholders = chunk.map(() => '?').join(',');
+        const rows = this.db
+          .prepare(
+            `SELECT DISTINCT src.file_path AS file_path
+               FROM edges e
+               JOIN nodes tgt ON tgt.id = e.target
+               JOIN nodes src ON src.id = e.source
+              WHERE e.kind = 'imports' AND tgt.file_path IN (${placeholders}) AND src.language = 'python'`
+          )
+          .all(...chunk) as Array<{ file_path: string }>;
+        for (const row of rows) {
+          if (!closure.has(row.file_path)) {
+            closure.add(row.file_path);
+            next.push(row.file_path);
+          }
+        }
+      }
+      frontier = next;
+    }
+    return [...closure];
+  }
+
+  /**
+   * The failed python attribute-chain refs — one attribute hop
+   * (`self.client.send`) or a call receiver (`make().send`) — in `filePaths`,
+   * as just the columns a sync needs to choose among them.
+   */
+  getFailedPythonAttrRefKeys(filePaths: string[]): Array<{ id: number; fromNodeId: string; referenceName: string; filePath: string }> {
+    // One scan, filtered here: a closure is often most of the project, and a
+    // `file_path IN (...)` per chunk re-runs the GLOB filters over every row.
+    const wanted = new Set(filePaths);
+    const rows = this.db
+      .prepare(`SELECT id, from_node_id, reference_name, file_path FROM unresolved_refs WHERE ${FAILED_PY_ATTR_REF}`)
+      .all() as Array<{ id: number; from_node_id: string; reference_name: string; file_path: string }>;
+    const out: Array<{ id: number; fromNodeId: string; referenceName: string; filePath: string }> = [];
+    for (const r of rows) {
+      if (wanted.has(r.file_path)) out.push({ id: r.id, fromNodeId: r.from_node_id, referenceName: r.reference_name, filePath: r.file_path });
+    }
+    return out;
+  }
+
+  /** Unresolved refs by row id. */
+  getUnresolvedReferencesByIds(ids: number[]): UnresolvedReference[] {
+    const rows: UnresolvedRefRow[] = [];
+    for (let i = 0; i < ids.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = ids.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const chunkRows = this.db
+        .prepare(`SELECT * FROM unresolved_refs WHERE id IN (${placeholders})`)
+        .all(...chunk) as UnresolvedRefRow[];
+      for (const row of chunkRows) rows.push(row);
+    }
+    return rows.map((row) => ({
+      fromNodeId: row.from_node_id,
+      referenceName: row.reference_name,
+      referenceKind: row.reference_kind as EdgeKind,
+      line: row.line,
+      column: row.col,
+      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path,
+      language: row.language as Language,
+      rowId: row.id,
+    }));
+  }
+
+  /**
+   * The python files with an edge of one of `kinds` into a node of `filePath`
+   * whose kind is one of `targetKinds` — who subclasses, calls or constructs
+   * what a file defines.
+   */
+  getPythonFilesWithEdgesInto(filePath: string, kinds: string[], targetKinds: string[]): string[] {
+    const kp = kinds.map(() => '?').join(',');
+    const tp = targetKinds.map(() => '?').join(',');
+    return (this.db
+      .prepare(
+        `SELECT DISTINCT src.file_path AS file_path
+           FROM edges e
+           JOIN nodes tgt ON tgt.id = e.target
+           JOIN nodes src ON src.id = e.source
+          WHERE tgt.file_path = ? AND e.kind IN (${kp}) AND tgt.kind IN (${tp})
+            AND src.language = 'python' AND src.file_path != ?`
+      )
+      .all(filePath, ...kinds, ...targetKinds, filePath) as Array<{ file_path: string }>).map((r) => r.file_path);
+  }
+
   replaceResolutionEdgesWithUnresolvedRefs(
     edgeIds: number[],
     refs: UnresolvedReference[]
