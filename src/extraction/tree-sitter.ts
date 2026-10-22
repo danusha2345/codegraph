@@ -17,7 +17,7 @@ import {
 } from '../types';
 import { getParser, detectLanguage, isLanguageSupported, isFileLevelOnlyLanguage } from './grammars';
 import { NodeIdAllocator, getNodeText, getChildByField, getPrecedingDocstring, BUILTIN_TYPE_NAMES } from './tree-sitter-helpers';
-import { FN_REF_SPECS, captureFnRefCandidates, type FnRefSpec, type FnRefCandidate } from './function-ref';
+import { FN_REF_SPECS, captureFnRefCandidates, goScopedFnRefScopes, type FnRefSpec, type FnRefCandidate } from './function-ref';
 import { isGeneratedFile, isMinifiedContent } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
@@ -26,7 +26,7 @@ import { NestedIntervals, scanCppBraceScopes, type CppBraceScopes } from './lang
 import { appendCppMacroMethods } from './languages/cpp-macro-methods';
 import { rustImplItemOwner, rustImplTypeName } from './languages/rust';
 import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
-import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeRefs } from './languages/dart';
+import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeAliasRefs, pushDartTypeRefs } from './languages/dart';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -750,7 +750,9 @@ export class TreeSitterExtractor {
   // during the walk, gated & flushed into unresolvedReferences at end-of-file
   // (see flushFnRefCandidates).
   private fnRefSpec: FnRefSpec | undefined;
-  private fnRefCandidates: Array<FnRefCandidate & { fromNodeId: string }> = [];
+  // A Go candidate also keeps the value container it came from: the flush
+  // reads its scope from there when the function shadows the name (#2596).
+  private fnRefCandidates: Array<FnRefCandidate & { fromNodeId: string; goNode?: SyntaxNode }> = [];
   // Memoized "is this a Vue store file" verdict (per-extractor = per-file).
   private vueStoreFile: boolean | null = null;
   // An object literal hung on a path (`window.App = {…}`, `ns.mod = {…}`) is
@@ -763,6 +765,9 @@ export class TreeSitterExtractor {
   // point (this instance is the wasm fallback for a kernel-deferred file) —
   // don't blank it a second time.
   private sourceIsPreParsed = false;
+  // The source as the file has it, kept when this instance's preParse changed
+  // it, for an extractor whose signatures read it (`signatureAsWritten`).
+  private sourceAsWritten: string | null = null;
 
   constructor(
     filePath: string,
@@ -776,6 +781,11 @@ export class TreeSitterExtractor {
     this.extractor = EXTRACTORS[this.language] || null;
     this.fnRefSpec = FN_REF_SPECS[this.language];
     this.sourceIsPreParsed = options?.sourceIsPreParsed === true;
+  }
+
+  /** The text `getSignature` reads: the source as written when the extractor asks for it. */
+  private get signatureSource(): string {
+    return this.sourceAsWritten ?? this.source;
   }
 
   /**
@@ -827,7 +837,9 @@ export class TreeSitterExtractor {
       // saw (identical outside the blanked directive lines). Skipped when the
       // kernel route point already applied it (sourceIsPreParsed).
       if (this.extractor?.preParse && !this.sourceIsPreParsed) {
-        this.source = this.extractor.preParse(this.source, this.filePath);
+        const preParsed = this.extractor.preParse(this.source, this.filePath);
+        if (preParsed !== this.source && this.extractor.signatureAsWritten) this.sourceAsWritten = this.source;
+        this.source = preParsed;
       }
       this.tree = parser.parse(this.source) ?? null;
       if (!this.tree) {
@@ -946,8 +958,9 @@ export class TreeSitterExtractor {
     if (!rule || this.nodeStack.length === 0) return;
     const fromNodeId = this.nodeStack[this.nodeStack.length - 1];
     if (!fromNodeId) return;
+    const goNode = this.language === 'go' ? node : undefined;
     for (const cand of captureFnRefCandidates(node, rule, spec, this.source)) {
-      this.fnRefCandidates.push({ ...cand, fromNodeId });
+      this.fnRefCandidates.push({ ...cand, fromNodeId, goNode });
     }
   }
 
@@ -1042,7 +1055,7 @@ export class TreeSitterExtractor {
 
     const ungated = this.fnRefSpec?.ungatedModes;
     const addressOfOnly = this.fnRefSpec?.addressOfOnly === true;
-    const seen = new Set<string>();
+    const survivors: typeof candidates = [];
     for (const c of candidates) {
       const atFileScope = c.fromNodeId.startsWith('file:');
       // C++ (addressOfOnly): a BARE identifier qualifies only inside a
@@ -1080,7 +1093,18 @@ export class TreeSitterExtractor {
           continue;
         }
       }
-      const key = `${c.fromNodeId}|${c.name}`;
+      survivors.push(c);
+    }
+
+    // One reference per function and name, at its first use. In Go, a
+    // function that binds the name itself gets one per scope instead (#2596):
+    // its first use may be the local, which resolution drops, while a later
+    // use in another scope is the package function.
+    const goScopes = this.language === 'go' ? goScopedFnRefScopes(survivors, this.source) : null;
+    const seen = new Set<string>();
+    for (const c of survivors) {
+      const scope = goScopes?.get(c);
+      const key = scope === undefined ? `${c.fromNodeId}|${c.name}` : `${c.fromNodeId}|${c.name}|${scope}`;
       if (seen.has(key)) continue;
       seen.add(key);
       this.unresolvedReferences.push({
@@ -2164,7 +2188,7 @@ export class TreeSitterExtractor {
     }
 
     const docstring = this.docstringFor(node);
-    const signature = this.extractor.getSignature?.(node, this.source);
+    const signature = this.extractor.getSignature?.(node, this.signatureSource);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = commonJsExport || this.extractor.isExported?.(node, this.source);
     const isAsync = this.extractor.isAsync?.(node);
@@ -2525,7 +2549,7 @@ export class TreeSitterExtractor {
     }
 
     const docstring = this.docstringFor(node);
-    const signature = this.extractor.getSignature?.(node, this.source);
+    const signature = this.extractor.getSignature?.(node, this.signatureSource);
     const visibility = this.extractor.getVisibility?.(node);
     const isAsync = this.extractor.isAsync?.(node);
     const isStatic = this.extractor.isStatic?.(node);
@@ -4102,7 +4126,7 @@ export class TreeSitterExtractor {
     docstring?: string
   ): void {
     if (!this.extractor) return;
-    const signature = this.extractor.getSignature?.(node, this.source);
+    const signature = this.extractor.getSignature?.(node, this.signatureSource);
     const extra: Partial<Node> = { docstring, signature };
     if (receiver) extra.qualifiedName = this.composeReceiverQualifiedName(receiver, name);
     else extra.isExported = this.extractor.isExported?.(node, this.source);
@@ -4274,6 +4298,12 @@ export class TreeSitterExtractor {
             column: type.startPosition.column,
           });
         }
+      } else if (this.language === 'dart') {
+        // A Dart typedef has no fields either: the type it aliases is the
+        // rest of the declaration, `void Function(Report r)` in `typedef
+        // ReportCallback = void Function(Report r);`, or a legacy one's
+        // return and parameter types (#2327).
+        pushDartTypeAliasRefs(node, typeAliasNode.id, (ref) => this.unresolvedReferences.push(ref));
       }
     }
     return false;
@@ -4299,7 +4329,7 @@ export class TreeSitterExtractor {
       const mname = getNodeText(nameNode, this.source);
       if (mname) {
         const methodNode = this.createNode('method', mname, m, {
-          signature: this.extractor?.getSignature?.(m, this.source),
+          signature: this.extractor?.getSignature?.(m, this.signatureSource),
         });
         if (methodNode) {
           for (const type of goInterfaceMethodTypeNames(m, decl, this.source)) {
@@ -8563,7 +8593,7 @@ export class TreeSitterExtractor {
     // free routines, so there's no duplicate.
     if (!parentId && !fullName.includes('.')) {
       const fnNode = this.createNode('function', fullName, declProc, {
-        signature: this.extractor?.getSignature?.(declProc, this.source),
+        signature: this.extractor?.getSignature?.(declProc, this.signatureSource),
         visibility: this.extractor?.getVisibility?.(declProc),
       });
       if (fnNode) {
@@ -8588,9 +8618,13 @@ export class TreeSitterExtractor {
   }
 
   /**
-   * Extract function calls from a Pascal expression
+   * Extract function calls from a Pascal expression. A `receiverLink` call is
+   * a link inside another call's receiver chain (#2547): it is recorded only
+   * when it can be named precisely — `Obj.Method`, a bare routine, or a
+   * `TFoo.Factory().Method` chain — never as the bare method name a longer
+   * chain like `Client.New.BaseURL(…)` would leave, which matches namesakes.
    */
-  private extractPascalCall(node: SyntaxNode): void {
+  private extractPascalCall(node: SyntaxNode, receiverLink = false): void {
     if (this.nodeStack.length === 0) return;
     const callerId = this.nodeStack[this.nodeStack.length - 1];
     if (!callerId) return;
@@ -8641,7 +8675,8 @@ export class TreeSitterExtractor {
       calleeName = getNodeText(firstChild, this.source);
     }
 
-    if (calleeName) {
+    const vagueLink = receiverLink && firstChild.type === 'exprDot' && !calleeName.includes('.');
+    if (calleeName && !vagueLink) {
       this.unresolvedReferences.push({
         fromNodeId: callerId,
         referenceName: calleeName,
@@ -8651,6 +8686,12 @@ export class TreeSitterExtractor {
       });
     }
 
+    // The calls in the callee itself: a chained call's receiver, like
+    // `MD5FileSized(…)` in `MD5FileSized(…).IsSame(AKey)` (#2547), or the call
+    // whose result is called in `GetHandler()(X)`.
+    if (firstChild.type === 'exprDot') this.extractPascalReceiverCalls(firstChild.namedChild(0));
+    else if (firstChild.type !== 'identifier') this.extractPascalReceiverCalls(firstChild);
+
     // Also visit arguments for nested calls
     const args = node.namedChildren.find(
       (c: SyntaxNode) => c.type === 'exprArgs'
@@ -8658,6 +8699,46 @@ export class TreeSitterExtractor {
     if (args) {
       this.visitPascalBlock(args);
     }
+  }
+
+  /**
+   * The calls inside the receiver of a Pascal call or member access, which
+   * the outer reference doesn't cover (#2547): `MD5FileSized(…)` and the
+   * `TMeta.ExtendedPath(APath)` in its arguments for
+   * `MD5FileSized(TMeta.ExtendedPath(APath)).IsSame(AKey)`, `A(1)` in
+   * `A(1).B.C`, `GetIndex(x)` in `List[GetIndex(x)].Free`. A paren'd call
+   * there is a call like any other. A paren-less link (`.B`) may read a field
+   * or property, so it is not one. A typecast (`TButton(Sender)`) is written
+   * like a call; resolution tells it apart by what the name resolves to.
+   */
+  private extractPascalReceiverCalls(node: SyntaxNode | null): void {
+    if (!node) return;
+    switch (node.type) {
+      case 'identifier':
+        return;
+      case 'exprCall':
+        this.extractPascalReceiverCall(node, true);
+        return;
+      case 'exprDot':
+      case 'exprTpl':
+        this.extractPascalReceiverCalls(node.namedChild(0));
+        return;
+      case 'exprSubscript': {
+        this.extractPascalReceiverCalls(node.namedChild(0));
+        const index = node.namedChildren.find((c: SyntaxNode) => c.type === 'exprArgs');
+        if (index) this.visitPascalBlock(index);
+        return;
+      }
+      default:
+        this.visitPascalBlock(node);
+    }
+  }
+
+  /** A receiver call, read as any call is, its arguments' routine values included (#756). */
+  private extractPascalReceiverCall(call: SyntaxNode, receiverLink: boolean): void {
+    this.extractPascalCall(call, receiverLink);
+    const args = call.namedChildren.find((c: SyntaxNode) => c.type === 'exprArgs');
+    if (args) this.maybeCaptureFnRefs(args, 'exprArgs');
   }
 
   /**
@@ -8699,10 +8780,11 @@ export class TreeSitterExtractor {
       if (innerCallee && /^[TI][A-Z]/.test(innerCallee)) {
         calleeName = `${innerCallee}().${method}`;
         // The T/I-prefixed inner is itself a real call — record it too.
-        if (receiver.type === 'exprCall') this.extractPascalCall(receiver);
+        if (receiver.type === 'exprCall') this.extractPascalReceiverCall(receiver, false);
         else this.extractPascalParenlessCall(receiver);
       } else {
         calleeName = method; // non-class receiver: a bare method ref (no field-access ref)
+        this.extractPascalReceiverCalls(receiver); // `MD5FileSized(…).Reset;` (#2547)
       }
     } else {
       // Simple: `Obj.Method` → the dotted name (resolves via the receiver / bare name).
@@ -8710,6 +8792,7 @@ export class TreeSitterExtractor {
         .filter((c: SyntaxNode) => c.type === 'identifier')
         .map((id: SyntaxNode) => getNodeText(id, this.source))
         .join('.');
+      this.extractPascalReceiverCalls(receiver); // `List[GetIndex(x)].Free;`
     }
 
     if (calleeName) {
@@ -8744,16 +8827,15 @@ export class TreeSitterExtractor {
         // A STATEMENT-level bare exprDot is a paren-less call (`Obj.Free;`,
         // `TFoo.GetInstance.DoIt;`). Anywhere else (assignment side, condition,
         // expression) a bare exprDot is ambiguous with a field/property access,
-        // so there we only descend for paren'd inner calls.
+        // so there we only read the paren'd calls in its receiver chain
+        // (`X := A(1).B.C` reads `A(1)`); a call right before the read is
+        // named as any call is.
         if (node.type === 'statement') {
           this.extractPascalParenlessCall(child);
         } else {
-          for (let j = 0; j < child.namedChildCount; j++) {
-            const grandchild = child.namedChild(j);
-            if (grandchild?.type === 'exprCall') {
-              this.extractPascalCall(grandchild);
-            }
-          }
+          const receiver = child.namedChild(0);
+          if (receiver?.type === 'exprCall') this.extractPascalReceiverCall(receiver, false);
+          else this.extractPascalReceiverCalls(receiver);
         }
       } else {
         this.visitPascalBlock(child);

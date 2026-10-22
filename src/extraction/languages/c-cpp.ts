@@ -1151,53 +1151,20 @@ export function maskCppRawStrings(source: string): { source: string; restore: (b
  *    an operator (`MAKE(a) + 1`) — all rejected. String/char literals inside the
  *    args are skipped so an embedded `)` can't mis-close the balance.
  *
- * A blanked macro inside a block comment is harmless (comments don't parse), and
- * the rare line-leading no-semicolon ALL-CAPS call that isn't markup only loses
- * that one annotation, never a whole class.
+ * C runs it too (redis's `REDIS_NO_SANITIZE("bounds")` above a definition),
+ * with `keepCReturnTypes`: there a macro that wraps the return type of the
+ * function declared after it is no markup, it IS the type — cJSON's
+ * `CJSON_PUBLIC(char *) cJSON_Print(const cJSON *item)`, libgit2's
+ * `GIT_EXTERN(int) git_blob_dup(…);` — and tree-sitter-c reads it as one (a
+ * `macro_type_specifier`). Blanked with its argument, it left `cJSON_Print(…)`
+ * and a block, which parse as a call: the function had no node (#2470). See
+ * isCReturnTypeMacro for how such a macro is told from markup.
  *
- * C runs it too, with `keepCReturnTypeMacros`: there a macro at column 0 that
- * wraps a type and is followed by nothing but a function's declarator IS the
- * return type — cJSON's `CJSON_PUBLIC(char *) cJSON_Print(const cJSON *item)`,
- * an `EXPORT(int) version(void);` — and tree-sitter-c reads it as one (a
- * `macro_type_specifier`). Blanked, it left `cJSON_Print(…)` and a free block,
- * which parse as a call: the function had no node (#2470). Only where the
- * declaration starts, though: jemalloc's `size_t JEMALLOC_NOTHROW\n
- * JEMALLOC_ATTR(pure)\n je_sallocx(…) {` has its type on the line above, and
- * that macro is the attribute it looks like.
+ * A blanked macro inside a block comment is harmless (comments don't parse),
+ * and the rare line-leading no-semicolon ALL-CAPS call that isn't markup only
+ * loses that one annotation, never a whole class.
  */
-const C_RETURN_TYPE_MACRO_ARG_RE = /^\s*[A-Za-z_][\w\s*]*$/;
-const C_FUNCTION_DECLARATOR_HEAD_RE = /[A-Za-z_]\w*[ \t]*\(/y;
-
-/** Whether the code line above `at` leaves a declaration open: it ends in a type's last token. */
-function continuesCDeclaration(source: string, at: number): boolean {
-  let end = at;
-  while (end > 0) {
-    const start = source.lastIndexOf('\n', end - 2) + 1;
-    const line = source.slice(start, end).trim();
-    end = start;
-    if (line === '') continue;
-    return !/^(?:#|\/\/)/.test(line) && /[\w*]$/.test(line);
-  }
-  return false;
-}
-
-/** Whether `name(…)` at `at` is all that stands before a `{` or a `;`: a function's declarator. */
-function isBareCFunctionDeclarator(source: string, at: number): boolean {
-  C_FUNCTION_DECLARATOR_HEAD_RE.lastIndex = at;
-  const head = C_FUNCTION_DECLARATOR_HEAD_RE.exec(source);
-  if (!head) return false;
-  let depth = 0;
-  for (let i = at + head[0].length - 1; i < source.length; i++) {
-    const c = source[i];
-    if (c === '(') depth++;
-    else if (c === ')') {
-      if (--depth === 0) return /^\s*[{;]/.test(source.slice(i + 1, i + 200));
-    } else if (c === ';' || c === '{' || c === '}') return false;
-  }
-  return false;
-}
-
-export function blankCppAnnotationMacroCalls(source: string, keepCReturnTypeMacros = false): string {
+export function blankCppAnnotationMacroCalls(source: string, options: { keepCReturnTypes?: boolean } = {}): string {
   if (!/^[ \t]*[A-Z][A-Z0-9_]{2,}\s*\(/m.test(source)) return source;
   const rawStrings = maskCppRawStrings(source);
   source = rawStrings.source;
@@ -1234,14 +1201,68 @@ export function blankCppAnnotationMacroCalls(source: string, keepCReturnTypeMacr
     // Only markup is followed by the declaration it decorates; a statement call
     // (`;`), init-list item (`,`/`{`), or expression fragment (operator) is not.
     if (!after || !/[A-Za-z_~#]/.test(after)) continue;
-    if (keepCReturnTypeMacros && macroStart === m.index && C_RETURN_TYPE_MACRO_ARG_RE.test(source.slice(open + 1, end - 1)) &&
-        isBareCFunctionDeclarator(source, j) && !continuesCDeclaration(source, m.index)) continue;
+    if (options.keepCReturnTypes && macroStart === m.index && isCReturnTypeMacro(source, m.index, open, end, j)) continue;
     for (let k = macroStart; k < end; k++) {
       if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
     }
     re.lastIndex = end;
   }
   return rawStrings.restore(chars.join(''));
+}
+
+/** A macro argument that reads as a C type: `char *`, `const cJSON *`, `unsigned long`, `git_repository *`. */
+const C_RETURN_TYPE_ARG_RE = /^\s*[A-Za-z_][\w\s*]*$/;
+/** A function declarator's name and the `(` of its parameter list. */
+const C_DECLARATOR_HEAD_RE = /[A-Za-z_]\w*\s*\(/y;
+/**
+ * What may end a function declarator: attributes (`__attribute__((format(printf, 1, 2)))`,
+ * an ALL-CAPS attribute macro, with or without arguments), then the body's `{` or a prototype's `;`.
+ */
+const C_DECLARATOR_TAIL_RE = /\s*(?:(?:__attribute__\s*\(\((?:[^()]|\([^()]*\))*\)\)|[A-Z][A-Z0-9_]*(?![\w$])(?:\s*\((?:[^()]|\([^()]*\))*\))?)\s*)*[{;]/y;
+
+/**
+ * Whether the column-0 macro call `MACRO(…)` starting at `lineStart` (its
+ * argument list from `open` to `end`, the next code at `next`) is the return
+ * type of the function declared right after it, not markup:
+ *  - its one argument reads as a type, so `ATTR_FORMAT(1, 2)` and
+ *    `REDIS_NO_SANITIZE("bounds")` are markup;
+ *  - only the function's declarator follows: a name, its parameter list,
+ *    attributes, then `{` or `;`. Markup is followed by a declaration with a
+ *    type of its own (`ATTR(x) void f(void);`);
+ *  - the line above leaves no declaration open. jemalloc writes the type
+ *    there: `size_t JEMALLOC_NOTHROW\nJEMALLOC_ATTR(pure)\nje_sallocx(…) {`,
+ *    and that macro is the attribute it looks like.
+ * Column 0 is where a file-scope declaration starts; an indented statement
+ * prefix in a body (`FOREACH(n) visit(n);`) is no return type.
+ */
+function isCReturnTypeMacro(source: string, lineStart: number, open: number, end: number, next: number): boolean {
+  if (!C_RETURN_TYPE_ARG_RE.test(source.slice(open + 1, end - 1))) return false;
+  C_DECLARATOR_HEAD_RE.lastIndex = next;
+  const head = C_DECLARATOR_HEAD_RE.exec(source);
+  if (!head) return false;
+  let close = -1;
+  let depth = 0;
+  for (let i = next + head[0].length - 1; i < source.length && close < 0; i++) {
+    const c = source[i];
+    if (c === '(') depth++;
+    else if (c === ')') { if (--depth === 0) close = i; }
+    else if (c === ';' || c === '{' || c === '}') return false;
+  }
+  if (close < 0) return false;
+  C_DECLARATOR_TAIL_RE.lastIndex = close + 1;
+  return C_DECLARATOR_TAIL_RE.test(source) && !opensCDeclaration(source, lineStart);
+}
+
+/**
+ * Whether the line right above `lineStart` leaves a declaration open: its
+ * code ends in a type's last token (`unsigned long`, `char *`, `size_t
+ * JEMALLOC_NOTHROW`). A blank line, a directive, or a comment closes none.
+ */
+function opensCDeclaration(source: string, lineStart: number): boolean {
+  if (lineStart === 0) return false;
+  const from = source.lastIndexOf('\n', lineStart - 2) + 1;
+  const line = source.slice(from, lineStart - 1).replace(/\/\/.*$/, '').trim();
+  return line !== '' && !line.startsWith('#') && /[\w*]$/.test(line);
 }
 
 /**
@@ -2672,7 +2693,7 @@ function preParseCSource(source: string): string {
                 )
               )
             ),
-            true
+            { keepCReturnTypes: true }
           )
         )
       )

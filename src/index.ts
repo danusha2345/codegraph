@@ -408,9 +408,19 @@ export class CodeGraph {
       throw new Error(`Invalid CodeGraph directory: ${validation.errors.join(', ')}`);
     }
 
-    // Open database
+    // Open database. The secondary indexes an interrupted bulk load dropped are
+    // rebuilt off this thread, and finished before the instance is returned
+    // (#1887): rebuilt in line on a large index, they blocked the thread longer
+    // than the liveness watchdog allows, and every restart was killed the same
+    // way.
     const dbPath = getDatabasePath(resolvedRoot);
-    const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly });
+    const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly, deferIndexRecovery: true });
+    try {
+      await db.recoverIndexesOffThread();
+    } catch (err) {
+      db.close();
+      throw err;
+    }
     const queries = new QueryBuilder(db.getDb());
 
     const instance = new CodeGraph(db, queries, resolvedRoot);
@@ -477,9 +487,14 @@ export class CodeGraph {
   }
 
   /**
-   * Open synchronously (without sync)
+   * Open synchronously (without sync).
+   *
+   * `deferIndexRecovery` leaves the secondary indexes an interrupted bulk load
+   * dropped for {@link recoverIndexes} to rebuild off this thread, instead of
+   * rebuilding them here (#1887): for a caller on a watched event loop, which
+   * then awaits {@link recoverIndexes} before it relies on the project.
    */
-  static openSync(projectRoot: string, options: Pick<OpenOptions, 'readOnly'> = {}): CodeGraph {
+  static openSync(projectRoot: string, options: Pick<OpenOptions, 'readOnly'> & { deferIndexRecovery?: boolean } = {}): CodeGraph {
     const resolvedRoot = path.resolve(projectRoot);
 
     // Check if initialized
@@ -495,10 +510,26 @@ export class CodeGraph {
 
     // Open database
     const dbPath = getDatabasePath(resolvedRoot);
-    const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly });
+    const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly, deferIndexRecovery: options.deferIndexRecovery });
     const queries = new QueryBuilder(db.getDb());
 
     return new CodeGraph(db, queries, resolvedRoot);
+  }
+
+  /**
+   * Rebuild, on a worker thread, the secondary indexes an interrupted bulk
+   * load dropped and `openSync({ deferIndexRecovery: true })` left (#1887).
+   * Resolves at once when nothing is left, which is every open but the first
+   * after such an interruption; rejects when the rebuild fails, and the next
+   * call tries again. Reads stay correct meanwhile, only slower.
+   */
+  recoverIndexes(): Promise<void> {
+    return this.db.recoverIndexesOffThread();
+  }
+
+  /** Whether {@link recoverIndexes} still has indexes to rebuild. */
+  hasPendingIndexRecovery(): boolean {
+    return this.db.hasDeferredIndexRecovery();
   }
 
   /**
@@ -2186,6 +2217,14 @@ export class CodeGraph {
   /** Lexical evidence for an empty explore result; does not alter retrieval. */
   getExploreMissDiagnostics(query: string) {
     return this.queries.getExploreMissDiagnostics(query);
+  }
+
+  /**
+   * Which of `names` the index has never seen, by name, path, signature or
+   * docstring — the names explore reports as not in the index (#2462).
+   */
+  getUnseenNames(names: readonly string[]): string[] {
+    return this.queries.getUnseenNames(names);
   }
 
   /**
