@@ -220,9 +220,8 @@ export class CodeGraph {
     // CodeGraph per root for its whole lifetime, so editing `codegraph.json`
     // would appear to do nothing until the process restarted — `exclude` and
     // `include` do not behave that way. `loadDeprioritizePatterns` is
-    // mtime-cached, so this costs one `stat` per ranking pass (a pass takes
-    // one predicate for all its candidates, #2184); the compiled matcher is
-    // memoized on the pattern array's identity, which the cache keeps stable.
+    // mtime-cached, so this costs one `stat`; the compiled matcher is memoized
+    // on the pattern array's identity, which the cache keeps stable.
     let cachedPatterns: string[] | undefined;
     let cachedMatcher: ReturnType<typeof ignore> | undefined;
     // The compiled matcher for the patterns `codegraph.json` holds right now,
