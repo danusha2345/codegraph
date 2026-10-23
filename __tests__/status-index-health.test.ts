@@ -5,10 +5,9 @@
  * "Up to date" used to mean only "every file's content hash matches the
  * index". Two kinds of file pass that check with nothing usable in the graph:
  *
- *   - a file the parser could not read — a statement the grammar has no rule
- *     for (the report was TypeScript 5.0's `export type * from`, since given
- *     one in #2474; here a malformed `export`), so the file is stored with a
- *     parse error and no symbols (#2336);
+ *   - a file the parser could not read, like one left with merge-conflict
+ *     markers, which is stored with a parse error and no symbols (#2336; the
+ *     report's file, TypeScript 5.0's `export type * from`, parses since #2474);
  *   - a row stored without its symbols — by an engine whose grammar failed to
  *     load (#2335), or the #1541 wipe — which `codegraph sync` re-indexes.
  *
@@ -97,7 +96,12 @@ describe('status reports files indexed without their symbols (#2336, #2335)', ()
   it('a file the parser could not read keeps status from reporting "up to date"', async () => {
     fs.writeFileSync(
       path.join(dir, 'src', 'index.ts'),
-      'export * from "./constants/index.js";\nexport const = ;\n'
+      'export * from "./constants/index.js";\n' +
+        '<<<<<<< HEAD\n' +
+        'export type { Row } from "./types/database.js";\n' +
+        '=======\n' +
+        'export type { RowId } from "./types/database.js";\n' +
+        '>>>>>>> feature\n'
     );
     await index();
 
