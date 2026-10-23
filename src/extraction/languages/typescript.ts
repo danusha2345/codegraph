@@ -69,14 +69,30 @@ export function blankFlowSyntax(source: string, filePath?: string): string {
     .replace(/\.\.\.(?=\s*[},])/g, '   ');
 }
 
+/** Whether the file writes `export type *` anywhere: most files don't, and skip the rest. */
+const EXPORT_TYPE_STAR_HINT = /export\s+type\s*\*/;
 /**
- * `export type * from './types'` and `export type * as ns from './types'`
- * (TypeScript 5.0) are not in the grammar: `type` is an error there, and a
- * barrel made only of such lines parses to nothing. With `type` blanked to
- * spaces (offsets survive) each reads as the `export *` it is to the graph.
+ * `export type *` where a statement starts (a line's first word, or after `;`,
+ * `{`, `}` or the end of a block comment), followed by `from` or `as`.
+ */
+const EXPORT_TYPE_STAR = /(^|[;{}]|\*\/)([ \t]*export\s+)type(?=\s*\*\s*(?:from|as)\b)/gm;
+
+/**
+ * TypeScript 5.0's type-only re-export of a whole module, `export type * from
+ * './types'` and `export type * as ns from './types'`, with its `type` blanked
+ * to spaces (offsets survive), so it reads as the `export *` it is to the
+ * graph. The grammar has no rule for it (nor does upstream's): `type` parsed
+ * as an error, so a barrel of re-exports was reported as producing no symbols
+ * and counted by `codegraph status` as a file it could not parse, and the
+ * kernel handed every such file to the wasm parser (#2474). Only a statement
+ * start is blanked, so a mention in a comment or a doc keeps its text. The
+ * import resolver reads the statement as written, `type` included, from the
+ * file itself (`extractReExports`). Applied before both engines parse (the
+ * kernel's preParse hoist), so they agree.
  */
 export function blankExportTypeStar(source: string): string {
-  return source.replace(/^([ \t]*export[ \t]+)type(?=[ \t]*\*)/gm, '$1    ');
+  if (!EXPORT_TYPE_STAR_HINT.test(source)) return source;
+  return source.replace(EXPORT_TYPE_STAR, '$1$2    ');
 }
 
 /**

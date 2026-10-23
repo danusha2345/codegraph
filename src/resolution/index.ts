@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, GO_STDLIB_PACKAGES, matchGoAssertedCall, matchKotlinReceiverChain, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGoAssertedLocal, isGoProjectLocalCall, matchByFilePath, isGoLocallyBound, isRustForeignImplCallable, isPythonFromImportModule, pythonAttrRefResolves, isImportShadowedByJsBinding, matchGoIndexedCall, goDotImportedSupertype, matchGoChainedCall, preferGoBuildTwin, isManualMockPath, isRustPathCallReachable, matchPythonTypedLocalCall } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, GO_STDLIB_PACKAGES, matchGoAssertedCall, matchKotlinReceiverChain, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGoAssertedLocal, isGoProjectLocalCall, matchByFilePath, isGoLocallyBound, isRustForeignImplCallable, isPythonFromImportModule, pythonAttrRefResolves, isImportShadowedByJsBinding, matchGoIndexedCall, goDotImportedSupertype, matchGoChainedCall, preferGoBuildTwin, isManualMockPath, isRustPathCallReachable, matchPythonTypedLocalCall, isTestSuitePath } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -100,6 +100,9 @@ const CHAIN_SHAPE = /^(.+)\(\)\.(\w+)$/;
 
 /** PHP `$this->prop->method()` encoded as `this->prop.method` — no `()`, so CHAIN_SHAPE misses it. */
 const PHP_PROP_SHAPE = /^this->\w+\.\w+$/;
+
+/** A CFML call on a construction, `a.b.Batch().init` (#2652); CFML names may hold `$` (`$init`). */
+const CFML_CONSTRUCTED_CALL = /^([A-Za-z_$][\w$.-]*)\(\)\.([A-Za-z_$][\w$]*)$/;
 
 /**
  * How many files that import a changed module by default a sync reads the
@@ -1600,6 +1603,30 @@ export class ReferenceResolver {
       (ref.referenceName.includes('.') || ref.referenceName.includes('/'))
     ) {
       return this.resolveCfmlComponentPath(ref);
+    }
+    // The component a CFML `createObject("component", "a.b.Batch")` makes,
+    // named by its component path as `extends` names one (#2652), and a call
+    // chained onto a construction — `createObject(…).init()`, `new
+    // a.b.Batch().init()`, encoded `a.b.Batch().init` — which is a method of
+    // that component or of nothing: no name match may guess past it.
+    if (ref.language === 'cfml' || ref.language === 'cfscript') {
+      if (ref.referenceKind === 'instantiates' && ref.referenceName.includes('.')) return this.resolveCfmlComponentPath(ref);
+      if (ref.referenceKind === 'calls' && CFML_CONSTRUCTED_CALL.test(ref.referenceName)) return this.resolveCfmlConstructedCall(ref);
+    }
+
+    // A CFML include names a template by its path from the including file's
+    // directory, or from the web root (#2651): `<cfinclude template="../shared/
+    // helpers.cfm">` is that file, not whichever `helpers.cfm` file-name
+    // matching would settle on. A path that names no file here (one through a
+    // server mapping, `/contenscms/…`) is matched by its file name, as before,
+    // but only to a file: the symbol strategies below took a path no file
+    // matched for another template's import statement of the same path. Nor
+    // is it the including file, which a file-name match can land on (Wheels'
+    // `views/wheels/wheels.cfm` including `../../wheels/public/wheels.cfm`).
+    if ((ref.language === 'cfml' || ref.language === 'cfscript') && ref.referenceKind === 'imports' && isCfmlTemplatePath(ref.referenceName)) {
+      const included = this.resolveCfmlIncludePath(ref) ?? matchByFilePath(ref, this.context);
+      if (included && this.nodeById(included.targetNodeId)?.filePath === ref.filePath) return null;
+      return this.gateLanguage(included, ref);
     }
 
     // A PHP class written with a namespace in it — `new Alias\X()` through a
@@ -3565,6 +3592,18 @@ export class ReferenceResolver {
    * edge. Directory comparison is case-insensitive (CFML path resolution is);
    * the class segment itself is matched exactly, which real code satisfies —
    * dotted paths are written to match the on-disk file name.
+   *
+   * A test suite is no candidate for production code (#2209's rule), and on a
+   * tie it yields to the one component outside the test suites (#2650): a
+   * TestBox spec mirroring the component's path (`tests/specs/unit/core/
+   * basecore.cfc` beside `core/basecore.cfc`) corroborates the same segments,
+   * and a mapping root like `contenscms` (onto `contens/`) matches neither.
+   *
+   * The one exception to corroboration is a path with a single folder segment
+   * and a component at the project root (#2652): `wheels.JobWorker` in Wheels'
+   * own source, where `wheels` is the mapping onto the root, has no folder of
+   * the file's to corroborate. It ranks below any candidate a folder
+   * corroborates, and the file must be named like the component.
    */
   private resolveCfmlComponentPath(ref: UnresolvedRef): ResolvedRef | null {
     const cfmlCandidates = (name: string): Node[] =>
@@ -3608,10 +3647,13 @@ export class ReferenceResolver {
     const className = segments[segments.length - 1]!;
     const dirSegments = segments.slice(0, -1);
 
-    let best: Node | null = null;
+    // Production code never names a component in a test suite; a test can
+    // name one, by the path to it.
+    const fromTest = isTestPath(ref.filePath);
     let bestScore = 0;
-    let tie = false;
+    let tied: Node[] = [];
     for (const cand of cfmlCandidates(className)) {
+      if (!fromTest && isTestSuitePath(cand.filePath)) continue;
       const dirs = cand.filePath.replace(/\\/g, '/').split('/').slice(0, -1);
       // Count matching directory segments right-to-left: for
       // `coldbox.system.web.Controller` vs `system/web/Controller.cfc`,
@@ -3625,16 +3667,109 @@ export class ReferenceResolver {
       ) {
         score++;
       }
+      if (
+        score === 0 && dirs.length === 0 && dirSegments.length === 1 &&
+        cand.filePath.replace(/\.cfc$/i, '').toLowerCase() === className.toLowerCase()
+      ) {
+        score = 0.5; // a root component, named by the mapping onto the root
+      }
       if (score > bestScore) {
-        best = cand;
         bestScore = score;
-        tie = false;
+        tied = [cand];
       } else if (score === bestScore && score > 0) {
-        tie = true;
+        tied.push(cand);
       }
     }
-    if (!best || bestScore === 0 || tie) return null;
-    return { original: ref, targetNodeId: best.id, confidence: 0.9, resolvedBy: 'qualified-name' };
+    // A test's tie between a component and a suite mirroring its path: the
+    // path names the component, as it does from production code.
+    if (tied.length > 1) tied = tied.filter((c) => !isTestSuitePath(c.filePath));
+    if (bestScore === 0 || tied.length !== 1) return null;
+    return { original: ref, targetNodeId: tied[0]!.id, confidence: bestScore >= 1 ? 0.9 : 0.8, resolvedBy: 'qualified-name' };
+  }
+
+  /**
+   * A CFML call chained onto a construction (#2652): `createObject("component",
+   * "a.b.Batch").init()` or `new a.b.Batch().init()`, encoded
+   * `a.b.Batch().init`. The component is the one its path names, by
+   * resolveCfmlComponentPath's rules, or for a bare name the one beside the
+   * calling file (where CFML looks first), else the only one of that name. The
+   * method is the component's own or one it inherits — inheritance is wired
+   * before calls are resolved. Null when either is missing: the bare `init`
+   * such a call used to emit matched whichever component's `init` came first.
+   */
+  private resolveCfmlConstructedCall(ref: UnresolvedRef): ResolvedRef | null {
+    const match = CFML_CONSTRUCTED_CALL.exec(ref.referenceName);
+    if (!match) return null;
+    const component = match[1]!;
+    const cls = component.includes('.')
+      ? this.nodeById(this.resolveCfmlComponentPath({ ...ref, referenceName: component, referenceKind: 'instantiates' })?.targetNodeId ?? '')
+      : this.cfmlComponentByName(component, ref.filePath);
+    const method = cls ? this.cfmlMethodOf(cls, match[2]!.toLowerCase(), new Set()) : undefined;
+    return method ? { original: ref, targetNodeId: method.id, confidence: 0.9, resolvedBy: 'instance-method' } : null;
+  }
+
+  /** The CFML component a bare name reaches from `fromFile`: the one in its directory, else the only one so named. */
+  private cfmlComponentByName(name: string, fromFile: string): Node | undefined {
+    const components = this.context
+      .getNodesByLowerName(name.toLowerCase())
+      .filter((n) => (n.kind === 'class' || n.kind === 'interface') && (n.language === 'cfml' || n.language === 'cfscript'));
+    const dirOf = (p: string): string => p.slice(0, p.lastIndexOf('/') + 1);
+    const beside = components.filter((n) => dirOf(n.filePath) === dirOf(fromFile));
+    if (beside.length === 1) return beside[0];
+    return components.length === 1 ? components[0] : undefined;
+  }
+
+  /** A CFML component's method by its lowercased name (CFML names ignore case): its own, else one a supertype has. */
+  private cfmlMethodOf(cls: Node, lowerName: string, seen: Set<string>): Node | undefined {
+    if (seen.has(cls.id) || seen.size >= 8) return undefined;
+    seen.add(cls.id);
+    const own = this.context.getNodesInFile(cls.filePath).find((n) =>
+      n.kind === 'method' &&
+      n.name.toLowerCase() === lowerName &&
+      n.qualifiedName.toLowerCase() === `${cls.name}::${n.name}`.toLowerCase() &&
+      n.startLine >= cls.startLine && n.endLine <= cls.endLine
+    );
+    if (own) return own;
+    for (const supertype of this.context.getSupertypeNodes?.(cls.id) ?? []) {
+      const inherited = this.cfmlMethodOf(supertype, lowerName, seen);
+      if (inherited) return inherited;
+    }
+    return undefined;
+  }
+
+  /**
+   * The file a CFML include names (#2651) — `include "x.cfm";`,
+   * `<cfinclude template="x.cfm">`, `cfinclude(template="x.cfm")`. A template
+   * path is relative to the directory of the file that includes it
+   * (`formlistshared.cfm`, `../shared/helpers.cfm`), or to the web root when
+   * it starts with `/`: the project root, when the project is the web root —
+   * an assumption, so such a match is less sure. Null when no indexed file is
+   * there. CFML code written on a case-blind file system often spells a path
+   * in another case, so a single file that matches ignoring case counts too.
+   */
+  private resolveCfmlIncludePath(ref: UnresolvedRef): ResolvedRef | null {
+    const written = ref.referenceName.trim().replace(/\\/g, '/');
+    const fromRoot = written.startsWith('/');
+    const parts = fromRoot ? [] : ref.filePath.replace(/\\/g, '/').split('/').slice(0, -1);
+    for (const seg of written.split('/')) {
+      if (seg === '' || seg === '.') continue;
+      if (seg === '..') {
+        if (parts.length === 0) return null; // above the project root
+        parts.pop();
+      } else {
+        parts.push(seg);
+      }
+    }
+    const fileName = parts[parts.length - 1];
+    if (!fileName) return null;
+    const wanted = parts.join('/');
+    const files = this.context.getNodesByLowerName(fileName.toLowerCase()).filter((n) => n.kind === 'file');
+    const exact = files.find((n) => n.filePath === wanted);
+    if (exact) return { original: ref, targetNodeId: exact.id, confidence: fromRoot ? 0.85 : 0.95, resolvedBy: 'file-path' };
+    const folded = files.filter((n) => n.filePath.toLowerCase() === wanted.toLowerCase());
+    return folded.length === 1
+      ? { original: ref, targetNodeId: folded[0]!.id, confidence: fromRoot ? 0.8 : 0.9, resolvedBy: 'file-path' }
+      : null;
   }
 
   /**
@@ -4321,6 +4456,15 @@ export class ReferenceResolver {
     if (tgt && ref.language && crossesCodeBoundary(tgt, ref.language)) return null;
     return result;
   }
+}
+
+/**
+ * Whether a CFML `imports` name is the path of a template an include names
+ * (`formlistshared.cfm`, `../shared/helpers.cfm`, `/app/x.cfm`), not a
+ * cfscript `import com.foo.Bar;` or `import "java:…";` (#2651).
+ */
+function isCfmlTemplatePath(name: string): boolean {
+  return !name.includes(':') && (name.includes('/') || name.includes('\\') || /\.(?:cfml?|cfc|cfs)$/i.test(name.trim()));
 }
 
 /** The project-relative directory holding `p` ('' for the project root). */
