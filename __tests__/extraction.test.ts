@@ -13928,6 +13928,14 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
         expect(byName.markBusy!.endLine).toBe(22);
         expect(byName.after!.qualifiedName).toBe('after');
         expect(byName.after!.startLine).toBe(24);
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('Go: a call through a package stays on its function, not an exported method of that name', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-go-package-member-'));
     try {
