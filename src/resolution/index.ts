@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, GO_STDLIB_PACKAGES, matchGoAssertedCall, matchKotlinReceiverChain, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGoAssertedLocal, isGoProjectLocalCall, matchByFilePath, isGoLocallyBound, isRustForeignImplCallable, isPythonFromImportModule, pythonAttrRefResolves, isImportShadowedByJsBinding, matchGoIndexedCall, goDotImportedSupertype, matchGoChainedCall, preferGoBuildTwin, isManualMockPath, isRustPathCallReachable, matchPythonTypedLocalCall, isTestSuitePath } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, rustChainedCallByName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -790,6 +790,10 @@ export class ReferenceResolver {
         return result;
       },
 
+      // The set warmCaches loads (`SELECT DISTINCT name FROM nodes`, the exact
+      // match getNodesByName makes); unloaded, no name is absent.
+      isAbsentName: (name: string) => this.knownNames !== null && !this.knownNames.has(name),
+
       getMethodMatches: (typeName: string, methodName: string, language: Language) => {
         const key = `${language} ${typeName}::${methodName}`;
         const cached = this.methodMatchCache.get(key);
@@ -1434,6 +1438,17 @@ export class ReferenceResolver {
   }
 
   private resolveOneIn(ref: UnresolvedRef): ResolvedRef | null {
+    // A Rust call kept with its receiver chain — `self.services.store.put`,
+    // `self.store().put` (#2836) — resolves as the call by its method's name
+    // did before the extractor kept the chain: every strategy and gate reads
+    // that name the same way, and the receiver's type is read through the
+    // whole chain where the call is written (matchRustWrittenReceiverCall).
+    // The edge keeps the call as written.
+    const byName = rustChainedCallByName(ref);
+    if (byName) {
+      const resolved = this.resolveOneIn(byName);
+      return resolved && { ...resolved, original: ref };
+    }
     // A C/C++ "call" whose name is a function-like macro visible in this
     // translation unit is a macro expansion, not a call — it must never bind
     // to a same-named function in another file (#1838).
@@ -1467,6 +1482,8 @@ export class ReferenceResolver {
       const module = this.nodeById(resolved.targetNodeId);
       if (module && module.kind !== 'file' && module.kind !== 'module') return null;
     }
+    if (resolved && (resolved.byName || resolved.resolvedBy === 'exact-match' || resolved.resolvedBy === 'fuzzy') &&
+        isGuessedRecordAccessor(resolved, ref, this.context)) return null;
     // A name the calling JS/TS function binds itself (a parameter, a local) in
     // scope at the reference is that binding even when the file imports the
     // name, which the import resolver answers before the matcher's own check.

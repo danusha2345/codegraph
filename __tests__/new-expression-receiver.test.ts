@@ -90,6 +90,66 @@ describe('new-expression receivers', () => {
     expect(calleesOf('jsCalls', 'plain.js')).toEqual(['Runner::run']);
   });
 
+  it('TS: of two classes that share a name, the one the file imports is the one constructed', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-newrecv-twin-'));
+    const twin: Record<string, string> = {
+      'src/a/runner.ts': 'export class Runner { run() { return 1; } }\n',
+      'src/b/runner.ts': 'export class Runner { run() { return 2; } }\n',
+      'src/aa/use-a.ts': "import { Runner } from '../a/runner';\nexport function useA() { return new Runner().run(); }\n",
+      'src/zz/use-b.ts': "import { Runner as Job } from '../b/runner';\nexport function useB() { return new Job().run(); }\n",
+    };
+    for (const [rel, text] of Object.entries(twin)) {
+      fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+      fs.writeFileSync(path.join(root, rel), text);
+    }
+    const graph = CodeGraph.initSync(root);
+    try {
+      await graph.indexAll();
+      const target = (caller: string) => {
+        const from = graph.getNodesByName(caller).find((n) => n.kind === 'function')!;
+        return graph.getCallees(from.id).filter(({ edge }) => edge.kind === 'calls').map(({ node: n }) => n.filePath);
+      };
+      expect(target('useA')).toEqual(['src/a/runner.ts']);
+      expect(target('useB')).toEqual(['src/b/runner.ts']);
+    } finally {
+      graph.destroy();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("a class building its own instance, with `new this.constructor()` or a static `new this()`, calls its own method", async () => {
+    // three.js's `clone() { return new this.constructor().copy(this); }`: no class name is
+    // written, so the call keeps the bare name, as a call on `this` does.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-newrecv-self-'));
+    const own: Record<string, string> = {
+      'src/box.js':
+        'export class Box {\n' +
+        '  copy(other) { return this; }\n' +
+        '  init() { return this; }\n' +
+        '  clone() { return new this.constructor().copy(this); }\n' +
+        '  static create() { return new this().init(); }\n' +
+        '}\n',
+      'src/other.js': 'export class Other {\n  copy(o) { return o; }\n  init() { return 1; }\n}\n',
+    };
+    for (const [rel, text] of Object.entries(own)) {
+      fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+      fs.writeFileSync(path.join(root, rel), text);
+    }
+    const graph = CodeGraph.initSync(root);
+    try {
+      await graph.indexAll();
+      const callees = (caller: string) => {
+        const from = graph.getNodesByName(caller).find((n) => n.kind === 'method')!;
+        return graph.getCallees(from.id).filter(({ edge }) => edge.kind === 'calls').map(({ node: n }) => n.qualifiedName);
+      };
+      expect(callees('clone')).toEqual(['Box::copy']);
+      expect(callees('create')).toEqual(['Box::init']);
+    } finally {
+      graph.destroy();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('extraction keeps the constructed class in the ref name', () => {
     const src =
       'function f(p, s) {\n' +

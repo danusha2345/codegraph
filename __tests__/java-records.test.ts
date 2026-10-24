@@ -155,4 +155,53 @@ public class Http {
     expect(has('calls', 'p::Http::use', 'p::Pair::left')).toBe(true); // generic record
     expect(has('instantiates', 'p::Http::use', 'p::Point')).toBe(true);
   });
+
+  it('resolves a call on the record type itself when a sealed interface permits it first', async () => {
+    // `permits Circle,` in the interface's head is not a member named `Circle`
+    // of type `permits`: read as one, it typed the receiver of `Circle.unit()`
+    // as a built-in and dropped the call, now that the record encloses it.
+    write('p/Shape.java', `package p;
+public sealed interface Shape permits Circle, Square {
+    double area();
+}
+`);
+    write('p/Circle.java', `package p;
+public record Circle(double r) implements Shape {
+    static Circle unit() { return new Circle(1); }
+    public double area() { return r * r; }
+    Circle twice() { return Circle.unit(); }
+}
+`);
+    write('p/Square.java', `package p;
+public record Square(double side) implements Shape {
+    public double area() { return side * side; }
+}
+`);
+    const { has } = await load();
+    expect(has('calls', 'p::Circle::twice', 'p::Circle::unit')).toBe(true);
+    expect(has('implements', 'p::Circle', 'p::Shape')).toBe(true);
+  });
+
+  it('reaches an implicit accessor through a typed receiver, never by a name-only guess', async () => {
+    // `point` in the lambda has no type the resolver can read; its name
+    // matching the record's is no evidence that it is one.
+    write('p/Point.java', `package p;
+public record Point(int x, int y) {
+    int sum() { return x() + y(); }
+}
+`);
+    write('p/Use.java', `package p;
+import java.util.List;
+public class Use {
+    int typed(Point p) { return p.x(); }
+    void guessed(List<Object> points) { points.forEach(point -> point.x()); }
+    int ref(List<Point> ps) { return ps.stream().mapToInt(Point::y).sum(); }
+}
+`);
+    const { has } = await load();
+    expect(has('calls', 'p::Use::typed', 'p::Point::x')).toBe(true);
+    expect(has('references', 'p::Use::ref', 'p::Point::y')).toBe(true);
+    expect(has('calls', 'p::Point::sum', 'p::Point::x')).toBe(true);
+    expect(has('calls', 'p::Use::guessed', 'p::Point::x')).toBe(false);
+  });
 });

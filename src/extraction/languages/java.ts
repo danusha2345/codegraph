@@ -1,6 +1,7 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
+import { IMPLICIT_RECORD_ACCESSOR_DOC } from '../../types';
 
 /**
  * Tree-sitter-java node types for a method's `type` (return) field that can
@@ -299,7 +300,7 @@ function synthesizeRecordComponents(recordNode: SyntaxNode, ctx: ExtractorContex
         visibility: 'public',
         isStatic: false,
         signature: `${typeText} ${name}()`,
-        docstring: 'Implicit record component accessor',
+        docstring: IMPLICIT_RECORD_ACCESSOR_DOC,
         returnType: normalizeJavaType(typeNode, ctx.source),
       });
     }

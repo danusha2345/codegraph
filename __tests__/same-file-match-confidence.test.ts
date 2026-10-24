@@ -30,7 +30,7 @@ describe('same-file exact-match confidence', () => {
 
   type CallEdge = { src: string; tgt: string; tgtQn: string; tgtFile: string; confidence: number };
 
-  const calls = async (): Promise<CallEdge[]> => {
+  const calls = async (kind = 'calls'): Promise<CallEdge[]> => {
     const cg = await CodeGraph.init(dir, { silent: true });
     await cg.indexAll();
     const db = (cg as any).db.db;
@@ -41,9 +41,9 @@ describe('same-file exact-match confidence', () => {
            FROM edges e
            JOIN nodes s ON s.id = e.source
            JOIN nodes t ON t.id = e.target
-          WHERE e.kind = 'calls'`
+          WHERE e.kind = ?`
       )
-      .all();
+      .all(kind);
     cg.close?.();
     return rows;
   };
@@ -93,5 +93,31 @@ describe('same-file exact-match confidence', () => {
     const edge = (await calls()).find((e) => e.src === 'go' && e.tgt === 'run');
     expect(edge?.tgtQn).toBe('A::run');
     expect(edge?.confidence).toBe(0.4);
+  });
+
+  it("outranks a framework's naming guess that sends the name to another file", async () => {
+    // ASP.NET's naming rule takes `ToastService` for the class in Services/,
+    // but the component reads its own property named after that class, as
+    // eShopOnWeb's Blazor ToastComponent does (C#'s "Color Color").
+    write('Startup.cs', 'namespace App { public class Startup { } }\n');
+    write('Services/ToastService.cs', 'namespace App.Services {\n  public class ToastService { public event System.Action OnShow; }\n}\n');
+    write(
+      'Helpers/ToastComponent.cs',
+      'using App.Services;\nnamespace App.Helpers {\n  public class ToastComponent {\n    ToastService ToastService { get; set; }\n' +
+        '    void OnInitialized() { ToastService.OnShow += Show; }\n    void Show() { }\n  }\n}\n'
+    );
+    const edge = (await calls('references')).find((e) => e.src === 'OnInitialized' && e.tgt === 'ToastService');
+    expect(edge?.tgtQn).toBe('App.Helpers::ToastComponent::ToastService');
+    expect(edge?.confidence).toBe(0.9);
+  });
+
+  it("does not raise a sibling type's member found by its bare name", async () => {
+    // `Dns()` in one class is not the `Dns` entry of the enum beside it
+    // (okhttp's InterceptorOverridesTest): no more settled by the file than
+    // a sibling class's method.
+    write('src/app/Overrides.kt', 'package app\n\nenum class Param { Dns }\n\nclass Override {\n  val value = Dns()\n}\n');
+    write('src/app/Dns.kt', 'package app\n\nclass Dns\n');
+    const raised = (await calls()).filter((e) => e.tgtQn === 'app::Param::Dns' && e.confidence >= 0.9);
+    expect(raised).toEqual([]);
   });
 });
