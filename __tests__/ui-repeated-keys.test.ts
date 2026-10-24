@@ -105,6 +105,37 @@ app.get('/one', () => { first(); second(); third(); });
     }
   });
 
+  it('fills the page past routes it drops after reading them, like a test file\'s', async () => {
+    const testsFirst = path.join(root, 'tests-first');
+    const put = (rel: string, text: string) => {
+      fs.mkdirSync(path.dirname(path.join(testsFirst, rel)), { recursive: true });
+      fs.writeFileSync(path.join(testsFirst, rel), text);
+    };
+    put('package.json', JSON.stringify({ dependencies: { express: '^4.0.0' } }));
+    // Sorts before src/, and every handler is test code, so these rows are
+    // dropped only once they are read: they must not use up the window.
+    put('__tests__/routes.test.js', `const app = require('express')();
+${Array.from({ length: 6 }, (_, i) => `function t${i}(req, res) { res.end(); }\napp.get('/t${i}', t${i});`).join('\n')}
+`);
+    put('src/app.js', `const app = require('express')();
+function a(req, res) { res.end(); }
+function b(req, res) { res.end(); }
+function c(req, res) { res.end(); }
+app.get('/a', a);
+app.get('/b', b);
+app.get('/c', c);
+`);
+    const project = await CodeGraph.init(testsFirst, { index: true });
+    try {
+      const payload = buildRoutes(project, new URLSearchParams('limit=3'));
+      expect(payload.routed).toBe(true);
+      expect(payload.entries.map((e) => e.url)).toEqual(['GET /a', 'GET /b', 'GET /c']);
+      expect(payload.truncated).toBe(false);
+    } finally {
+      project.close();
+    }
+  });
+
   it('has one row per route', () => {
     const { entries } = buildRoutes(cg, new URLSearchParams());
     const ids = entries.map((e) => e.routeId);

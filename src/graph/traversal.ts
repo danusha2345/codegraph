@@ -439,31 +439,23 @@ export class GraphTraverser {
 
     const nodes = new Map<string, Node>();
     const edges: Edge[] = [];
-    // Each direction must expand the focal node independently.
-    const visitedAncestors = new Set<string>();
-    const visitedDescendants = new Set<string>();
 
     // Add focal node
     nodes.set(focalNode.id, focalNode);
 
+    // Each direction keeps its own visited set: the ancestor walk marks the
+    // focal node first, and a shared set made the descendant walk return at
+    // its guard before reading one incoming edge, so no type ever had
+    // subtypes (#2833).
     // Get ancestors (what this extends/implements)
-    this.getTypeAncestors(nodeId, nodes, edges, visitedAncestors);
+    this.getTypeAncestors(nodeId, nodes, edges, new Set<string>());
 
     // Get descendants (what extends/implements this)
-    this.getTypeDescendants(nodeId, nodes, edges, visitedDescendants);
-
-    // Cyclic hierarchies can expose an edge in both directional walks.
-    const seenEdges = new Set<string>();
-    const uniqueEdges = edges.filter((edge) => {
-      const key = JSON.stringify([edge.source, edge.target, edge.kind, edge.line, edge.column]);
-      if (seenEdges.has(key)) return false;
-      seenEdges.add(key);
-      return true;
-    });
+    this.getTypeDescendants(nodeId, nodes, edges, new Set<string>());
 
     return {
       nodes,
-      edges: uniqueEdges,
+      edges,
       roots: [nodeId],
     };
   }
@@ -485,7 +477,7 @@ export class GraphTraverser {
 
     for (const edge of outgoingEdges) {
       const parentNode = parents.get(edge.target);
-      if (parentNode) {
+      if (parentNode && !nodes.has(parentNode.id)) {
         nodes.set(parentNode.id, parentNode);
         edges.push(edge);
         this.getTypeAncestors(parentNode.id, nodes, edges, visited);
@@ -510,7 +502,7 @@ export class GraphTraverser {
 
     for (const edge of incomingEdges) {
       const childNode = children.get(edge.source);
-      if (childNode) {
+      if (childNode && !nodes.has(childNode.id)) {
         nodes.set(childNode.id, childNode);
         edges.push(edge);
         this.getTypeDescendants(childNode.id, nodes, edges, visited);

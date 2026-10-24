@@ -1658,6 +1658,12 @@ impl<'t> Walker<'t> {
                         // resolver can read its declared type (#1496). Mirrors
                         // TreeSitterExtractor.extractCall.
                         callee_name = format!("this.{field}.{method_name}");
+                    } else if let Some(element) = receiver.and_then(|r| self.this_subscript_of(r)) {
+                        // `this.<field>[k].<method>()` — an element of the
+                        // field, typed by the resolver from the field's
+                        // declaration; `this['svc']` is the field itself.
+                        // Mirrors TreeSitterExtractor.extractCall.
+                        callee_name = format!("{element}.{method_name}");
                     } else if let Some(r) = receiver.filter(|r| r.kind() == "call_expression") {
                         // Call receiver — `make().run()` (#1683): keep the inner
                         // callee as `<inner>().<method>`, or emit nothing when it
@@ -1677,7 +1683,15 @@ impl<'t> Walker<'t> {
                         else {
                             return;
                         };
-                        callee_name = format!("new {ctor}().{method_name}");
+                        // `new this.constructor().copy(this)`, a static
+                        // `new this().init()`: an instance of the enclosing
+                        // class keeps the bare method name, as a call on
+                        // `this` does.
+                        callee_name = if ctor == "this" || ctor == "this.constructor" {
+                            method_name.to_string()
+                        } else {
+                            format!("new {ctor}().{method_name}")
+                        };
                     } else if receiver.is_some_and(|r| !keeps_bare_receiver(r, self.src)) {
                         // An expression receiver with no static type
                         // (`(a ?? b).map()`, `f().list.map()`): emit nothing
@@ -1750,6 +1764,36 @@ impl<'t> Walker<'t> {
             return None;
         }
         Some(self.text(property).to_string())
+    }
+
+    /// A receiver subscripting the enclosing class's object: `this.<field>[k]`
+    /// → `this.<field>[]`, `this['svc']` → `this.svc`; None for any other
+    /// subscript. Mirrors tsThisSubscriptReceiver.
+    fn this_subscript_of(&self, receiver: Node<'t>) -> Option<String> {
+        if receiver.kind() != "subscript_expression" {
+            return None;
+        }
+        let object = peel_receiver(receiver.child_by_field_name("object")?);
+        if object.kind() == "this" {
+            let index = receiver.child_by_field_name("index")?;
+            if index.kind() != "string" {
+                return None;
+            }
+            let text = self.text(index);
+            let quoted = text.len() >= 2
+                && (text.starts_with('\'') || text.starts_with('"'))
+                && text.ends_with(&text[..1]);
+            let key = if quoted { &text[1..text.len() - 1] } else { return None };
+            let mut chars = key.chars();
+            let first = chars.next()?;
+            if !(first.is_ascii_alphabetic() || first == '_' || first == '$')
+                || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+            {
+                return None;
+            }
+            return Some(format!("this.{key}"));
+        }
+        self.this_field_of(object).map(|field| format!("this.{field}[]"))
     }
 
     /// `await f<T>(x)` parses with `await f` as the callee (#2586), and a
@@ -2111,10 +2155,14 @@ fn peel_receiver(node: Node<'_>) -> Node<'_> {
 }
 
 /// `this` / `super`, or a member chain rooted at either or at `window`, still
-/// collapse to the bare method name (mirrors keepsBareTsJsReceiver).
+/// collapse to the bare method name; a subscript anywhere in the chain does
+/// not (mirrors keepsBareTsJsReceiver).
 fn keeps_bare_receiver(node: Node<'_>, src: &str) -> bool {
     let mut cur = node;
     while matches!(cur.kind(), "member_expression" | "subscript_expression") {
+        if cur.kind() == "subscript_expression" {
+            return false;
+        }
         match cur.child_by_field_name("object") {
             Some(object) => cur = peel_receiver(object),
             None => return false,

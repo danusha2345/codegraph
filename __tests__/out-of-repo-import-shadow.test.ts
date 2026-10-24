@@ -50,6 +50,36 @@ describe('a name imported from outside the repository', () => {
     expect(await callTargets('configure')).toEqual(['config.ts:resolve:3']);
   });
 
+  it('is not shadowed by a declaration nested in a sibling function', async () => {
+    // `b` calls the package's `resolve`: the one nested in `a` is out of scope there.
+    project({
+      'plugin.ts': "export function resolve() { return 'plugin'; }",
+      'config.ts':
+        "import { resolve } from 'node:path';\n" +
+        "export function a() {\n  function resolve() { return 'local'; }\n  return resolve();\n}\n" +
+        "export function b() {\n  return resolve('src');\n}\n",
+    });
+    expect(await callTargets('b')).toEqual([]);
+  });
+
+  it('is not shadowed by a declaration nested a level below the call', async () => {
+    project({
+      'config.ts':
+        "import { resolve } from 'node:path';\n" +
+        "export function outer() {\n  function mid() { function resolve() { return 1; } return resolve(); }\n  return resolve('x') + mid();\n}\n",
+    });
+    expect((await callTargets('outer')).filter((t) => t.includes(':resolve:'))).toEqual([]);
+  });
+
+  it('is shadowed in a function nested inside the declaring one', async () => {
+    project({
+      'config.ts':
+        "import { resolve } from 'node:path';\n" +
+        "export function configure() {\n  function resolve() { return 'local'; }\n  function inner() { return resolve(); }\n  return inner();\n}\n",
+    });
+    expect(await callTargets('inner')).toEqual(['config.ts:resolve:3']);
+  });
+
   it('binds no other file\'s symbol of that name', async () => {
     project({
       'package.json': JSON.stringify({ name: 'app', dependencies: { 'external-resolver': '^1.0.0' } }),

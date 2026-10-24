@@ -126,7 +126,8 @@ export function lexicalPathWithinRoot(projectRoot: string, filePath: string): st
  * @param options.allowSymlinkEscape - Follow in-root symlinks out of the root
  *   (indexing read path only); defaults to the strict, leak-safe behavior.
  * @returns The resolved absolute path (realpath when it exists), or null if it
- *   escapes the root
+ *   escapes the root. A path that does not exist yet is judged by its nearest
+ *   existing ancestor, and every path under a root that does not exist is null.
  */
 export function validatePathWithinRoot(
   projectRoot: string,

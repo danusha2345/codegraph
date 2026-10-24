@@ -106,6 +106,7 @@ async function exprReceivers(x) {
   new RegExp(p).exec(s);
   (new ns.Widget(1)).draw();
   new (pick())().go();
+  new this.constructor().copy(x);
 }
 // --- component wrappers walked under the component ------------------------------
 const PANEL_GAP = 8;

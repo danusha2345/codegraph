@@ -143,6 +143,43 @@ function storedTrail(id: string): StoredTrail {
   };
 }
 
+/** Remove a link itself, never what it points at, when there is one. */
+function removeLink(link: string): void {
+  try {
+    if (fs.lstatSync(link).isSymbolicLink()) fs.unlinkSync(link);
+  } catch {
+    // Nothing there.
+  }
+}
+
+/**
+ * Whether this machine can create a link of `type`. A Windows junction needs no
+ * privilege; a symbolic link there needs Developer Mode or admin rights. Where
+ * one can't be made, its tests are skipped, with the reason in their name.
+ */
+function canCreateLink(type: 'file' | 'dir' | 'junction'): boolean {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-link-probe-'));
+  const target = path.join(dir, 'target');
+  const link = path.join(dir, 'link');
+  try {
+    if (type === 'file') fs.writeFileSync(target, '');
+    else fs.mkdirSync(target);
+    fs.symlinkSync(target, link, type);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    removeLink(link);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** A `.codegraph/ui` link can be a junction or a directory symlink on Windows. */
+const DIR_LINKS = (process.platform === 'win32' ? ['junction', 'dir'] : ['dir']) as Array<
+  'junction' | 'dir'
+>;
+const NO_LINK = ' (skipped: this link needs Developer Mode or admin rights on Windows)';
+
 /** Re-index in place, the way a `codegraph sync` would after an edit. */
 async function reindex(): Promise<void> {
   const cg = CodeGraph.openSync(projectRoot);
@@ -245,67 +282,79 @@ describe('trail ids', () => {
 });
 
 describe('trail write containment', () => {
-  it.runIf(process.platform !== 'win32')(
-    'refuses a missing trail directory below a symlink that leaves the project',
-    () => {
-      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-trail-symlink-'));
-      const project = path.join(base, 'project');
-      const outside = path.join(base, 'outside');
-      fs.mkdirSync(path.join(project, '.codegraph'), { recursive: true });
-      fs.mkdirSync(outside, { recursive: true });
-      fs.symlinkSync(outside, path.join(project, '.codegraph', 'ui'), 'dir');
+  for (const type of DIR_LINKS) {
+    const canLink = canCreateLink(type);
+    const kind = type === 'junction' ? 'junction' : 'symlink';
 
-      try {
-        expect(() => writeStoredTrail(project, storedTrail('must-stay-inside'))).toThrow(
-          /outside the project/
-        );
-        expect(fs.existsSync(path.join(outside, 'trails'))).toBe(false);
-      } finally {
-        fs.rmSync(base, { recursive: true, force: true });
+    it.skipIf(!canLink)(
+      `refuses a missing trail directory below a ${kind} that leaves the project${canLink ? '' : NO_LINK}`,
+      () => {
+        const base = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-trail-symlink-'));
+        const project = path.join(base, 'project');
+        const outside = path.join(base, 'outside');
+        const uiLink = path.join(project, '.codegraph', 'ui');
+        fs.mkdirSync(path.join(project, '.codegraph'), { recursive: true });
+        fs.mkdirSync(outside, { recursive: true });
+        fs.symlinkSync(outside, uiLink, type);
+
+        try {
+          expect(() => writeStoredTrail(project, storedTrail('must-stay-inside'))).toThrow(
+            /outside the project/
+          );
+          expect(fs.existsSync(path.join(outside, 'trails'))).toBe(false);
+        } finally {
+          removeLink(uiLink);
+          fs.rmSync(base, { recursive: true, force: true });
+        }
       }
-    }
-  );
+    );
 
-  it.runIf(process.platform !== 'win32')(
-    'allows a project root reached through a symlink when the real path stays inside it',
-    () => {
-      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-trail-root-link-'));
-      const project = path.join(base, 'project');
-      const alias = path.join(base, 'project-link');
-      fs.mkdirSync(path.join(project, '.codegraph'), { recursive: true });
-      fs.symlinkSync(project, alias, 'dir');
+    it.skipIf(!canLink)(
+      `allows a project root reached through a ${kind} when the real path stays inside it${canLink ? '' : NO_LINK}`,
+      () => {
+        const base = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-trail-root-link-'));
+        const project = path.join(base, 'project');
+        const alias = path.join(base, 'project-link');
+        fs.mkdirSync(path.join(project, '.codegraph'), { recursive: true });
+        fs.symlinkSync(project, alias, type);
 
-      try {
-        expect(() => writeStoredTrail(alias, storedTrail('safe-root-link'))).not.toThrow();
-        expect(
-          fs.existsSync(path.join(project, TRAILS_RELATIVE_DIR, 'safe-root-link.json'))
-        ).toBe(true);
-      } finally {
-        fs.rmSync(base, { recursive: true, force: true });
+        try {
+          expect(() => writeStoredTrail(alias, storedTrail('safe-root-link'))).not.toThrow();
+          expect(
+            fs.existsSync(path.join(project, TRAILS_RELATIVE_DIR, 'safe-root-link.json'))
+          ).toBe(true);
+        } finally {
+          removeLink(alias);
+          fs.rmSync(base, { recursive: true, force: true });
+        }
       }
-    }
-  );
+    );
+  }
 });
 
 describe('trail read containment', () => {
-  it.runIf(process.platform !== 'win32')(
-    'skips a trail file symlinked outside the project instead of reading it',
+  const fileLinks = canCreateLink('file');
+
+  it.skipIf(!fileLinks)(
+    `skips a trail file symlinked outside the project instead of reading it${fileLinks ? '' : NO_LINK}`,
     () => {
       const base = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-trail-read-link-'));
       const project = path.join(base, 'project');
       const outside = path.join(base, 'outside');
       const dir = path.join(project, TRAILS_RELATIVE_DIR);
+      const linked = path.join(dir, 'linked.json');
       fs.mkdirSync(dir, { recursive: true });
       fs.mkdirSync(outside, { recursive: true });
       fs.writeFileSync(
         path.join(outside, 'secret.json'),
         JSON.stringify({ ...storedTrail('outside'), note: 'must not be read' })
       );
-      fs.symlinkSync(path.join(outside, 'secret.json'), path.join(dir, 'linked.json'));
+      fs.symlinkSync(path.join(outside, 'secret.json'), linked, 'file');
 
       try {
         expect(listStoredTrails(project)).toEqual({ trails: [], skipped: 1 });
       } finally {
+        removeLink(linked);
         fs.rmSync(base, { recursive: true, force: true });
       }
     }
