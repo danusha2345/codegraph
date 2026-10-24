@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- `codegraph implementations <name>` lists the types that implement or extend a trait, interface or class, with each one's file and line, whether it reaches the type by `implements` or `extends`, and whether it is test code (a Rust `#[cfg(test)]` mock included); `--depth` follows subclasses of subclasses (#2833)
 - `codegraph serve --mcp --no-telemetry` turns telemetry off for one MCP server entry, so a shared MCP config can opt out without an environment variable. (#1908)
 - **Verilog and SystemVerilog are indexed.** Modules, packages, interfaces and modports, named instances, ports and signals, always/assign blocks and generate scopes are searchable, and `codegraph_explore` surfaces the instantiation path from a top module down to a nested one; based on the extractor contributed in #402 by @FHYQ-Dong. Re-index projects that contain Verilog files.
 - **HDL port bindings resolve to their formal ports.** Named, positional and wildcard (`.*`) connections link an instance's local signals to the instantiated module's ports, and bit or part selects keep their base signal.
