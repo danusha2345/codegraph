@@ -22180,7 +22180,7 @@ export function matchMethodCall(
         // `w.Header().Get(…)`, `reader.Value.ToString()`,
         // `options.setdefault(…)`) is the library type's.
         !(isStdMethodName(ref.language, methodName!) &&
-          !/^(?:self|Self|this|base|cls)$/.test(objectOrClass!) && !receiverNamesOwner(receiverLink(objectOrClass!), targetMethods[0]!, context)) &&
+          !/^(?:self|Self|this|base)$/.test(objectOrClass!) && !receiverNamesOwner(receiverLink(objectOrClass!), targetMethods[0]!, context)) &&
         !(UNTYPED_RECEIVER_LANGUAGES.has(ref.language) && !/^(?:self|self\.class|this|super|weak_?self|strong_?self)$/i.test(objectOrClass!) &&
           !sharesReceiverWord(objectOrClass!, targetMethods[0]!) &&
           !(ref.language === 'objc' && objcReceiverReaches(objectOrClass!, targetMethods[0]!, context)) &&
@@ -22214,7 +22214,7 @@ export function matchMethodCall(
       // Same-file candidates first, so a score tie (`score > bestScore` keeps
       // the first seen) resolves to the call site's own file rather than the
       // first-indexed duplicate (#1079).
-      const std = isStdMethodName(ref.language, methodName!) && !/^(?:self|Self|this|base|cls)$/.test(objectOrClass!);
+      const std = isStdMethodName(ref.language, methodName!) && !/^(?:self|Self|this|base)$/.test(objectOrClass!);
       for (const method of preferCallSiteFile(withinCppTranslationUnit(targetMethods, ref, context), ref.filePath)) {
         if (std && !receiverNamesOwner(receiverLink(objectOrClass!), method, context)) continue;
         // The owner type's own name — not its namespace (`eShop.ClientApp…`
