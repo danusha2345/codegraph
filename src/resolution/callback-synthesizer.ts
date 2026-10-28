@@ -158,6 +158,14 @@ function lineOf(src: string, idx: number): number {
   return lineOfIndex(idx);
 }
 
+/** Forget the last file sliceLines and lineOf keep, once a synthesis run is over. */
+function releaseLineCaches(): void {
+  sliceLinesSource = null;
+  sliceLinesSplit = [];
+  lineOfSource = null;
+  lineOfIndex = () => 1;
+}
+
 function registrarField(src: string): string | null {
   const m = src.match(/this\.(\w+)\.(?:add|push|set)\(/);
   return m ? m[1]! : null;
@@ -5482,6 +5490,10 @@ export async function synthesizeCallbackEdges(
       await runPassOnMain(i, false);
     }
   }
+  // The passes are done. In a long-lived process (the MCP server, `watch`),
+  // the two line caches would otherwise keep the last file read until the next
+  // synthesis; a pool worker's go with the worker.
+  releaseLineCaches();
 
   markT.t = Date.now();
   if (pool && gatedIn.length > 1) {

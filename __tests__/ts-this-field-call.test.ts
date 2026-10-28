@@ -96,6 +96,20 @@ beforeAll(async () => {
       '  put(x: string): void { this.#items.add(x); }\n' +
       '}\n'
   );
+  // Two apps declare the same service; the caller is equally near both.
+  // Code-unit order and locale collation disagree on `Beta` vs `alpha`.
+  for (const app of ['Beta', 'alpha']) {
+    fs.mkdirSync(path.join(dir, 'src', 'apps', app), { recursive: true });
+    w(`apps/${app}/service.ts`, 'export class UserService {\n  load(): string { return "x"; }\n}\n');
+  }
+  fs.mkdirSync(path.join(dir, 'src', 'shared'));
+  w(
+    'shared/hub.ts',
+    'export class Hub {\n' +
+      '  constructor(private readonly users: UserService) {}\n' +
+      '  run(): string { return this.users.load(); }\n' +
+      '}\n'
+  );
   cg = CodeGraph.initSync(dir);
   await cg.indexAll();
 });

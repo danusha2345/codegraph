@@ -1,11 +1,13 @@
 /**
  * A call that means a member of the class it is written in — a receiver-less
- * `render()` in Java / Scala / C++, or `this.render()` / `self.render()` in
+ * `render()` in Java / Scala, or `this.render()` / `self.render()` in
  * TypeScript / Python — binds to that class's
  * member (then what it inherits, then an enclosing class), not to whichever
  * same-named method is declared nearest the call. Each fixture puts the
  * caller's own `render` far above the call and a sibling class's `render`
  * right below it, which is what the same-file line-distance term used to pick.
+ * C++ has its own class lookup (matchCppImplicitThisCall); its cases here pin
+ * that it keeps the same answer.
  */
 
 import { describe, it, expect, afterEach } from 'vitest';
@@ -132,5 +134,78 @@ ${filler('    //')}
 }
 `, 'C::Builder::show');
     expect(out).toEqual(['AOrBuilder::describe']);
+  });
+});
+
+/** `qualifiedName@file` of every `calls` target of `from`, in a project of several files. */
+async function calleesIn(files: Record<string, string>, from: string): Promise<string[]> {
+  tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-enclosing-'));
+  for (const [rel, text] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(tempDir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, rel), text);
+  }
+  cg = await CodeGraph.init(tempDir, { index: true });
+  cg.resolveReferences();
+  const caller = [...cg.getNodesByKind('method'), ...cg.getNodesByKind('function')].find((n) => n.qualifiedName === from);
+  expect(caller).toBeDefined();
+  return cg
+    .getOutgoingEdges(caller!.id)
+    .filter((e) => e.kind === 'calls')
+    .map((e) => {
+      const target = cg!.getNode(e.target);
+      return target ? `${target.qualifiedName}@${target.filePath}` : '?';
+    });
+}
+
+describe('which inherited member a call reaches', () => {
+  it('Python: a base named like types in other files is not taken for the one another file declares', async () => {
+    const out = await calleesIn({
+      'a/base.py': 'class BaseEditor:\n    def execute(self, sql):\n        return sql\n',
+      'b/pg.py': 'from a.base import BaseEditor\n\nclass DatabaseSchemaEditor(BaseEditor):\n    def execute(self, sql):\n        return super().execute(sql)\n',
+      'c/lite.py': 'from a.base import BaseEditor\n\nclass DatabaseSchemaEditor(BaseEditor):\n    sql_create = "x"\n',
+      'd/gis.py': 'from c.lite import DatabaseSchemaEditor\n\nclass GisEditor(DatabaseSchemaEditor):\n    def drop(self):\n        return self.execute("drop")\n',
+    }, 'GisEditor::drop');
+    expect(out).not.toContain('DatabaseSchemaEditor::execute@b/pg.py');
+  });
+
+  it('Python: the first base listed that has the member is the one `self.` reaches', async () => {
+    const files = {
+      'mixins.py': 'class Second:\n    def describe(self):\n        return "second"\n\nclass First:\n    def describe(self):\n        return "first"\n\n' +
+        'class Both(First, Second):\n    def show(self):\n        return self.describe()\n\n' +
+        'class Other(Second, First):\n    def show(self):\n        return self.describe()\n',
+    };
+    expect(await calleesIn(files, 'Both::show')).toEqual(['First::describe@mixins.py']);
+    cg?.close();
+    cg = null;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+    expect(await calleesIn(files, 'Other::show')).toEqual(['Second::describe@mixins.py']);
+  });
+
+  it('Java: a class further up that implements the member wins over an interface that only declares it', async () => {
+    const out = await calleesIn({
+      'p/Rotation.java': 'package p;\ninterface Rotation {\n  String current();\n}\n',
+      'p/Dispatcher.java': 'package p;\nclass Dispatcher {\n  String current() { return "d"; }\n}\n',
+      'p/Contextual.java': 'package p;\nclass Contextual extends Dispatcher {\n}\n',
+      'p/RotationButton.java': 'package p;\nclass RotationButton extends Contextual implements Rotation {\n  String show() { return current(); }\n}\n',
+    }, 'p::RotationButton::show');
+    expect(out).toEqual(['p::Dispatcher::current@p/Dispatcher.java']);
+  });
+
+  it('Java: a variable named `parent` is not `super`', async () => {
+    // The extractor drops the `parent.` receiver, so the call arrives as a
+    // bare `getName()`; it must not be read as `super.getName()`.
+    const out = await calleesIn({
+      'p/Base.java': 'package p;\nclass Base {\n  String getName() { return "base"; }\n}\n',
+      'p/Child.java': 'package p;\nclass Node {\n  String getName() { return "node"; }\n}\nclass Child extends Base {\n  Node parent;\n  String getName() { return "child"; }\n  String show() { return parent.getName(); }\n}\n',
+    }, 'p::Child::show');
+    expect(out).not.toContain('p::Base::getName@p/Base.java');
+  });
+
+  it('C++: a call in a namespace takes the overload its arguments fit, not the one in its own file', async () => {
+    const out = await calleesIn({
+      'core.h': '#pragma once\nnamespace detail {\ntemplate <typename T, typename In, typename Out> Out copy(In b, In e, Out out) { return out; }\n}\n',
+      'format.h': '#pragma once\n#include "core.h"\nnamespace detail {\ntemplate <typename T, typename V, typename Out> Out copy(V s, Out out) { return out; }\ntemplate <typename Char, typename Out> Out write_it(Out out, const Char* b, const Char* e) {\n  return copy<Char>(b, e, out);\n}\n}\n',
+    }, 'detail::write_it');
+    expect(out).toEqual(['detail::copy@core.h']);
   });
 });

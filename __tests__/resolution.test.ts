@@ -6674,6 +6674,19 @@ class WrappedMapping(wrapped: Mapping) {
       expect(selfLoops(cg, 'Form.scala')).toEqual([]);
     }, 30000);
 
+    it('drops the self-loop for a TypeScript wrapper handing its call to a parameter', async () => {
+      fs.writeFileSync(path.join(tempDir, 'wrapped.ts'), `
+export class WrappedMapping {
+  unbind(wrapped, value: string): string {
+    return wrapped.unbind(value);
+  }
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      expect(selfLoops(cg, 'wrapped.ts')).toEqual([]);
+    }, 30000);
+
     it('keeps real recursion through this./bare calls and a Go named receiver', async () => {
       fs.writeFileSync(path.join(tempDir, 'Tree.java'), `
 public class Tree {
@@ -6695,6 +6708,25 @@ func (r *relayClient) sendBatchAttempt(retry bool) error {
       cg.resolveReferences();
       expect(selfLoops(cg, 'Tree.java').sort()).toEqual(['depth', 'size']);
       expect(selfLoops(cg, 'relay.go')).toEqual(['sendBatchAttempt']);
+    }, 30000);
+
+    it('keeps Go recursion through a range variable over the type\'s own children', async () => {
+      // cobra's `sub.checkCommandGroups()` over `c.commands`, etcd's
+      // `child.Repr(…)`: the loop variable is untyped, and it is the caller's type.
+      fs.writeFileSync(path.join(tempDir, 'node.go'), `
+package tree
+type Node struct{ children []*Node }
+func (n *Node) Size() int {
+	total := 1
+	for _, child := range n.children {
+		total += child.Size()
+	}
+	return total
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      expect(selfLoops(cg, 'node.go')).toEqual(['Size']);
     }, 30000);
   });
 });
