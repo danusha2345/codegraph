@@ -9,9 +9,10 @@
  * A receiver typed outside the project (`conn net.Conn`, `ctx
  * context.Context`, `c, _ := net.Dial(…)`, an alias `type Ctx =
  * context.Context`) gets no edge rather than a project method that happens
- * to share the name. A project function's result
- * declared as an outside type by value (`http.RoundTripper`) is left as it
- * was: that is usually an interface a project type implements.
+ * to share the name, and so does a project function's result declared as an
+ * outside type (`*os.File`, `http.RoundTripper`).
+ *
+ * Cases first written for PR #1954 by @danusha2345.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
@@ -109,10 +110,11 @@ func ifCtor() {
 	}
 }
 
-// \`r\` is what Reader returns, which is not read: not a ringLog.
+// \`r\` is what Reader returns: a reader, not a ringLog.
 func chainedCtor() { r := newRing().Reader(); r.Reset() }
 
-// On the binding's own line \`e\` is still the parameter.
+// On the binding's own line \`e\` is still the parameter; inside the
+// \`if\`, \`e\` is what wrap returns.
 func selfArg(e *Engine) {
 	if e := wrap(e.Run()); e != nil {
 		e.Write(nil)
@@ -224,9 +226,9 @@ func (s *Store) Put(k string) {}
     expect(await methodCallees(cg, 'qualifiedParam')).toEqual(['store/store.go::Store::Put']);
   });
 
-  it('a binding is not typed by the head of a call chain, nor on its own line', async () => {
-    expect(await methodCallees(cg, 'chainedCtor')).not.toContain('main.go::ringLog::Reset');
-    expect(await methodCallees(cg, 'selfArg')).toEqual(['main.go::Engine::Run']);
+  it('a binding is typed by the whole chain, and from the end of its own line', async () => {
+    expect(await methodCallees(cg, 'chainedCtor')).toEqual(['main.go::reader::Reset', 'main.go::ringLog::Reader']);
+    expect(await methodCallees(cg, 'selfArg')).toEqual(['main.go::Engine::Run', 'main.go::ringLog::Write']);
   });
 
   it.each(['stdlibParam', 'stdlibCtor', 'projectFuncReturningStdlib', 'netParam'])(
@@ -236,8 +238,10 @@ func (s *Store) Put(k string) {}
     },
   );
 
-  it('an outside interface a project function returns still reaches its implementation', async () => {
-    expect(await methodCallees(cg, 'interfaceResult')).toEqual(['main.go::limiter::RoundTrip']);
+  // Real code's by-name guesses here mostly took a namesake: prometheus's
+  // `handler := NewWriteHandler(…)` went to `readHandler::ServeHTTP`.
+  it('an outside interface a project function returns links nothing', async () => {
+    expect(await methodCallees(cg, 'interfaceResult')).toEqual([]);
   });
 
   it.each(['blockShadow', 'closureShadow'])(
@@ -331,4 +335,120 @@ func (d *Decoy) Usernames() {}
       expect(await methodCallees(cg, caller)).toEqual([]);
     },
   );
+});
+
+describe('Go receiver typing through what a call hands back', () => {
+  let dir: string;
+  let cg: CodeGraph;
+
+  beforeAll(async () => {
+    ({ dir, cg } = await indexProject({
+      'svc/svc.go': `package svc
+
+import (
+	"sync"
+
+	"google.golang.org/grpc"
+)
+
+type Client struct{}
+
+func (c *Client) Do() {}
+
+type monitor struct {
+	client func() (*Client, error)
+}
+
+func (m *monitor) run() {
+	c, _ := m.client()
+	c.Do()
+}
+
+type Result struct{}
+
+func (r *Result) Done() {}
+
+type Converter struct{}
+
+func (c *Converter) Convert() (*Result, error) { return &Result{}, nil }
+
+var pool sync.Pool
+
+func pooled() {
+	conv := pool.Get().(*Converter)
+	out, _ := conv.Convert()
+	out.Done()
+}
+
+type Resp struct{}
+
+func (r *Resp) GetKind() string { return "" }
+
+func stream(s grpc.ServerStreamingClient[Resp]) {
+	chunk, _ := s.Recv()
+	chunk.GetKind()
+}
+`,
+      'watch/watch.go': `package watch
+
+type Watcher struct{}
+
+func NewWatcher() *Watcher { return &Watcher{} }
+
+func (w *Watcher) Stop() {}
+`,
+      'watch/watch_test.go': `package watch_test
+
+import (
+	"testing"
+
+	. "example.com/app/watch"
+)
+
+func TestStop(t *testing.T) {
+	w := NewWatcher()
+	w.Stop()
+}
+`,
+      // Namesakes, so a guess by the method's name has somewhere wrong to go.
+      'decoy/decoy.go': `package decoy
+
+type Decoy struct{}
+
+func (d *Decoy) Do()   {}
+func (d *Decoy) Done() {}
+func (d *Decoy) Stop() {}
+`,
+    }));
+  });
+
+  afterAll(() => {
+    cg?.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const callees = async (caller: string, kind: 'function' | 'method' = 'function'): Promise<string[]> => {
+    const node = (await cg.searchNodes(caller, { limit: 20 })).find((r) => r.node.name === caller && r.node.kind === kind);
+    expect(node, caller).toBeDefined();
+    return (await cg.getCallees(node!.node.id))
+      .filter((c) => c.node.kind === 'method')
+      .map((c) => `${c.node.filePath}::${c.node.qualifiedName}`)
+      .sort();
+  };
+
+  it('a func-typed field is called for the result its type declares', async () => {
+    expect(await callees('run', 'method')).toEqual(['svc/svc.go::Client::Do']);
+  });
+
+  it('an assertion types the value, whatever hands it out', async () => {
+    expect(await callees('pooled')).toEqual(['svc/svc.go::Converter::Convert', 'svc/svc.go::Result::Done']);
+  });
+
+  it('a function a dot import brings in types its result', async () => {
+    expect(await callees('TestStop')).toEqual(['watch/watch.go::Watcher::Stop']);
+  });
+
+  it('what an outside generic type hands back is left to name matching, as before', async () => {
+    expect(await callees('stream')).toEqual(['svc/svc.go::Resp::GetKind']);
+  });
 });

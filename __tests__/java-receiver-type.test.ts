@@ -242,6 +242,8 @@ class Holder<T extends Hook> {
     expect(callees('Screen', 'libraryParam')).toEqual([]);
     expect(callees('Screen', 'libraryGenericLocal')).toEqual([]);
     expect(callees('Screen', 'libraryForEach')).toEqual([]);
+    // A static call on an imported library class (`Log.d` beside a project `Decoy.d`).
+    expect(callees('Screen', 'staticLibrary')).toEqual([]);
   });
 
   it('a JDK type is not read as a same-named type nested in another package', () => {
@@ -274,5 +276,248 @@ class Holder<T extends Hook> {
 
   it('a type-parameter receiver is not treated as a library type', () => {
     expect(callees('Holder', 'go')).toEqual(['p::Hook::fire']);
+  });
+});
+
+describe('Java receivers keep the type their declaration names', () => {
+  let dir: string;
+  let cg: CodeGraph;
+
+  beforeAll(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-java-field-written-'));
+    const write = (rel: string, body: string) => {
+      fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(dir, rel), body);
+    };
+    write('src/a/Pause.java', `package a;
+public class Pause {
+    public static class Suite {
+        public void runDelay(String id) {}
+    }
+}
+`);
+    write('src/a/http/Request.java', `package a.http;
+public class Request {
+    public String getBody() { return ""; }
+}
+`);
+    // kestra's AbstractRunnerTest: `protected PauseTest.Suite pauseTest;` under
+    // `import io.kestra.plugin.core.flow.*;`, and RequestTest's field written
+    // with the project package beside an import of a library `HttpRequest`.
+    write('src/b/Runner.java', `package b;
+
+import a.*;
+import io.lib.Request;
+
+public class Runner {
+    protected Pause.Suite pause;
+    private a.http.Request request;
+
+    public void delay() {
+        pause.runDelay("x");
+    }
+
+    public void body() {
+        request.getBody();
+    }
+
+    // spring-ai's \`org.springframework.ai.chat.messages.Message message\` beside
+    // an import of the Anthropic SDK's \`Message\`: a local or loop variable
+    // written with its package.
+    public void localBody(java.util.List<a.http.Request> all) {
+        a.http.Request first = all.get(0);
+        first.getBody();
+    }
+
+    public void eachBody(java.util.List<a.http.Request> all) {
+        for (a.http.Request each : all) {
+            each.getBody();
+        }
+    }
+}
+`);
+    // SystemUI's QSTileImpl<TState extends State>: a field typed by the class's
+    // type parameter, beside another class's same-named method.
+    write('src/a/State.java', `package a;
+public class State {
+    public void copyTo(State other) {}
+}
+`);
+    write('src/a/Other.java', `package a;
+public class Other {
+    public void copyTo(Other other) {}
+}
+`);
+    write('src/b/Tile.java', `package b;
+
+import a.State;
+
+public abstract class Tile<TState extends State> {
+    private TState mTmpState;
+
+    public void refresh() {
+        mTmpState.copyTo(null);
+    }
+}
+`);
+    // SystemUI's HeadsUpManagerPhone: `AlertEntry`, nested in a class two
+    // levels up its hierarchy, named without an import.
+    write('src/a/Alerts.java', `package a;
+public abstract class Alerts {
+    public static class Entry {
+        public void update() {}
+    }
+}
+`);
+    write('src/a/HeadsUp.java', `package a;
+public abstract class HeadsUp extends Alerts {}
+`);
+    write('src/c/Store.java', `package c;
+public class Store {
+    public void update() {}
+}
+`);
+    write('src/b/Phone.java', `package b;
+
+import a.HeadsUp;
+
+public class Phone extends HeadsUp {
+    public void refresh(java.util.List<Entry> entries) {
+        for (Entry entry : entries) {
+            entry.update();
+        }
+    }
+}
+`);
+    // kestra: a `java.net.URI` (short enough to read as a type parameter) and
+    // a project enum, whose `name()` is Java's, beside project methods the
+    // receivers' names match.
+    write('src/a/FlowWithPath.java', `package a;
+public class FlowWithPath {
+    public String getPath() { return ""; }
+}
+`);
+    write('src/a/Type.java', `package a;
+public class Type {
+    public String name() { return ""; }
+}
+`);
+    write('src/a/ServiceType.java', `package a;
+public enum ServiceType { WORKER, EXECUTOR }
+`);
+    write('src/b/Storage.java', `package b;
+
+import java.net.URI;
+import a.ServiceType;
+
+public class Storage {
+    private URI base;
+    private ServiceType kind;
+
+    public void local(URI path, ServiceType type) {
+        path.getPath();
+        type.name();
+    }
+
+    public void field() {
+        base.getPath();
+        kind.name();
+    }
+}
+`);
+    // playframework's javaguide: `import play.mvc.Http.*;` names Http's
+    // nested `RequestBody`.
+    write('src/a/Web.java', `package a;
+public class Web {
+    public static class Body {
+        public String asText() { return ""; }
+    }
+}
+`);
+    write('src/b/Parsers.java', `package b;
+
+import a.Web.*;
+
+public class Parsers {
+    public void read(Body body) {
+        body.asText();
+    }
+}
+`);
+    // spring-modulith's ApplicationModule: `Comparable<ApplicationModule>` in
+    // the class head names the class, not a type parameter, and a nested
+    // class's field of that type types the call on a local named like it.
+    write('src/a/AppModule.java', `package a;
+public class AppModule implements Comparable<AppModule> {
+    public java.util.List<String> getNames() { return null; }
+    public int compareTo(AppModule other) { return 0; }
+
+    public static class Link {
+        private final AppModule target;
+
+        Link(AppModule target) { this.target = target; }
+
+        static Link of(AppModule source) {
+            var target = source.find();
+            var names = target.getNames();
+            return null;
+        }
+    }
+
+    public AppModule find() { return this; }
+}
+`);
+    write('src/c/Other.java', `package c;
+public class Other {
+    public java.util.List<String> getNames() { return null; }
+}
+`);
+    cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+  });
+
+  afterAll(() => {
+    cg?.destroy();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function callees(owner: string, method: string): string[] {
+    const node = cg.searchNodes(method).map((r) => r.node).find((n) => n.qualifiedName.endsWith(`${owner}::${method}`));
+    expect(node, `${owner}::${method}`).toBeDefined();
+    return cg.getCallees(node!.id).filter((c) => c.edge.kind === 'calls').map((c) => c.node.qualifiedName).sort();
+  }
+
+  it('a field typed with its outer class, through an on-demand import, resolves on the nested type', () => {
+    expect(callees('Runner', 'delay')).toEqual(['a::Pause::Suite::runDelay']);
+  });
+
+  it('a field written with its package resolves on that type, whatever the file imports by the name', () => {
+    expect(callees('Runner', 'body')).toEqual(['a.http::Request::getBody']);
+  });
+
+  it('a local or loop variable written with its package resolves on that type too', () => {
+    expect(callees('Runner', 'localBody')).toEqual(['a.http::Request::getBody']);
+    expect(callees('Runner', 'eachBody')).toEqual(['a.http::Request::getBody']);
+  });
+
+  it('a field typed by the class type parameter resolves on its bound', () => {
+    expect(callees('Tile', 'refresh')).toEqual(['a::State::copyTo']);
+  });
+
+  it('a nested type a superclass declares is named without an import', () => {
+    expect(callees('Phone', 'refresh')).toEqual(['a::Alerts::Entry::update']);
+  });
+
+  it('a library type with a short name, or a project enum lacking the method, gets no guess', () => {
+    expect(callees('Storage', 'local')).toEqual([]);
+    expect(callees('Storage', 'field')).toEqual([]);
+  });
+
+  it('an on-demand import of a class names its nested types', () => {
+    expect(callees('Parsers', 'read')).toEqual(['a::Web::Body::asText']);
+  });
+
+  it('a class the head names as a type argument is no type parameter', () => {
+    expect(callees('Link', 'of')).toEqual(['a::AppModule::find', 'a::AppModule::getNames']);
   });
 });

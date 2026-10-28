@@ -84,6 +84,60 @@ describe('exact-name resolution prefers the caller\'s own copy of a duplicated m
     expect(calls[0]!.metadata?.confidence).toBe(0.7);
   });
 
+  // Android build flavors keep one package in two source sets that are never
+  // compiled together, so a name the package declares needs no import and
+  // means the caller's own flavor's copy.
+  const FLAVORS = 'platform/apps/mobile/android/app/src';
+
+  it("resolves a Kotlin flavor's call to its own copy of the package", async () => {
+    for (const flavor of ['rc2', 'rcpro2']) {
+      const dir = `${FLAVORS}/${flavor}/kotlin/com/app/util`;
+      write(tempDir, `${dir}/Util.kt`, ['package com.app.util', '', 'fun compute(): Int = 1']);
+      write(tempDir, `${dir}/Main.kt`, ['package com.app.util', '', 'fun run(): Int = compute()']);
+    }
+    cg = await CodeGraph.init(tempDir, { index: true });
+    cg.resolveReferences();
+
+    const flavors = ['rc2', 'rcpro2'];
+    const calls = await Promise.all(flavors.map((f) => callsFrom('run', `${FLAVORS}/${f}/kotlin/com/app/util/Main.kt`)));
+    expect(calls.map((c) => c.map((e) => e.target))).toEqual(
+      flavors.map((f) => [fn('compute', `${FLAVORS}/${f}/kotlin/com/app/util/Util.kt`).id]),
+    );
+    expect(calls.map((c) => c[0]!.metadata?.confidence)).toEqual([0.8, 0.8]);
+  });
+
+  it("resolves a Java flavor's `new Util()` to its own copy of the class", async () => {
+    for (const flavor of ['rc2', 'rcpro2']) {
+      const dir = `${FLAVORS}/${flavor}/java/com/app/util`;
+      write(tempDir, `${dir}/Util.java`, ['package com.app.util;', '', 'public class Util {', '  public int compute() { return 1; }', '}']);
+      write(tempDir, `${dir}/Main.java`, ['package com.app.util;', '', 'public class Main {', '  int run() { return new Util().compute(); }', '}']);
+    }
+    cg = await CodeGraph.init(tempDir, { index: true });
+    cg.resolveReferences();
+
+    for (const flavor of ['rc2', 'rcpro2']) {
+      const dir = `${FLAVORS}/${flavor}/java/com/app/util`;
+      const run = cg.getNodesByKind('method').find((n) => n.name === 'run' && n.filePath === `${dir}/Main.java`);
+      const util = cg.getNodesByKind('class').find((n) => n.name === 'Util' && n.filePath === `${dir}/Util.java`);
+      const made = cg.getOutgoingEdges(run!.id).filter((e) => e.kind === 'instantiates').map((e) => e.target);
+      expect(made).toEqual([util!.id]);
+    }
+  });
+
+  it('leaves a match of the caller itself at the proximity score', async () => {
+    // Recursion, or a receiver the call lost (`json.dumps` inside `dumps`):
+    // the caller's own copy being the caller says nothing of which copy.
+    for (const mod of ['rc2', 'rcpro2']) {
+      write(tempDir, `${ROOT}/${mod}/walk.py`, ['def walk(n):', '    return walk(n - 1)']);
+    }
+    cg = await CodeGraph.init(tempDir, { index: true });
+    cg.resolveReferences();
+
+    const calls = await callsFrom('walk', `${ROOT}/rcpro2/walk.py`);
+    expect(calls.map((e) => e.target)).toEqual([fn('walk', `${ROOT}/rcpro2/walk.py`).id]);
+    expect(calls[0]!.metadata?.confidence).toBe(0.7);
+  });
+
   it('leaves a single-candidate name unaffected', async () => {
     cg = await CodeGraph.init(tempDir, { index: true });
     cg.resolveReferences();

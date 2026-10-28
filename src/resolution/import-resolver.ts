@@ -35,6 +35,7 @@ import {
   isPythonFromImportModule,
   isRustAssociatedItem,
   tsGlobalScope,
+  rustItemPlacement,
 } from './name-matcher';
 import { JS_ARRAY_METHODS } from './js-builtins';
 
@@ -3698,16 +3699,6 @@ function resolveRustPathReference(
   const leaf = segments[segments.length - 1]!;
   const modSegs = segments.slice(0, -1);
 
-  // A path whose head a `use` binds from the standard library — `error::Error`
-  // under `use std::{error, fmt, io};` — is std's, whatever the file around it
-  // is called: `error/mod.rs`'s own `Error` is not `std::error::Error`.
-  const head = modSegs[0]!;
-  if (!/^(?:crate|self|super)$/.test(head)) {
-    const usePath = rustUseBindings(ref.filePath, context).get(head, ref.line, ref.column);
-    const useSegs = usePath ? usePath.split('::').filter(Boolean) : [];
-    if (useSegs.length > 0 && RUST_STDLIB_ROOTS.has(useSegs[0]!) && resolveRustModuleFile(useSegs, ref.filePath, context) === null) return null;
-  }
-
   const file = resolveRustModuleFile(modSegs, ref.filePath, context);
   if (!file) return null;
 
@@ -3718,7 +3709,8 @@ function resolveRustPathReference(
   // of one name are `#[cfg]` variants of it; the first one stands for both.
   // With none, the path reaches an inline module's item through a re-export
   // (`#[cfg(…)] mod imp { … }` + `pub use imp::*;`), never an associated item
-  // of an `impl` or `trait` body.
+  // of an `impl` or `trait` body: serde's `use crate::de::Error` is not
+  // `de/mod.rs`'s `impl SeqAccess`'s `type Error`.
   const candidates = context.getNodesInFile(file).filter(
     (n) =>
       n.name === leaf &&
@@ -3735,12 +3727,17 @@ function resolveRustPathReference(
       isLexicallyReachable(n, ref, context)
   );
   const target =
-    candidates.find((n) => rustUseBindings(file, context).isModuleLevelDeclaration(n.startLine, n.startColumn)) ??
-    candidates.find((n) => rustUseBindings(file, context).isInlineModuleDeclaration(n.startLine, n.startColumn));
-  if (target) {
-    return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
-  }
-  return null;
+    candidates.find((n) => rustItemPlacement(n, context) === 'top') ??
+    candidates.find((n) => rustItemPlacement(n, context) === 'inline');
+  if (!target) return null;
+  // A path whose head a `use` binds from the standard library — `fs::read`
+  // under `use std::fs;`, `error::Error` under `use std::{error, io};` — is
+  // std's, whatever the module the project has of that name: `fs/mod.rs`'s own
+  // `read` is not `std::fs::read`. (Asked only here, where it changes the
+  // answer: the check reads the file's `use`s.)
+  const head = modSegs[0]!;
+  if (!/^(?:crate|self|super)$/.test(head) && isBoundToOutOfRepoImport({ ...ref, referenceName: head }, context)) return null;
+  return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
 }
 
 const rustUseBindingMemos = new WeakMap<ResolutionContext, Map<string, ReturnType<typeof parseRustUseBindings>>>();

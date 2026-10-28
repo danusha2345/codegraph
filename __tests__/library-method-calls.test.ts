@@ -68,6 +68,16 @@ const files: Record<string, string> = {
     '    int named() { var userRegistry = make(); return userRegistry.size(); }\n' +
     '    Registry make() { return null; }\n' +
     '}\n',
+  'cs/App/Money.cs':
+    'namespace App {\n' +
+    '  public class Money {\n' +
+    '    public override string ToString() { return "m"; }\n' +
+    '  }\n' +
+    '  public class Use {\n' +
+    '    object Make() { return null; }\n' +
+    '    public string Look() { var cls = Make(); return cls.ToString(); }\n' +
+    '  }\n' +
+    '}\n',
 };
 
 beforeAll(async () => {
@@ -115,5 +125,9 @@ describe('library-method calls on untyped receivers', () => {
     expect(calleesOf('count', 'Registry.java')).toEqual(['Registry::size']);
     expect(calleesOf('own', 'Registry.java')).toEqual(['Registry::get']);
     expect(calleesOf('named', 'Use.java')).toEqual(['Registry::size', 'Use::make']);
+  });
+
+  it('C#: a receiver named `cls` is a value like any other, not the class itself', () => {
+    expect(calleesOf('Look', 'Money.cs')).toEqual(['Use::Make']);
   });
 });

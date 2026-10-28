@@ -2548,14 +2548,14 @@ export function blankCDesignatedMacroArgs(source: string): string {
 }
 
 /**
- * Collapse a `#if … #elif … #else … #endif` group whose branches are not
- * self-contained statements to its first live branch. tree-sitter-c keeps
- * EVERY branch of a conditional group and parses each as a run of block
- * items, so a group is only harmless when each branch is complete on its
- * own. Three shapes in real C are not, and each ends in a phantom function
- * (K&R `if(cond) { … }` reads as an implicit-int function definition named
- * `if`, and the extractor then files it — and every symbol after it — under
- * the enclosing function; 265 on a betaflight tree, #1729 follow-up):
+ * Open up a `#if … #elif … #else … #endif` group whose branches are not
+ * self-contained statements. tree-sitter-c keeps EVERY branch of a
+ * conditional group and parses each as a run of block items, so a group is
+ * only harmless when each branch is complete on its own. Three shapes in
+ * real C are not, and each ends in a phantom function (K&R
+ * `if(cond) { … }` reads as an implicit-int function definition named `if`,
+ * and the extractor then files it — and every symbol after it — under the
+ * enclosing function; 265 on a betaflight tree, #1729 follow-up):
  *
  *  - a branch that BEGINS with `else` — `} #ifdef X  else if (…) { … } #endif`
  *    (a conditional arm of an if-chain);
@@ -2564,13 +2564,15 @@ export function blankCDesignatedMacroArgs(source: string): string {
  *  - a branch whose braces do not balance — a function signature or a `{`
  *    that differs per configuration, with the body shared.
  *
- * The first branch not written `#if 0` is kept verbatim; every other branch
- * AND the group's directive lines are blanked to spaces (newlines and `\r`
- * kept, so offsets survive), which is exactly what the preprocessor would
- * hand a compiler for that configuration. The symbols the other branches
- * held were not extracting cleanly anyway. Balanced groups — the vast
- * majority — are untouched. This pass edits directive lines on purpose, so
- * it runs AFTER `restoreDirectiveLines` (like the named-variadic pass).
+ * The group's directive lines are blanked to spaces (newlines and `\r` kept,
+ * so offsets survive). When every branch's braces and parentheses balance,
+ * all branches stay, read in a row. Otherwise one branch stays verbatim and
+ * the rest become spaces too, which is what the preprocessor would hand a
+ * compiler for that configuration: the `#else` of a feature test, the first
+ * branch of `#ifndef`, the live one of `#if 0` or `#if 1`. Groups whose
+ * branches are whole statements — the vast majority — are untouched. This
+ * pass edits directive lines on purpose, so it runs AFTER
+ * `restoreDirectiveLines` (like the named-variadic pass).
  * Groups are handled innermost-first; an inner group inside a blanked branch
  * simply disappears with it.
  */
@@ -2580,36 +2582,48 @@ const C_COND_ENDIF_RE = /^[ \t]*#[ \t]*endif\b/;
 export function blankCUnbalancedConditionalBranches(source: string): string {
   if (source.indexOf('#') === -1) return source;
   const lines = source.split('\n');
+  // The same lines with comments and string / char literals as spaces: a `{`
+  // in a block comment over several lines (Lua's `** {======` banners) or a
+  // `#` line inside one is not code. Blanked along with `lines`, so an outer
+  // group reads an inner one as collapsed.
+  const masked = maskCppCommentsAndLiterals(source).split('\n');
   const stripCr = (l: string): string => (l.endsWith('\r') ? l.slice(0, -1) : l);
-  // Code content of a line: comments and string / char literals removed.
-  const code = (l: string): string =>
-    stripCr(l)
-      .replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '')
-      .replace(/\/\*.*?\*\//g, '')
-      .replace(/\/\/.*$/, '')
-      .trim();
+  // Code content of a line.
+  const code = (k: number): string => stripCr(masked[k] as string).trim();
   const blank = (l: string): string => l.replace(/[^\r]/g, ' ');
+  const blankLine = (k: number): void => {
+    lines[k] = blank(lines[k] as string);
+    masked[k] = blank(masked[k] as string);
+  };
   // Directive line indices of each open group, innermost last.
   // `positive`: the group opens on a feature test (`#ifdef X`, `#if defined(X)`,
   // `#if X`), whose `#else` branch is the default build. `elseAt`: index into
-  // marks of that `#else`, if any.
-  const stack: Array<{ marks: number[]; dead: boolean; positive: boolean; elseAt: number }> = [];
+  // marks of that `#else`, if any. `literal`: `#if 0` or `#if 1`.
+  const stack: Array<{ marks: number[]; dead: boolean; literal: boolean; positive: boolean; elseAt: number }> = [];
   const directive: boolean[] = [];
+  // Lines that continue the directive above them with a `\`.
+  const continued: boolean[] = [];
   let changed = false;
   let continuation = false;
   for (let i = 0; i < lines.length; i++) {
-    const line = stripCr(lines[i] as string);
+    const line = stripCr(masked[i] as string);
     const isDirective: boolean = continuation || /^[ \t]*#/.test(line);
     directive[i] = isDirective;
+    continued[i] = continuation;
     const wasContinuation = continuation;
-    continuation = isDirective && /\\\s*$/.test(line);
+    // Read on the raw line: a `\` that ends a line splices it even inside a
+    // comment (a multi-line comment in a `#define` body), and masking would
+    // hide it.
+    continuation = isDirective && /\\\s*$/.test(stripCr(lines[i] as string));
     if (!isDirective || wasContinuation) continue;
     let m: RegExpExecArray | null;
     if ((m = C_COND_OPEN_RE.exec(line))) {
       const cond = (m[2] as string).trim();
       const dead = m[1] === 'if' && /^0\b/.test(cond);
-      const positive = m[1] === 'ifdef' || (m[1] === 'if' && !dead && !/^!/.test(cond));
-      stack.push({ marks: [i], dead, positive, elseAt: -1 });
+      // `#if 1` is the other way round from `#if 0`: its first branch is the live one.
+      const live = m[1] === 'if' && /^1\b/.test(cond);
+      const positive = m[1] === 'ifdef' || (m[1] === 'if' && !dead && !live && !/^!/.test(cond));
+      stack.push({ marks: [i], dead, literal: dead || live, positive, elseAt: -1 });
       continue;
     }
     const top = stack[stack.length - 1];
@@ -2629,25 +2643,30 @@ export function blankCUnbalancedConditionalBranches(source: string): string {
     const keep = top.dead ? 1 : top.positive && top.elseAt > 0 ? top.elseAt : 0;
     if (keep >= top.marks.length - 1) continue; // `#if 0` with nothing to keep
     let damaged = false;
-    for (let b = 0; b < top.marks.length - 1 && !damaged; b++) {
+    // Whether each branch's braces and parentheses balance on their own.
+    let balanced = true;
+    for (let b = 0; b < top.marks.length - 1; b++) {
       const body: string[] = [];
       for (let k = (top.marks[b] as number) + 1; k < (top.marks[b + 1] as number); k++) {
         if (directive[k]) continue; // a `\`-continued directive line
-        const c = code(lines[k] as string);
+        const c = code(k);
         if (c) body.push(c);
       }
       if (body.length === 0) continue;
       const first = body[0] as string;
       const last = body[body.length - 1] as string;
       let depth = 0;
+      let parens = 0;
       let dips = false;
       for (const l of body) {
         for (const ch of l) {
           depth += ch === '{' ? 1 : ch === '}' ? -1 : 0;
+          parens += ch === '(' ? 1 : ch === ')' ? -1 : 0;
           if (depth < 0) dips = true; // closes a block it did not open (`} else if (…) {`)
         }
       }
-      damaged =
+      if (depth !== 0 || parens !== 0) balanced = false;
+      damaged ||=
         depth !== 0 ||
         dips ||
         /^else\b/.test(first) ||
@@ -2658,16 +2677,25 @@ export function blankCUnbalancedConditionalBranches(source: string): string {
         (/^(else[ \t]+)?if[ \t]*\(/.test(last) && /\)$/.test(last));
     }
     if (!damaged) continue;
+    // A group on a flag whose branches each balance keeps them all: read in
+    // a row they are still C (`} else if (a) {…} else if (b) {…}`, list
+    // entries, `|| x || y`), and the parser needed only the directive lines
+    // gone. Dropping one would lose real code of a build the project may
+    // well use (betaflight's ENABLE_RESCUE_PLAN arms). A branch that opens or
+    // closes more than it should, or a literal `#if 0` / `#if 1`, keeps one.
+    const keepAll = balanced && !top.literal;
     for (let b = 0; b < top.marks.length - 1; b++) {
       const from = top.marks[b] as number;
       const to = top.marks[b + 1] as number;
       // The directive line (with its `\`-continuations), then — unless this
       // is the kept branch — the branch body.
-      for (let k = from; k < to && (k === from || directive[k]); k++) lines[k] = blank(lines[k] as string);
-      if (b === keep) continue;
-      for (let k = from + 1; k < to; k++) lines[k] = blank(lines[k] as string);
+      // Only its own `\` continuations: a `#define` or `#include` right under
+      // it is a line of the branch, kept with a kept branch.
+      for (let k = from; k < to && (k === from || continued[k]); k++) blankLine(k);
+      if (b === keep || keepAll) continue;
+      for (let k = from + 1; k < to; k++) blankLine(k);
     }
-    lines[i] = blank(lines[i] as string);
+    blankLine(i);
     changed = true;
   }
   return changed ? lines.join('\n') : source;

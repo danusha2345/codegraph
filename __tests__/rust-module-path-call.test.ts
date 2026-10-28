@@ -26,9 +26,48 @@ mod caller;
 mod importer;
 mod handle;
 mod worker;
+mod twice;
+mod inline_reexport;
+mod fs;
+mod uses_std;
 
 pub fn via_self() -> usize {
     self::util::take(1)
+}
+`,
+    // A namesake in an inline module, before the module's own item.
+    'src/twice.rs': `#[cfg(test)]
+mod tests {
+    pub fn pick() -> usize {
+        0
+    }
+}
+
+pub fn pick() -> usize {
+    1
+}
+
+pub fn via_twice() -> usize {
+    crate::twice::pick()
+}
+`,
+    // The item lives in an inline module the file passes on with a glob.
+    'src/inline_reexport.rs': `#[cfg(unix)]
+mod imp {
+    pub fn lone() {}
+}
+pub use imp::*;
+
+pub fn via_inline() {
+    crate::inline_reexport::lone();
+}
+`,
+    // A project module named like a module of the standard library.
+    'src/fs/mod.rs': 'pub fn read(path: &str) -> usize {\n    path.len()\n}\n',
+    'src/uses_std.rs': `use std::fs;
+
+pub fn loads() {
+    let _ = fs::read("config.toml");
 }
 `,
     'src/util.rs': `pub struct Buf;
@@ -167,5 +206,18 @@ describe('Rust calls through a module path', () => {
   it('link nothing when the module declares no such free function, or is not in the index', () => {
     expect(callsFrom('src/caller.rs', 'via_method_only')).toEqual([]);
     expect(callsFrom('src/caller.rs', 'via_missing')).toEqual([]);
+  });
+
+  it('prefer the module\'s own item to a namesake in a module it declares inline', () => {
+    expect(callsFrom('src/twice.rs', 'via_twice')).toEqual(['function pick src/twice.rs:8']);
+  });
+
+  it('reach an inline module\'s item the module passes on, from the module\'s own file', () => {
+    expect(callsFrom('src/inline_reexport.rs', 'via_inline')).toEqual(['function lone src/inline_reexport.rs:3']);
+  });
+
+  it('leave a path through a module a `use` takes from the standard library to it', () => {
+    // `fs::read` under `use std::fs;` is std's, not `src/fs/mod.rs`'s `read`.
+    expect(callsFrom('src/uses_std.rs', 'loads')).toEqual([]);
   });
 });
