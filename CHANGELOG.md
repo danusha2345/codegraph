@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- In JavaScript and TypeScript, you can now find a named object’s data properties by words in their leading documentation comments, even near the end of a long object literal. (#3408)
+
 
 ## [1.6.3] - 2026-11-17
 
