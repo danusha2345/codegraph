@@ -14,6 +14,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Kotlin Gradle scripts that call `annotation("example.Entity")` in an `allOpen` block now index without a parse warning. (#3410)
+
 - In JavaScript and TypeScript, you can now find a named object’s data properties by words in their leading documentation comments, even near the end of a long object literal. (#3408)
 
 
