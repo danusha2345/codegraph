@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { defineConfig } from 'vitest/config';
 import { WASM_RUNTIME_FLAGS } from './src/extraction/wasm-runtime-flags';
@@ -17,6 +18,15 @@ export default defineConfig({
     // A throwaway home dir (and git global config) per test file, so nothing
     // the suite runs can write to the developer's real one (#2275).
     setupFiles: ['./__tests__/setup-home-sandbox.ts'],
+    /**
+     * Since Vitest 3 a synchronous test or hook fails when it outlasts its
+     * timeout. Under Vitest 2 the timer could not fire until the body had
+     * returned, so a body blocked in `spawnSync` never timed out at all. Hundreds
+     * of tests here block on the built CLI, and on a loaded machine the 5 s and
+     * 10 s defaults would turn them into flakes.
+     */
+    testTimeout: 30_000,
+    hookTimeout: 60_000,
     /**
      * Several MCP integration tests (mcp-daemon, mcp-initialize, mcp-ppid-watchdog,
      * mcp-roots) spawn `dist/bin/codegraph.js serve --mcp` with `process.execPath`
@@ -65,12 +75,26 @@ export default defineConfig({
         test: {
           name: 'engine',
           include: ['__tests__/**/*.test.ts'],
+          // A lazy `require` of a `.ts` file can't run under vitest's module
+          // transform: see src/lazy-engine.ts.
+          alias: [
+            {
+              find: /^\.\/lazy-engine$/,
+              replacement: fileURLToPath(new URL('./__tests__/lazy-engine-eager.ts', import.meta.url)),
+            },
+            {
+              find: /^\.\/lazy-frameworks$/,
+              replacement: fileURLToPath(new URL('./__tests__/lazy-frameworks-eager.ts', import.meta.url)),
+            },
+          ],
           exclude: ['**/node_modules/**', '**/dist/**', '__tests__/ui-package.test.ts'],
         },
       },
       {
         // Browser package resolution must not leak into the engine project:
         // web-tree-sitter and other dual packages would resolve differently.
+        // And no `extends`: a project that extends takes the base's `include`
+        // too, so every engine suite would run a second time inside jsdom.
         extends: false,
         plugins: [svelte({ configFile: 'ui/svelte.config.js' })],
         resolve: { conditions: ['browser'] },

@@ -10,8 +10,12 @@
  */
 
 import type { Node } from '../types';
+import { blankRustCode } from '../resolution/rust-scopes';
 import { isTestFile } from '../search/query-utils';
 import { isTestScope } from './dead-code';
+
+/** `#[cfg(test)]`, or `test` as one condition of `#[cfg(all(…))]`. `not(test)` is neither. */
+const CFG_TEST = /^#\[cfg\((?:test\)|all\((?:.*,\s*)?test\s*[,)])/;
 
 /** `node` is test code. `source` is the node's file, read when the caller has it. */
 export function isTestCode(node: Node, source?: string): boolean {
@@ -21,16 +25,17 @@ export function isTestCode(node: Node, source?: string): boolean {
 }
 
 /**
- * `line` (1-based) is inside a module declared under `#[cfg(test)]`. The
- * module's extent is its brace block, counted with string literals and line
- * comments blanked out, which is as far as a module-level reading needs to go.
+ * `line` (1-based) is inside a module declared under a test `cfg`. The
+ * module's extent is its brace block, counted with comments and the contents
+ * of strings and characters blanked, which is as far as a module-level reading
+ * needs to go.
  */
 export function inCfgTestModule(source: string, line: number): boolean {
-  const lines = source.split('\n');
+  const lines = blankRustCode(source).split('\n');
   let armed = false;
   for (let i = 0; i < lines.length && i < line; i++) {
     const text = lines[i]!.trim();
-    if (/^#\[cfg\(test\)\]/.test(text)) { armed = true; continue; }
+    if (CFG_TEST.test(text)) { armed = true; continue; }
     if (!armed) continue;
     if (text.startsWith('#[') || text === '') continue;
     armed = false;
@@ -38,7 +43,7 @@ export function inCfgTestModule(source: string, line: number): boolean {
     // Walk the block: it ends on the line where its braces close.
     let depth = 0;
     for (let j = i; j < lines.length; j++) {
-      for (const ch of lines[j]!.replace(/"(?:[^"\\]|\\.)*"/g, '""').replace(/\/\/.*$/, '')) {
+      for (const ch of lines[j]!) {
         if (ch === '{') depth++;
         else if (ch === '}') depth--;
       }

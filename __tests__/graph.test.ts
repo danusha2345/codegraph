@@ -585,6 +585,34 @@ describe('Traversal edge-completeness & limits (#1086–#1090)', () => {
     expect(batches[0]).toEqual(['B', 'C']);
   });
 
+  it('findPath keeps one predecessor per node instead of copying the path into the queue', () => {
+    const depth = 400;
+    const nodes = Array.from({ length: depth + 1 }, (_, i) => tNode(`n${i}`));
+    const edges: Edge[] = nodes.slice(1).map((node, i) => ({ source: `n${i}`, target: node.id, kind: 'calls' }));
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const q = {
+      getNodeById: (id: string) => byId.get(id) ?? null,
+      getNodesByIds: (ids: readonly string[]) => new Map(ids.map((id) => [id, byId.get(id)!] as const)),
+      getOutgoingEdges: (source: string) => edges.filter((e) => e.source === source),
+    };
+
+    // Count the elements array iteration walks, so no timing is involved. A
+    // queue entry that copies its path walks 1 + 2 + ... + depth of them.
+    const iterate = Array.prototype[Symbol.iterator];
+    let walked = 0;
+    let found: ReturnType<GraphTraverser['findPath']>;
+    try {
+      Array.prototype[Symbol.iterator] = function* (this: unknown[]) {
+        for (let i = 0; i < this.length; i++) { walked++; yield this[i]; }
+      } as never;
+      found = new GraphTraverser(q as never).findPath('n0', `n${depth}`);
+    } finally {
+      Array.prototype[Symbol.iterator] = iterate;
+    }
+    expect(found).toHaveLength(depth + 1);
+    expect(walked).toBeLessThan(depth * 10);
+  });
+
   it('traverseBFS keeps every parallel edge to the same target (#1090)', () => {
     // A reaches B via both `calls` and `references` — two distinct edges.
     const edges: Edge[] = [

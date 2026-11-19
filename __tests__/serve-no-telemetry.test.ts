@@ -13,6 +13,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
+import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
@@ -31,7 +32,7 @@ async function runOneToolCall(
   };
   delete env.CODEGRAPH_TELEMETRY;
   delete env.DO_NOT_TRACK;
-  const child = spawn(process.execPath, [BIN, 'serve', '--mcp', '--no-watch', '--path', project, ...extraArgs], {
+  const child = spawn(process.execPath, [...WASM_RUNTIME_FLAGS, BIN, 'serve', '--mcp', '--no-watch', '--path', project, ...extraArgs], {
     env,
     stdio: ['pipe', 'pipe', 'pipe'],
   });

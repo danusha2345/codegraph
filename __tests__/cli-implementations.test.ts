@@ -189,4 +189,39 @@ describe('inCfgTestModule()', () => {
     expect(inCfgTestModule(source, 8)).toBe(false);
     expect(inCfgTestModule(source, 10)).toBe(false);
   });
+
+  it('finds the end of the module past a brace in a character, a raw string or a block comment', () => {
+    const tricky = [
+      '#[cfg(test)]',
+      'mod tests {',
+      "    const OPEN: char = '{';",
+      '    const RAW: &str = r#"{"#;',
+      '    /* { */',
+      '    struct Mock;',
+      '}',
+      'pub struct After;',
+    ].join('\n');
+    expect(inCfgTestModule(tricky, 6)).toBe(true);
+    expect(inCfgTestModule(tricky, 8)).toBe(false);
+  });
+
+  it('reads test inside cfg(all(...)), and not a negated test', () => {
+    const gated = [
+      '#[cfg(all(test, not(loom)))]',
+      'mod tests {',
+      '    struct Mock;',
+      '}',
+      '#[cfg(all(feature = "sync", test))]',
+      'mod sync_tests {',
+      '    struct SyncMock;',
+      '}',
+      '#[cfg(all(unix, not(test)))]',
+      'mod real {',
+      '    struct Real;',
+      '}',
+    ].join('\n');
+    expect(inCfgTestModule(gated, 3)).toBe(true);
+    expect(inCfgTestModule(gated, 7)).toBe(true);
+    expect(inCfgTestModule(gated, 11)).toBe(false);
+  });
 });

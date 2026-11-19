@@ -1,3 +1,10 @@
+/**
+ * A bare Rust name a `use` binds: the item that `use`'s path names, where
+ * the `use` is in scope — a block's own `use` before its module's, a rename
+ * (`use crate::util::take as consume`), an enum's variant — and nothing when
+ * a local (a parameter, a `let`) binds the name there. Cases from PR #2308 by
+ * @danusha2345.
+ */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
