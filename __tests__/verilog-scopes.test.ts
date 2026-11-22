@@ -79,6 +79,9 @@ it('does not invent outer bindings from a loop with recovered declaration syntax
 initial for(int i=0,j=0;i<3;i++) $display(j);
 initial $display(j);
 endmodule`);cg=CodeGraph.initSync(root);await cg.indexAll();
+ // tree-sitter-systemverilog 0.5.0 recovers this malformed for-initializer as
+ // module-level ERROR nodes, so the recovered body is not a reliable scope.
+ // Do not bind recovered ERROR expressions to outer-scope signals.
  expect(rows().filter(r=>r.line===2&&r.target==='m::j')).toEqual([]);
- expect(rows().filter(r=>r.line===3&&r.target==='m::j').length).toBeGreaterThan(0);
+ expect(rows().filter(r=>r.line===3)).toEqual([]);
 });

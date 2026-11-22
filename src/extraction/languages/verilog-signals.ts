@@ -260,6 +260,14 @@ function formalMetadata(node: SyntaxNode, id: SyntaxNode, source: string): strin
 
 /** HDL declarations and executable blocks; called before generic recursion. */
 export function visitVerilogSignals(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  if (node.type === 'ERROR') {
+    // Recovered ERROR nodes may contain valid expressions but no reliable
+    // declaration/scope structure. Skip binding inside them to avoid inventing
+    // outer-scope references from broken syntax; walk children so nested
+    // well-formed declarations/calls still get extracted.
+    walkChildren(node, ctx);
+    return true;
+  }
   if (['seq_block', 'par_block', 'loop_statement'].includes(node.type)) {
     // Generate blocks have their own handler; these nodes are procedural scopes.
     const keyword = node.children[0]?.text ?? 'block';
